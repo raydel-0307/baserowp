@@ -1,0 +1,119 @@
+import { Registerable } from '@baserow/modules/core/registry'
+import { FF_AGENTS } from '@baserow/modules/core/plugins/featureFlags'
+
+export class WorkspaceSettingsPageType extends Registerable {
+  /**
+   * The name of the page in the tabs navigation at the top of the page.
+   */
+  getName() {
+    return null
+  }
+
+  get developmentStage() {
+    return null
+  }
+
+  getBadge() {
+    return null
+  }
+
+  constructor(...args) {
+    super(...args)
+    this.type = this.getType()
+
+    if (this.type === null) {
+      throw new Error('The type name of a workspace settings page must be set.')
+    }
+  }
+
+  serialize() {
+    return {
+      type: this.type,
+      name: this.getName(),
+    }
+  }
+
+  /**
+   * Responsible for returning whether the user has access
+   * to this workspace settings page type. By default, they do.
+   */
+  hasPermission(workspace) {
+    return true
+  }
+
+  /**
+   * Responsible for returning whether the user has access to
+   * this page's features in this workspace.
+   */
+  isFeatureActive(workspace) {
+    return true
+  }
+
+  getFeatureDeactivatedModal(workspace) {
+    return null
+  }
+
+  getRoute() {
+    throw new Error('The `getRoute` method must be set.')
+  }
+}
+
+export class MembersWorkspaceSettingsPageType extends WorkspaceSettingsPageType {
+  getOrder() {
+    return 10
+  }
+
+  static getType() {
+    return 'members'
+  }
+
+  getName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('membersSettings.membersTabTitle')
+  }
+
+  getRoute(workspace) {
+    return {
+      name: 'settings-members',
+      params: {
+        workspaceId: workspace.id,
+      },
+    }
+  }
+}
+
+export class AgentsWorkspaceSettingsPageType extends WorkspaceSettingsPageType {
+  getOrder() {
+    return 40
+  }
+
+  static getType() {
+    return 'agents'
+  }
+
+  getBadge() {
+    return this.app.$i18n.t('agents.new')
+  }
+
+  getName() {
+    return this.app.$i18n.t('agents.tabTitle')
+  }
+
+  get developmentStage() {
+    return 'beta'
+  }
+
+  hasPermission(workspace) {
+    return (
+      this.app.$featureFlagIsEnabled(FF_AGENTS) &&
+      this.app.$hasPermission('workspace.list_agents', workspace, workspace.id)
+    )
+  }
+
+  getRoute(workspace) {
+    return {
+      name: 'settings-agents',
+      params: { workspaceId: workspace.id },
+    }
+  }
+}

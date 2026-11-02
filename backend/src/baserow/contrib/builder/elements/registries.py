@@ -1,0 +1,749 @@
+import uuid
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypedDict,
+    TypeVar,
+    Union,
+)
+from zipfile import ZipFile
+
+from django.core.files.storage import Storage
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+
+from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
+
+from baserow.contrib.builder.mixins import BuilderInstanceWithFormulaMixin
+from baserow.contrib.builder.pages.models import Page
+from baserow.core.formula.types import BaserowFormulaObject
+from baserow.core.graph.exceptions import GraphPointReferencePointInvalid
+from baserow.core.graph.types import GraphPointPosition, GraphPointPositionType
+from baserow.core.models import Workspace
+from baserow.core.registry import (
+    CustomFieldsInstanceMixin,
+    CustomFieldsRegistryMixin,
+    EasyImportExportMixin,
+    Instance,
+    ModelInstanceMixin,
+    ModelRegistryMixin,
+    Registry,
+)
+from baserow.core.storage import ExportZipFile
+from baserow.core.user_files.handler import UserFileHandler
+from baserow.core.user_sources.handler import UserSourceHandler
+from baserow.core.user_sources.utils import remap_user_source_roles
+
+from .models import CollectionField, Element
+from .types import ElementDictSubClass, ElementSubClass
+
+BUILDER_PAGE_ELEMENTS = "builder_page_elements"
+ELEMENT_IDS_PROCESSED_FOR_ROLES = "_element_ids_processed_for_roles"
+EXISTING_USER_SOURCE_ROLES = "_existing_user_source_roles"
+
+
+class ElementType(
+    BuilderInstanceWithFormulaMixin,
+    EasyImportExportMixin[ElementSubClass],
+    CustomFieldsInstanceMixin,
+    ModelInstanceMixin[ElementSubClass],
+    Instance,
+    ABC,
+):
+    """Element type"""
+
+    SerializedDict: Type[ElementDictSubClass]
+    parent_property_name = "page"
+    id_mapping_name = BUILDER_PAGE_ELEMENTS
+
+    display_name = _("Unnamed element")
+
+    # Is this element type a container-type element?
+    is_container = False
+
+    # Whether this element is a multi-page element and should be placed on shared page.
+    is_multi_page_element = False
+
+    def get_places(self, instance: ElementSubClass) -> Dict[str, Dict[str, str]]:
+        """
+        Returns the places available from this element in the graph.
+
+        The default builder element place is the unnamed `next` edge.
+        Container elements override this to expose their child slots.
+        """
+
+        return {"": {"label": ""}}
+
+    def is_deactivated(self, workspace: Workspace) -> bool:
+        """
+        Returns whether this element type is deactivated for the given workspace.
+        """
+
+        return False
+
+    def get_event_names(self, instance: ElementSubClass) -> List[str]:
+        """
+        Returns the names of the events the given element can fire, which are the
+        only `event` values a workflow action attached to it may use. This mirrors
+        the `getEvents()` method of the frontend element types. By default an
+        element cannot fire any event.
+
+        :param instance: The (specific) element instance.
+        :return: The list of valid event names for this element.
+        """
+
+        return []
+
+    def prepare_value_for_db(self, values: Dict, instance: Optional[Element] = None):
+        """
+        This function allows you to hook into the moment an element is created or
+        updated. If the element is updated `instance` will be defined, and you can use
+        `instance` to extract any context data that might be required for the
+        implementation of this hook.
+
+        :param values: The values that are being updated
+        :param instance: The existing instance that is being updated
+        :return: Values that should be used for the update or creation of the element.
+        """
+
+        return values
+
+    def export_prepared_values(self, instance: Element) -> Dict[str, Any]:
+        """
+        Returns a JSON-serializable dict of the element's `allowed_fields`, used by
+        the undo/redo `ActionHandler` to snapshot values so they can be restored
+        later. Relation fields are exported as their id so the result stays
+        JSON-serializable.
+
+        Note: re-applying a stored relation id through `update_element` only
+        round-trips for element types whose update path accepts that id (e.g. those
+        exposing an `<field>_id` allowed field). Update undo/redo therefore only
+        snapshots the fields actually changed by an update (see the update action),
+        keeping scalar/JSON field changes fully reversible.
+
+        :param instance: The element instance to export values for.
+        :return: A dict of prepared values keyed by field name.
+        """
+
+        from django.core.exceptions import FieldDoesNotExist
+
+        values: Dict[str, Any] = {}
+        for field_name in self.allowed_fields:
+            try:
+                model_field = instance._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                values[field_name] = getattr(instance, field_name)
+                continue
+
+            if model_field.is_relation:
+                # Use the relation's attname (e.g. "data_source_id") to read the id,
+                # which keeps the value JSON-serializable. allowed_fields may already
+                # use the attname form, so we never construct "<name>_id" ourselves.
+                values[field_name] = getattr(instance, model_field.attname)
+            else:
+                values[field_name] = getattr(instance, field_name)
+
+        return values
+
+    def validate_position_as_child(
+        self, place_in_container: str, instance: ElementSubClass
+    ):
+        """
+        Validate that this element type accepts children in the given place.
+
+        By default, element types can't have children. Container element types
+        override this method to accept and validate child placement.
+
+        :param place_in_container: The place in container being set.
+        :param instance: The reference element instance.
+        :raises GraphPointReferencePointInvalid: If the element can't have children.
+        """
+
+        raise GraphPointReferencePointInvalid(
+            f"The reference node {instance.id} can't have child"
+        )
+
+    def validate_position(
+        self,
+        page: Page,
+        reference_element: ElementSubClass | None,
+        place_in_container: str,
+        position: GraphPointPositionType = None,
+    ):
+        """
+        Validates the page/reference_element/position for this element.
+        Can be overridden to change the behavior.
+
+        :param page: the page we want to add/move the element to.
+        :param reference_element: the element reference.
+        :param place_in_container: the place in container in the parent.
+        :param position: the position we are referencing alongside `reference_element`.
+        :raises ValidationError: if the element place is disallowed.
+        """
+
+        if position == GraphPointPosition.CHILD and reference_element is not None:
+            reference_element.get_type().validate_position_as_child(
+                place_in_container, reference_element
+            )
+
+        parent_element = (
+            reference_element
+            if position == GraphPointPosition.CHILD
+            else reference_element.get_parent_point()
+            if reference_element is not None
+            else None
+        )
+
+        if parent_element is None:
+            if page.shared:
+                raise ValidationError(
+                    "This element type can't be added as root of the shared page."
+                )
+            return
+
+        parent_type = parent_element.get_type()
+        if self.type not in [e.type for e in parent_type.child_types_allowed]:
+            raise ValidationError(
+                f"Container of type {parent_type.type} can't have "
+                f"child of type {self.type}"
+            )
+
+    def get_graph_point_label(self, instance: ElementSubClass) -> str:
+        """
+        Returns the label used by the graph handler's labeled graph representation.
+
+        :param instance: The element instance to label.
+        :return: A stable, human-readable label for the element in test/debug graphs.
+        """
+
+        return self.type
+
+    def before_import(
+        self,
+        serialized_values: Dict[str, Any],
+        id_mapping: Dict[str, Any],
+        files_zip: ZipFile | None = None,
+        storage: Storage | None = None,
+        cache: Dict[str, Any] | None = None,
+        **kwargs,
+    ) -> Optional[Callable[[ElementSubClass, Dict[str, Any], Dict[str, Any]], None]]:
+        """
+        This hook is called before the element is imported. It can mutate the
+        serialized values before instance creation and return a callback that will be
+        called once the import context is available.
+
+        :param serialized_values: The serialized element values.
+        :param id_mapping: A map of old->new id per data type.
+        :param files_zip: The zip file containing the files that can be used.
+        :param storage: The storage that can be used to store files.
+        :param cache: A dictionary that can be used to cache data.
+        :return: A callable receiving the imported instance, id_mapping and import
+            context, or None if no deferred work is needed.
+        """
+
+        return None
+
+    def after_create(self, instance: ElementSubClass, values: Dict):
+        """
+        This hook is called right after the element has been created.
+
+        :param instance: The created element instance.
+        :param values: The values that were passed when creating the field
+            instance.
+        """
+
+    def after_update(
+        self,
+        instance: ElementSubClass,
+        values: Dict,
+        changes: Dict[str, Tuple],
+    ):
+        """
+        This hook is called right after the element has been updated.
+
+        :param instance: The updated element instance.
+        :param values: The values that were passed when updating the instance.
+        :param changes: A dictionary containing all changes which were made to the
+            element prior to `after_update` being called.
+        """
+
+    def before_delete(self, instance: ElementSubClass):
+        """
+        This hook is called just before the element will be deleted.
+
+        :param instance: The to be deleted element instance.
+        """
+
+    @contextmanager
+    def wrap_move(
+        self,
+        element: Element,
+        reference_element: Element | None,
+        position: GraphPointPositionType,
+        target_page: Page,
+        place_in_container: str,
+    ) -> Generator[None, None, None]:
+        """
+        Wraps moving the element so element types can run logic before and after the
+        move while keeping any context captured before the move.
+
+        :param element: The element being moved.
+        :param reference_element: The target reference element.
+        :param position: The target position relative to the reference element.
+        :param target_page: The page the element is being moved to.
+        :param place_in_container: The target place in container.
+        """
+        # Captured before the move, while element.page still points at the source.
+        moved_to_new_page = element.page_id != target_page.id
+
+        yield
+
+        if moved_to_new_page:
+            # A workflow action associated with this element has its own page foreign
+            # key. When the element changes page (e.g. moving to/from the shared page)
+            # the action would otherwise be left behind on the source page, so move it
+            # along with the element. This runs for every element in a moved subtree
+            # because each one passes through its type's wrap_move (which chains here).
+            from baserow.contrib.builder.workflow_actions.models import (
+                BuilderWorkflowAction,
+            )
+
+            BuilderWorkflowAction.objects.filter(element=element).update(
+                page_id=target_page.id
+            )
+
+    def import_context_addition(self, instance: ElementSubClass) -> Dict[str, Any]:
+        """
+        This hook allow to specify extra context data when importing objects related
+        to this one like child elements, collection fields or workflow actions.
+        This extra context is then used as import context for these objects.
+
+        :param instance: The instance we want the context for.
+        :return: An object containing the extra context for the import process.
+        """
+
+        return {}
+
+    def import_serialized(
+        self,
+        page: Any,
+        serialized_values: Dict[str, Any],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: ZipFile | None = None,
+        storage: Storage | None = None,
+        cache: Dict[str, Any] | None = None,
+        **kwargs,
+    ) -> ElementSubClass:
+        if cache is None:
+            cache = {}
+
+        # Add mapping for builder element event uids (for collection field or other
+        # elements that are using dynamic events.
+        if "builder_element_event_uids" not in id_mapping:
+            id_mapping["builder_element_event_uids"] = {}
+
+        existing_roles = cache.get("existing_roles", {}).get(page.builder.id)
+        if not existing_roles:
+            existing_roles = UserSourceHandler().get_all_roles_for_application(
+                page.builder
+            )
+            cache.setdefault("existing_roles", {})[page.builder.id] = existing_roles
+
+        serialized_values["roles"] = self.sanitize_element_roles(
+            serialized_values.get("roles", []),
+            existing_roles,
+            id_mapping.get("user_sources", {}),
+        )
+
+        created_instance = super().import_serialized(
+            page,
+            serialized_values,
+            id_mapping,
+            files_zip,
+            storage,
+            cache,
+            **kwargs,
+        )
+
+        # Add created instance to an element cache
+        cache.setdefault("imported_element_map", {})[created_instance.id] = (
+            created_instance
+        )
+
+        from baserow.contrib.builder.elements.handler import ElementHandler
+
+        # As we've created a new element instance, clear the `ElementHandler`
+        # cache so that any upcoming calls to `get_elements` includes the new model.
+        ElementHandler().invalidate_element_cache(page)
+
+        return created_instance
+
+    def sanitize_element_roles(
+        self,
+        roles: List[str],
+        existing_roles: List[str],
+        user_sources_mapping: Dict[int, int],
+    ) -> List[str]:
+        """
+        Given a list of roles, return a sanitized version of it. The sanitized
+        version should not contain any invalid roles.
+
+        An invalid role is a role name that doesn't exist (e.g. due to renaming
+        or deletion). Also, Default User Roles are updated to ensure they contain
+        the new User Source's ID.
+        """
+
+        return [
+            role
+            for role in remap_user_source_roles(
+                roles, existing_roles, user_sources_mapping
+            )
+            if role in existing_roles
+        ]
+
+    def serialize_property(
+        self,
+        element: Element,
+        prop_name: str,
+        import_export_config=None,
+        files_zip: Optional[ExportZipFile] = None,
+        storage: Optional[Storage] = None,
+        cache: Optional[Dict] = None,
+    ):
+        """
+        You can customize the behavior of the serialization of a property with this
+        hook.
+        """
+
+        if prop_name == "style_background_file_id":
+            return UserFileHandler().export_user_file(
+                element.style_background_file,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+
+        return super().serialize_property(
+            element,
+            prop_name,
+            import_export_config=import_export_config,
+            files_zip=files_zip,
+            storage=storage,
+            cache=cache,
+        )
+
+    def deserialize_property(
+        self,
+        prop_name: str,
+        value: Any,
+        id_mapping: Dict[str, Any],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        cache: Optional[Dict] = None,
+        **kwargs,
+    ) -> Any:
+        """
+        This hooks allow to customize the deserialization of a property.
+
+        :param prop_name: the name of the property being transformed.
+        :param value: the value of this property.
+        :param id_mapping: the id mapping dict.
+        :param files_zip: the zip file containing the files.
+        :param storage: the storage where the files should be stored.
+        :param cache: a cache dict that can be used to store temporary data.
+        :return: the deserialized version for this property.
+        """
+
+        if cache is None:
+            cache = {}
+
+        if prop_name == "parent_element_id":
+            return id_mapping[BUILDER_PAGE_ELEMENTS].get(
+                value,
+                value,
+            )
+
+        if prop_name == "style_background_file_id":
+            user_file = UserFileHandler().import_user_file(
+                value, files_zip=files_zip, storage=storage
+            )
+            if user_file:
+                return user_file.id
+            return None
+
+        # Compat with old exported JSONs
+        # Can be removed in January 2025
+        if prop_name == "style_background_mode":
+            return value or "fill"
+
+        # Compat with old exported JSONs
+        # Can be removed in January 2025
+        if prop_name in [
+            "style_margin_bottom",
+            "style_margin_top",
+            "style_margin_left",
+            "style_margin_right",
+        ]:
+            return value or 0
+
+        return value
+
+    @abstractmethod
+    def get_pytest_params(self, pytest_data_fixture) -> Dict[str, Any]:
+        """
+        Returns a sample of params for this type. This can be used to tests the element
+        for instance.
+
+        :param pytest_data_fixture: A Pytest data fixture which can be used to
+            create related objects when the import / export functionality is tested.
+        """
+
+    def formula_generator(
+        self, element: Element
+    ) -> Generator[str | Instance, str, None]:
+        """
+        Generator that returns formula fields for the LinkElementType.
+
+        Unlike other Element types, this one has its formula fields in the
+        page_parameters and query_prameters JSON fields.
+        """
+
+        yield from super().formula_generator(element)
+
+        # Deal with visibility_condition
+        new_formula = yield element.visibility_condition
+        if new_formula is not None:
+            element.visibility_condition = new_formula
+            yield element
+
+
+ElementTypeSubClass = TypeVar("ElementTypeSubClass", bound=ElementType)
+
+
+class ElementTypeRegistry(
+    Registry[ElementTypeSubClass],
+    ModelRegistryMixin[ElementSubClass, ElementTypeSubClass],
+    CustomFieldsRegistryMixin,
+):
+    """
+    Contains all registered element types.
+    """
+
+    name = "element_type"
+
+
+element_type_registry = ElementTypeRegistry()
+
+
+class CollectionFieldType(
+    BuilderInstanceWithFormulaMixin,
+    CustomFieldsInstanceMixin,
+    Instance,
+    ABC,
+):
+    """Collection element field type"""
+
+    SerializedDict: TypedDict
+
+    model_class = CollectionField
+
+    # The events a collection field of this type can fire. They are exposed on the
+    # collection element as `<field uid>_<event name>` workflow action events.
+    event_names: List[str] = []
+
+    def serialize_property(self, config: Dict[str, Any], prop_name: str):
+        return config[prop_name]
+
+    def export_serialized(self, instance: CollectionField) -> Dict[str, Any]:
+        property_names = self.SerializedDict.__annotations__.keys()
+
+        serialized_config = self.SerializedDict(
+            **{
+                key: self.serialize_property(instance.config, key)
+                for key in property_names
+                if key in instance.config
+            }
+        )
+
+        serialized = {
+            "uid": str(instance.uid),
+            "name": instance.name,
+            "type": instance.type,
+            "styles": instance.styles,
+            "config": serialized_config,
+        }
+
+        return serialized
+
+    def deserialize_property(
+        self,
+        prop_name: str,
+        value: Any,
+        id_mapping: Dict[str, Any],
+        serialized_values: Dict[str, Any],
+        **kwargs,
+    ) -> Any:
+        """
+        This hooks allow to customize the deserialization of a property.
+
+        :param prop_name: the name of the property being transformed.
+        :param value: the value of this property.
+        :param id_mapping: the id mapping dict.
+        :param serialized_values: the serialized values, which can be accessed
+            during deserialization to perform extra checks.
+        :return: the deserialized version for this property.
+        """
+
+        return value
+
+    def create_instance_from_serialized(
+        self, serialized_values: Dict[str, Any]
+    ) -> CollectionField:
+        """
+        Create the instance related to the given serialized values.
+        Allow to hook into instance creation while still having the serialized values.
+
+        :param serialized_values: the deserialized values.
+        :return: the created instance.
+        """
+
+        # We don't save the new instance intentionally to be able to bulk create them
+        return CollectionField(**serialized_values)
+
+    def import_serialized(
+        self,
+        serialized_values: Dict[str, Any],
+        id_mapping: Dict[str, Any],
+        **kwargs,
+    ) -> CollectionField:
+        """
+        Imports the previously exported dict generated by the `export_serialized`
+        method.
+
+        An id_mapping for this class is populated during the process.
+
+        :param serialized_values: The dict containing the serialized values.
+        :param id_mapping: Used to mapped object ids from export to newly
+            created instances.
+        :return: The created instance.
+        """
+
+        deserialized_config = {}
+        for name in self.SerializedDict.__annotations__.keys():
+            # If any field declared in the `SerializedDict` is not present in
+            # `serialized_values`, try to use a default value instead.
+            # The default value is retrieved from the `serialized_field_overrides`
+            # method, if present.
+            serializer_field_override = self.serializer_field_overrides.get(name)
+            default = getattr(serializer_field_override, "default", None)
+            deserialized_config[name] = self.deserialize_property(
+                name,
+                serialized_values["config"].get(name, default),
+                id_mapping,
+                serialized_values,
+                **kwargs,
+            )
+
+        # Generate a new `uid` for this collection field.
+        deserialized_uid = str(uuid.uuid4())
+
+        if "uid" in serialized_values:
+            # Map the old uid to the new uid. This ensures that any workflow
+            # actions with an `event` pointing to the old uid will have the
+            # pointer to the new uid.
+            id_mapping["builder_element_event_uids"][serialized_values["uid"]] = (
+                deserialized_uid
+            )
+
+        deserialized_values = {
+            "uid": deserialized_uid,
+            "config": deserialized_config,
+            "type": serialized_values["type"],
+            "styles": serialized_values.get("styles", {}),
+            "name": serialized_values["name"],
+        }
+
+        return self.create_instance_from_serialized(deserialized_values)
+
+    def get_serializer(
+        self,
+        model_instance_or_instances: Union[models.Model, List[models.Model]],
+        base_class: Optional[serializers.ModelSerializer] = None,
+        context: Optional[Dict[str, Any]] = None,
+        request: bool = False,
+        **kwargs: Dict[str, Any],
+    ) -> serializers.ModelSerializer:
+        """
+        Returns an instantiated model serializer based on this type field names and
+        overrides. The provided model instance will be used instantiate the serializer.
+
+        :param model_instance_or_instances: The instance or a list of instances for
+            which the serializer must be generated.
+        :param base_class: The base serializer class that must be extended. For example
+            common fields could be stored here.
+        :param context: Extra context arguments to pass to the serializers context.
+        :param request: True if you want the request serializer.
+        :param kwargs: The kwargs are used to initialize the serializer class.
+        :return: The instantiated generated model serializer.
+        """
+
+        if context is None:
+            context = {}
+
+        model_instance_or_instances = model_instance_or_instances
+
+        serializer_class = self.get_serializer_class(
+            base_class=base_class, request_serializer=request
+        )
+
+        return serializer_class(model_instance_or_instances, context=context, **kwargs)
+
+    def before_delete(self, instance: CollectionField):
+        """
+        This hooks is called before we delete a collection field and gives the
+        opportunity to clean up things.
+        """
+
+    def formula_generator(
+        self, collection_field: CollectionField
+    ) -> Generator[str | Instance, str, None]:
+        """
+        Generator that iterates over formula fields for CollectionField.
+
+        Some formula fields are in the config JSON field, e.g. page_parameters.
+        """
+
+        for formula_field in self.simple_formula_fields:
+            formula = collection_field.config.get(formula_field, "")
+            new_formula = yield BaserowFormulaObject.to_formula(formula)
+            if new_formula is not None:
+                collection_field.config[formula_field] = new_formula
+                yield collection_field
+
+
+CollectionFieldTypeSubClass = TypeVar(
+    "CollectionFieldTypeSubClass", bound=CollectionFieldType
+)
+
+
+class CollectionFieldTypeRegistry(
+    Registry[CollectionFieldTypeSubClass],
+    CustomFieldsRegistryMixin,
+):
+    """
+    Contains all registered collection field types.
+    """
+
+    name = "collection_field_type"
+
+
+collection_field_type_registry = CollectionFieldTypeRegistry()

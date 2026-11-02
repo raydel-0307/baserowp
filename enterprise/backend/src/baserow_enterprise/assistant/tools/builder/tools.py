@@ -1,0 +1,1773 @@
+"""
+Builder assistant tool functions.
+
+All tools use the ``RunContext[AssistantDeps]`` + ``FunctionToolset`` pattern.
+Page-scoped ref tracking helpers are defined at the top of this module.
+"""
+
+from typing import Annotated, Any
+
+from django.db import transaction
+from django.utils.translation import gettext as _
+
+from pydantic import Field
+from pydantic_ai import ModelRetry, RunContext
+
+from baserow.contrib.builder.pages.handler import PageHandler
+from baserow.core.exceptions import PermissionException
+from baserow_enterprise.assistant.deps import AssistantDeps
+from baserow_enterprise.assistant.tools.builder.themes import (
+    THEME_CATALOG,
+    ThemeName,
+    apply_theme,
+)
+from baserow_enterprise.assistant.tools.shared import (
+    permission_denied_result,
+    raise_if_permission_denied,
+    require_payload,
+)
+from baserow_enterprise.assistant.tools.toolset import AssistantFunctionToolset
+from baserow_enterprise.assistant.types import BuilderPageNavigationType
+
+from . import agents, helpers
+from .registries import assistant_element_type_registry
+from .types import (
+    ActionCreate,
+    CollectionElementCreate,
+    DataSourceCreate,
+    DataSourceUpdate,
+    DisplayElementCreate,
+    ElementItemCreate,
+    ElementMove,
+    ElementStyleUpdate,
+    ElementUpdate,
+    FormElementCreate,
+    LayoutElementCreate,
+    PageCreate,
+    PageItem,
+    PageUpdate,
+)
+from .types.user_source import UserSourceSetup
+
+# ---------------------------------------------------------------------------
+# Page-scoped ref tracking
+# ---------------------------------------------------------------------------
+
+
+def _get_page_context(tool_helpers, page_id: int) -> dict:
+    """Get or create the ref-tracking context dict for a page."""
+    key = f"builder_page_{page_id}"
+    if key not in tool_helpers.request_context:
+        tool_helpers.request_context[key] = {
+            "element_refs": {},
+            "data_source_refs": {},
+        }
+    return tool_helpers.request_context[key]
+
+
+def _track_element_refs(tool_helpers, page_id: int, refs: dict[str, int]) -> None:
+    _get_page_context(tool_helpers, page_id)["element_refs"].update(refs)
+
+
+def _get_element_refs(tool_helpers, page_id: int) -> dict[str, int]:
+    return _get_page_context(tool_helpers, page_id)["element_refs"].copy()
+
+
+def _track_data_source_refs(tool_helpers, page_id: int, refs: dict[str, int]) -> None:
+    _get_page_context(tool_helpers, page_id)["data_source_refs"].update(refs)
+
+
+def _get_data_source_refs(tool_helpers, page_id: int) -> dict[str, int]:
+    return _get_page_context(tool_helpers, page_id)["data_source_refs"].copy()
+
+
+# ---------------------------------------------------------------------------
+# Page tools
+# ---------------------------------------------------------------------------
+
+
+def list_pages(
+    ctx: RunContext[AssistantDeps],
+    application_id: Annotated[int, Field(description="The builder application ID.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    List all pages in an application builder.
+
+    WHEN to use: Check existing pages, find page IDs, or verify page names before creating new ones.
+    WHAT it does: Lists all non-shared pages with their id, name, path, parameters, and visibility.
+    RETURNS: Pages, login_page_id, user_sources with table info, and available_roles.
+    DO NOT USE when: You already have the page IDs you need.
+    """
+
+    from baserow.core.user_sources.handler import UserSourceHandler
+
+    user = ctx.deps.user
+    workspace = ctx.deps.workspace
+    tool_helpers = ctx.deps.tool_helpers
+
+    builder = helpers.get_builder(user, workspace, application_id)
+    tool_helpers.update_status(
+        _("Listing pages in %(app_name)s...") % {"app_name": builder.name}
+    )
+
+    pages = helpers.list_pages(user, builder)
+
+    user_sources = UserSourceHandler().get_user_sources(builder)
+    user_source_data = []
+    for us in user_sources:
+        entry = {"id": us.id, "name": us.name}
+        specific = us.specific if hasattr(us, "specific") else us
+        if hasattr(specific, "table_id"):
+            entry["table_id"] = specific.table_id
+        user_source_data.append(entry)
+
+    return {
+        "application_id": builder.id,
+        "pages": [p.model_dump() for p in pages],
+        "login_page_id": builder.login_page_id,
+        "user_sources": user_source_data,
+        "available_roles": UserSourceHandler().get_all_roles_for_application(builder),
+        "next_steps": (
+            "For a requested new page, use create_pages with this application_id "
+            "first, then use its returned page ID in setup_page or element tools. "
+            "An application ID is not a page ID. Do not replace a different existing "
+            "page when the user asked for a new one. If a new presentation page's "
+            "CTA has no specified destination and a Home page is listed, link the "
+            "CTA to that page and state this assumption instead of blocking the "
+            "build with a question. Do not modify that destination page. "
+            "For pages displaying records, "
+            "find the matching table before creating the page; if the records are "
+            "missing, ask where they should come from first."
+        ),
+    }
+
+
+def create_pages(
+    ctx: RunContext[AssistantDeps],
+    application_id: Annotated[int, Field(description="The builder application ID.")],
+    pages: Annotated[list[PageCreate], Field(description="Pages to create.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Create pages in an application builder.
+
+    WHEN to use: User wants new pages in a builder app.
+    WHAT it does: Creates pages with paths and parameters. Skips duplicates by name.
+    RETURNS: Created pages with id, name, path.
+    DO NOT USE when: Pages with those names already exist — check with list_pages first.
+    REQUIRED: `application_id` and `pages` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Page Setup
+    - Each page needs a unique name and path.
+    - Use path parameters like :id for dynamic routes (e.g., '/products/:id').
+    - Path params must be defined in path_params array with name and type.
+
+    ## Navigation
+    After creating pages, add navigation links (menu items, link elements) so users can reach them.
+    """
+
+    user = ctx.deps.user
+    workspace = ctx.deps.workspace
+    tool_helpers = ctx.deps.tool_helpers
+
+    require_payload("create_pages", "pages", pages)
+
+    builder = helpers.get_builder(user, workspace, application_id)
+
+    # Skip duplicates
+    existing = {p.name.lower(): p for p in helpers.list_pages(user, builder)}
+    helpers.ensure_distinct_paths([p for p in pages if p.name.lower() not in existing])
+    created_pages: list[PageItem] = []
+    skipped_pages: list[PageItem] = []
+
+    with transaction.atomic():
+        for page_create in pages:
+            tool_helpers.raise_if_cancelled()
+            ex = existing.get(page_create.name.lower())
+            if ex:
+                skipped_pages.append(ex)
+                continue
+            tool_helpers.update_status(
+                _("Creating page %(name)s...") % {"name": page_create.name}
+            )
+            page = helpers.create_page(user, builder, page_create)
+            created_pages.append(PageItem.from_orm(page))
+
+    if created_pages:
+        last = created_pages[-1]
+        tool_helpers.navigate_to(
+            BuilderPageNavigationType(
+                type="builder-page",
+                application_id=application_id,
+                page_id=last.id,
+                page_name=last.name,
+            )
+        )
+
+    result: dict[str, Any] = {
+        "created_pages": [p.model_dump() for p in created_pages],
+    }
+    if skipped_pages:
+        result["existing_pages"] = [p.model_dump() for p in skipped_pages]
+    if created_pages:
+        result["next_steps"] = (
+            "Pages created. Add the requested content now. Draft sensible headings, "
+            "descriptions, and button labels rather than asking for this copy. "
+            "If the request names an internal navigation destination that is "
+            "missing, create that supporting page too and link to its returned ID. "
+            "Add data sources only for content backed by existing records "
+            "(create_data_sources). Then add elements "
+            "(create_display_elements, create_layout_elements, "
+            "create_form_elements, create_collection_elements), "
+            "then actions for buttons/forms (create_actions)."
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Page update tool
+# ---------------------------------------------------------------------------
+
+
+def update_page(
+    ctx: RunContext[AssistantDeps],
+    page: Annotated[PageUpdate, Field(description="Page update data.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Update an existing page's properties.
+
+    WHEN to use: User wants to rename a page, change its path, or modify parameters.
+    WHAT it does: Updates the specified fields on a page. Only non-null fields are applied.
+    RETURNS: Updated page with id, name, path.
+    DO NOT USE when: You need to create a new page — use create_pages instead.
+
+    ## Usage
+    - page_id: ID of the page to update (from list_pages).
+    - Only set the fields you want to change.
+    - When changing path, also update path_params if the new path has different parameters.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    tool_helpers.update_status(_("Updating page %(id)d...") % {"id": page.page_id})
+
+    updated_page = helpers.update_page(user, ctx.deps.workspace, page)
+    page_item = PageItem.from_orm(updated_page)
+
+    return {
+        "status": "ok",
+        "page": page_item.model_dump(),
+        "updated_fields": page.get_updated_field_names(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Data source tools
+# ---------------------------------------------------------------------------
+
+
+def list_data_sources(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    List all data sources on a page.
+
+    WHEN to use: Check existing data sources or find data source IDs.
+    WHAT it does: Lists data sources with id, name, type, table_id.
+    RETURNS: Data sources array.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Listing data sources on %(name)s...") % {"name": page.name}
+    )
+
+    ds_list = helpers.list_data_sources(user, page)
+    return {"data_sources": [ds.model_dump() for ds in ds_list]}
+
+
+def create_data_sources(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    data_sources: Annotated[
+        list[DataSourceCreate], Field(description="Data sources to create.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Create data sources to connect page elements to database tables.
+
+    WHEN to use: Page needs data from database tables for display or forms.
+    WHAT it does: Creates list_rows or get_row data sources. Skips duplicates by name.
+    RETURNS: Created data sources with ref-to-ID mapping.
+    DO NOT USE when: Data sources with those names already exist on the page.
+    REQUIRED: `page_id` and `data_sources` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Data Source Types
+    - list_rows: Fetches multiple rows — use when the page displays a collection (table, repeat, dropdown).
+    - get_row: Fetches a single row by ID — use when the page works with one specific record. Set row_id with $formula: to get the ID dynamically (e.g. from a page parameter).
+
+    ## Dynamic Values with $formula:
+    - get_row row_id: "$formula: the id from the page parameter"
+    - list_rows search_query: "$formula: the text from the search input"
+
+    ## Filtering with view_id
+    To filter a list_rows data source, create a database table view with the
+    desired filters (using create_views + create_view_filters), then pass
+    its view_id here. The view's filters and sortings are applied automatically.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    require_payload("create_data_sources", "data_sources", data_sources)
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    integration = helpers.get_local_baserow_integration(user, page.builder)
+
+    existing_ds = helpers.list_data_sources(user, page)
+    existing_by_name = {ds.name.lower(): ds for ds in existing_ds}
+    ref_to_id: dict[str, int] = {}
+    created: list[dict] = []
+    ds_pairs: list[tuple] = []
+
+    with transaction.atomic():
+        for ds_create in data_sources:
+            tool_helpers.raise_if_cancelled()
+            ex = existing_by_name.get(ds_create.name.lower())
+            if not ex:
+                ex = next(
+                    (ds for ds in existing_ds if ds_create.matches_existing(ds)), None
+                )
+            if ex:
+                ref_to_id[ds_create.ref] = ex.id
+                continue
+
+            tool_helpers.update_status(
+                _("Creating data source '%(name)s'...") % {"name": ds_create.name}
+            )
+            orm_ds, ds_id = helpers.create_data_source(
+                user, page, ds_create, integration
+            )
+            ref_to_id[ds_create.ref] = ds_id
+            ds_pairs.append((orm_ds, ds_create))
+            created.append(
+                {
+                    "id": ds_id,
+                    "ref": ds_create.ref,
+                    "name": ds_create.name,
+                    "type": ds_create.type,
+                }
+            )
+
+    # Formula generation (separate transactions)
+    errors = agents.update_data_source_formulas(user, page, ds_pairs, tool_helpers)
+
+    _track_data_source_refs(tool_helpers, page_id, ref_to_id)
+
+    result: dict[str, Any] = {
+        "created_data_sources": created,
+        "ref_to_id_map": ref_to_id,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Data source update tool
+# ---------------------------------------------------------------------------
+
+
+def update_data_source(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[
+        int, Field(description="The page ID the data source belongs to.")
+    ],
+    data_source: Annotated[
+        DataSourceUpdate, Field(description="Data source update data.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Update an existing data source's properties.
+
+    WHEN to use: User wants to change a data source's name, table, row_id, or search_query.
+    WHAT it does: Updates the specified fields on a data source. Only non-null fields are applied.
+    RETURNS: Updated data source ID and list of changed fields.
+    DO NOT USE when: You need to create a new data source — use create_data_sources instead.
+
+    ## Usage
+    - data_source_id: ID of the data source to update (from list_data_sources).
+    - Only set the fields you want to change.
+
+    ## Dynamic Values with $formula:
+    - row_id: "$formula: the id from the page parameter"
+    - search_query: "$formula: the text from the search input"
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Updating data source %(id)d...") % {"id": data_source.data_source_id}
+    )
+
+    with transaction.atomic():
+        orm_ds, ds_type = helpers.update_data_source(user, page, data_source)
+
+    # Handle formula generation for $formula: fields (separate transaction)
+    formulas = data_source.get_formulas_to_update(orm_ds, None)
+    if formulas:
+        agents.update_single_data_source_formulas(
+            user, page, orm_ds, data_source, tool_helpers
+        )
+
+    updated_fields = data_source.get_updated_field_names()
+    return {
+        "status": "ok",
+        "data_source_id": data_source.data_source_id,
+        "service_type": ds_type,
+        "updated_fields": updated_fields,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Element tools
+# ---------------------------------------------------------------------------
+
+
+def list_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    List all elements on a page.
+
+    WHEN to use: Check existing elements, find element IDs or container structure.
+    WHAT it does: Lists elements with id, type, parent_element_id, is_container. Tables also show their data_source_id and table_columns in display order: uid, name, type, and value (text, boolean, rating) or label (button). value and label are formulas: fixed text is quoted, and '' or "''" is an empty cell. Menus show their items in order: uid, name, type, page_id (or url, for a link to a custom address), and a top-level link's sub-links as children.
+    RETURNS: Elements array.
+
+    Elements with page_name="[shared]" are headers/footers visible on ALL pages.
+    Do not add page-specific children to them.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Listing elements on %(name)s...") % {"name": page.name}
+    )
+
+    elements = helpers.list_elements(user, page)
+    return {"elements": [el.model_dump() for el in elements]}
+
+
+def _create_elements_internal(
+    ctx: RunContext[AssistantDeps],
+    page_id: int,
+    elements: list[ElementItemCreate],
+    before_element_id: int | None = None,
+) -> dict[str, Any]:
+    """Shared implementation for all create_*_elements tools."""
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    shared_page = PageHandler().get_shared_page(page.builder)
+
+    tool_helpers.update_status(
+        _("Creating %(count)d elements on %(name)s...")
+        % {"count": len(elements), "name": page.name}
+    )
+
+    ref_to_id: dict[str, int] = _get_element_refs(tool_helpers, page_id)
+    element_mapping: dict[str, tuple[Any, ElementItemCreate]] = {}
+    created_elements_by_id: dict[int, Any] = {}
+    ds_ref_to_id = _get_data_source_refs(tool_helpers, page_id)
+    shared_page_refs: set[str] = set(
+        _get_element_refs(tool_helpers, shared_page.id).keys()
+    )
+    created: list[dict] = []
+
+    errors: list[str] = []
+    table_action_pairs: list[tuple] = []
+    with transaction.atomic():
+        for el_create in elements:
+            tool_helpers.raise_if_cancelled()
+            try:
+                element, el_id, action_pairs = helpers.create_element(
+                    user,
+                    page,
+                    el_create,
+                    ref_to_id,
+                    ds_ref_to_id,
+                    shared_page_refs,
+                    before_element_id,
+                )
+            except Exception as exc:
+                raise_if_permission_denied(exc)
+                errors.append(f"{el_create.ref}: {exc}")
+                continue
+            ref_to_id[el_create.ref] = el_id
+            element_mapping[el_create.ref] = (element, el_create)
+            created_elements_by_id[el_id] = element
+            table_action_pairs.extend(action_pairs)
+            created.append({"id": el_id, "ref": el_create.ref, "type": el_create.type})
+
+    # Formula generation (separate transactions)
+    errors.extend(
+        agents.update_element_formulas(
+            user, page, elements, element_mapping, tool_helpers
+        )
+    )
+
+    if table_action_pairs:
+        errors.extend(
+            agents.update_workflow_action_formulas(
+                user, page, table_action_pairs, tool_helpers
+            )
+        )
+
+    _track_element_refs(tool_helpers, page_id, ref_to_id)
+    _track_element_refs(
+        tool_helpers,
+        shared_page.id,
+        {r: 0 for r in ref_to_id if r in shared_page_refs},
+    )
+
+    result: dict[str, Any] = {"created_elements": created, "ref_to_id_map": ref_to_id}
+
+    if errors:
+        result["errors"] = errors
+
+    # Report the saved graph after the entire batch, including children added by
+    # post-create hooks. A container's successful creation does not add content.
+    empty_containers = [
+        item
+        for item in created
+        if (element := created_elements_by_id[item["id"]]).get_type().is_container
+        and not element.page.get_graph().get_children(element)
+    ]
+    next_steps = []
+    if empty_containers:
+        result["empty_containers"] = empty_containers
+        next_steps.append(
+            "The empty_containers have no child elements. If the user requested "
+            "content, add that requested content before finishing, using "
+            "parent_element with the returned container ID or ref. Creating a "
+            "container does not complete its requested content. Inside a repeat, "
+            "use current_record for each row's dynamic values. Do not add "
+            "unrequested content or invent missing data."
+        )
+
+    # Guide the model to create workflow actions for interactive elements.
+    actionable = [
+        el.ref
+        for el in elements
+        if el.ref in element_mapping and el.type in ("button", "form_container")
+    ]
+    if actionable:
+        next_steps.append(
+            f"Elements {actionable} need workflow actions. "
+            "Call create_actions next: 'click' event for buttons, "
+            "'submit' event for form_container."
+        )
+    if next_steps:
+        result["next_steps"] = " ".join(next_steps)
+
+    # Navigate to the page containing the created elements
+    if created:
+        tool_helpers.navigate_to(
+            BuilderPageNavigationType(
+                type="builder-page",
+                application_id=page.builder_id,
+                page_id=page_id,
+                page_name=page.name,
+            )
+        )
+
+    return result
+
+
+def create_display_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    elements: Annotated[
+        list[DisplayElementCreate], Field(description="Display elements to create.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+    before_element_id: Annotated[
+        int | None,
+        Field(default=None, description="Insert before this element ID."),
+    ] = None,
+) -> dict[str, Any]:
+    """\
+    Create display elements on a page: heading, text, button, link, image.
+
+    For navigation, use a link (link_variant='button' gives a button appearance),
+    or create a button and then create_actions(type='open_page', event='click').
+    Button elements do not accept navigation properties.
+
+    PREREQUISITE: The page must already exist. Call create_pages first if it doesn't.
+    WHEN to use: User wants to add text content, headings, buttons, links, or images.
+    WHAT it does: Creates display elements with formula support for dynamic values.
+    RETURNS: Created elements with ref-to-ID mapping.
+    REQUIRED: `page_id` and `elements` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Element Structure
+    - parent_element: int ID (existing container) or string ref (same batch)
+    - place_in_container: 0-indexed column position for column elements
+
+    ## Dynamic Values with $formula:
+    - Heading/text value: "$formula: the product name from the products data source"
+    - Image URL: "$formula: the image URL from the product data source"
+    - Static text: use plain strings (auto-wrapped in quotes)
+    - Inside a collection, descriptions use current_record for that collection's row.
+      For intentional fixed-row access, supply an explicit runtime expression.
+
+    ## After Creating Buttons
+    Buttons need a click action (open_page, notification, etc.) via create_actions.
+    Links use their navigation properties directly.
+
+    ## Buttons/Links in Shared Headers
+    - In shared headers, only use links that navigate to a FIXED page (navigate_to_page_id).
+    - Do NOT create "back" buttons or context-dependent navigation in shared headers.
+    - For page-specific navigation (back, contextual links), place buttons on the page itself.
+    """
+
+    require_payload("create_display_elements", "elements", elements)
+    internal = [el.to_element_item_create() for el in elements]
+    return _create_elements_internal(ctx, page_id, internal, before_element_id)
+
+
+def create_layout_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    elements: Annotated[
+        list[LayoutElementCreate], Field(description="Layout elements to create.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+    before_element_id: Annotated[
+        int | None,
+        Field(default=None, description="Insert before this element ID."),
+    ] = None,
+) -> dict[str, Any]:
+    """\
+    Create layout/navigation elements on a page: column, simple_container, header, footer, menu.
+
+    WHEN to use: User wants page structure — columns, containers, headers, footers, menus.
+    WHAT it does: Creates container elements that hold child elements.
+    RETURNS: Created elements with ref-to-ID mapping.
+    REQUIRED: `page_id` and `elements` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Element Structure
+    - Layout elements are containers — add children via parent_element ref.
+    - column: creates N columns, children use place_in_container "0", "1", etc.
+    - menu: add menu_items to link to pages.
+
+    ## Shared Elements (header, footer)
+    - Headers/footers are shared across ALL pages by default (share_type="all").
+    - Use share_type="only" + page_ids to limit which pages show them.
+    - ONLY put absolute navigation in shared headers: links/menus to specific pages.
+    - NEVER put page-specific content in shared headers (e.g., "back" button,
+      page-specific data, breadcrumbs). These vary per page and will be wrong.
+    - A menu element inside a header/footer is also shared.
+    - `page_id` is still required for shared elements: pass any existing page of the
+      application, such as the Home page from list_pages. There is no application_id.
+    - Shared elements CANNOT reference page-specific data sources.
+    """
+
+    require_payload("create_layout_elements", "elements", elements)
+    internal = [el.to_element_item_create() for el in elements]
+    return _create_elements_internal(ctx, page_id, internal, before_element_id)
+
+
+def create_form_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    elements: Annotated[
+        list[FormElementCreate], Field(description="Form elements to create.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+    before_element_id: Annotated[
+        int | None,
+        Field(default=None, description="Insert before this element ID."),
+    ] = None,
+) -> dict[str, Any]:
+    """\
+    Create form elements on a page: form_container, input_text, choice, checkbox, datetime_picker, record_selector.
+
+    WHEN to use: User wants a form to collect input data.
+    WHAT it does: Creates form containers and input elements with validation.
+    RETURNS: Created elements with ref-to-ID mapping.
+    REQUIRED: `page_id` and `elements` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Form Structure
+    - Create a form_container first, then add inputs inside it via parent_element.
+    - Each input has label, placeholder, required, default_value.
+    - input_text: validation_type (any, email, integer), is_multiline.
+    - choice: choice_options, multiple.
+    - record_selector: needs data_source.
+
+    ## Edit Forms
+    For forms that edit existing data, set default_value on each input using $formula: to reference the field value from the page's data source (e.g. "$formula: the Name field from the <data source name> data source").
+    The form's submit action should be update_row with row_id referencing the page parameter.
+
+    ## After Creating Forms
+    Form containers need a submit action (create_row, update_row) via create_actions.
+    ALWAYS call create_actions after creating form_container elements.
+    """
+
+    require_payload("create_form_elements", "elements", elements)
+    internal = [el.to_element_item_create() for el in elements]
+    return _create_elements_internal(ctx, page_id, internal, before_element_id)
+
+
+def create_collection_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    elements: Annotated[
+        list[CollectionElementCreate],
+        Field(description="Collection elements to create."),
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+    before_element_id: Annotated[
+        int | None,
+        Field(default=None, description="Insert before this element ID."),
+    ] = None,
+) -> dict[str, Any]:
+    """\
+    Create collection elements on a page: table, repeat.
+
+    WHEN to use: User wants to display data from a data source in a table or repeating layout.
+    WHAT it does: Creates collection elements connected to data sources.
+    RETURNS: Created elements with ref-to-ID mapping.
+    REQUIRED: `page_id` and `elements` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Prerequisites
+    Create data sources first (create_data_sources), then reference them here.
+
+    ## Table
+    - data_source: the data source ID or ref.
+    - fields: the table's columns — always specify which columns to show. Each column has name and type ("text" or "button"); text columns take value ($formula: for dynamic content), button columns take label.
+
+    ## Repeat
+    - data_source: the data source ID or ref.
+    - orientation: "vertical" or "horizontal".
+    - Add child elements inside the repeat via parent_element ref.
+    """
+
+    require_payload("create_collection_elements", "elements", elements)
+    internal = [el.to_element_item_create() for el in elements]
+    return _create_elements_internal(ctx, page_id, internal, before_element_id)
+
+
+# ---------------------------------------------------------------------------
+# Element update tool
+# ---------------------------------------------------------------------------
+
+
+def update_element(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID the element belongs to.")],
+    element: Annotated[ElementUpdate, Field(description="Element update data.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Update an existing element's properties.
+
+    WHEN to use: User wants to change properties of an existing element (text, label, settings, table columns, menu items, etc.).
+    WHAT it does: Updates the specified properties on an element. Only non-null properties are applied.
+    RETURNS: Updated element ID and list of changed properties. Table column changes also return the table's columns afterwards and the removed columns; menu item changes return the menu's items afterwards and the removed items.
+    DO NOT USE when: You need to move elements, change data sources, or modify styles — use other tools for those.
+
+    ## Usage
+    - element_id: ID of the element to update (from list_elements).
+    - Only set the properties you want to change — unset properties are left unchanged.
+    - Unsupported properties reject the update without applying any changes.
+    - Button navigation belongs in create_actions(type='open_page', event='click'),
+      not in update_element. Links support navigation properties directly.
+
+    ## Table Columns
+    - list_elements shows each table's columns with uid, name, type, and value or label.
+      Change them by uid with add_table_columns, update_table_columns,
+      reorder_table_columns and remove_table_columns; columns you don't list stay
+      exactly as they are.
+    - value and label take fixed text or a runtime formula such as
+      get('current_record.field_<id>'). "$formula:" descriptions work only when
+      creating a table.
+    - To show a database field, set field_id (from get_tables_schema). Renaming a
+      column doesn't change what it shows.
+    - Only text and button columns can be created. Never remove a column to rebuild
+      it or to work around a setting you can't change (a link's target, styles,
+      link, tags or image settings): tell the user to change it in the table's
+      editor.
+    - Remove a column only when the user asked for it, and confirm first: undo
+      doesn't revert column changes, and removed columns and their click actions
+      are gone for good.
+
+    ## Dynamic Values with $formula:
+    - value: "$formula: the product name from the data source"
+    - default_value: "$formula: the current user's email"
+    - Inside a collection, descriptions use current_record for that collection's row.
+      For intentional fixed-row access, supply an explicit runtime expression.
+    - Switching a link/image to a generated URL applies only if that URL succeeds.
+      Independent changes can still apply; updated_fields lists only saved changes.
+
+    ## Menu Items
+    - list_elements shows each menu's items with uid, name, type, page_id (or url, for
+      a link to a custom address), and a top-level link's sub-links as children.
+      Change them by uid with add_menu_items, update_menu_items, reorder_menu_items
+      and remove_menu_items; items you don't list stay exactly as they are. On a
+      header or footer, they change its menu.
+    - add_menu_items adds page links, last unless before_uid is set; parent_uid makes
+      one a sub-link of a top-level link.
+    - update_menu_items renames an item or points a link to a page; the item keeps
+      its type, click actions and sub-links, and a new page drops the old page's
+      parameters. A button can't link to a page: give it an open_page action with
+      create_actions.
+    - reorder_menu_items lists every top-level item that stays; sub-links can't be
+      reordered.
+    - Remove an item only when the user asked for it: its sub-links go with it, undo
+      doesn't restore removed items, and a removed button's click actions are gone for
+      good.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Updating element %(id)d...") % {"id": element.element_id}
+    )
+
+    with transaction.atomic():
+        outcome = helpers.update_element(user, page, element)
+    orm_element, element_type = outcome.element, outcome.element_type
+
+    # Handle formula generation for $formula: fields (separate transaction)
+    formulas = element.get_formulas_to_update(orm_element, None, element_type)
+    applied_formulas: list[str] = []
+    errors: list[str] = []
+    if formulas:
+        try:
+            applied_formulas, errors = agents.update_single_element_formulas(
+                user, page, orm_element, element, element_type, tool_helpers
+            )
+        except PermissionException:
+            errors = [
+                "Permission denied while applying element formulas. "
+                "Previous formula values were retained. Do not retry the denied operation."
+            ]
+
+    dependent_fields = element.get_formula_dependent_fields(element_type)
+    property_aliases = assistant_element_type_registry.get_for(
+        element_type
+    ).property_aliases
+    updated_fields = []
+    for field in element.get_updated_field_names():
+        formula_field = property_aliases.get(field, field)
+        formula_field = dependent_fields.get(field, formula_field)
+        if formula_field not in formulas or formula_field in applied_formulas:
+            updated_fields.append(field)
+    result = {
+        "status": ("partial" if updated_fields else "error") if errors else "ok",
+        "element_id": element.element_id,
+        "element_type": element_type,
+        "updated_fields": updated_fields,
+        **outcome.result,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Element style tool
+# ---------------------------------------------------------------------------
+
+
+def update_element_style(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID the element belongs to.")],
+    style: Annotated[ElementStyleUpdate, Field(description="Style update data.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Update visual style of an element (box model + theme overrides).
+
+    WHEN to use: User wants to change borders, padding, margins, background, width, or theme style overrides (button colors, typography, input styles, etc.).
+    WHAT it does: Applies box-model values and per-element-type theme overrides.
+    RETURNS: Updated element ID, type, and list of changed fields.
+    DO NOT USE when: You need to change content (text, label) or structural properties — use update_element instead.
+
+    ## Box Model
+    - border_color, border_size, padding, margin: pass a single value for all 4 sides, or a dict like {"left": 0, "top": 10} to set specific sides only.
+    - border_radius, background_radius: corner rounding.
+    - background: "none" or "color", background_color: hex color.
+    - width: "full", "full-width", "normal", "medium", "small".
+
+    ## Theme Style Overrides (per element type)
+    - button: background_color, text_color, border_color, hover colors, font_size, width, alignment.
+    - link: text_color, hover_text_color, font_size, font_weight.
+    - typography: heading_1_*/body_* text_color, font_size, font_weight, text_alignment.
+    - input: input_background_color, input_border_color, input_text_color, label_text_color.
+    - table: header/cell colors, border_color, border_size.
+    - image: image_alignment, max_width, max_height, border_radius.
+
+    Only blocks valid for the element type are applied; others are ignored.
+
+    ## Reset
+    Set reset=true to restore all box-model fields to defaults and clear theme overrides.
+    You can combine reset with new values to reset-then-apply.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Styling element %(id)d...") % {"id": style.element_id}
+    )
+
+    with transaction.atomic():
+        element, element_type = helpers.update_element_style(user, page, style)
+
+    # Report which fields were explicitly set (not inherited from existing styles)
+    updated_fields = list(style.to_update_kwargs(element_type, {}).keys())
+    if not updated_fields:
+        return {
+            "status": "warning",
+            "element_id": style.element_id,
+            "element_type": element_type,
+            "message": (
+                "No style fields were applied. Make sure you pass style "
+                "properties (padding, margin, border_size, border_color, "
+                "background, width, etc.) in the style parameter. "
+                "Theme overrides (button, link, typography, etc.) are only "
+                "applied if the element type supports them."
+            ),
+        }
+    return {
+        "status": "ok",
+        "element_id": style.element_id,
+        "element_type": element_type,
+        "updated_fields": updated_fields,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Element move tool
+# ---------------------------------------------------------------------------
+
+
+def move_elements(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    moves: Annotated[
+        list[ElementMove], Field(description="Move operations to perform.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Move or reorder elements on a page.
+
+    WHEN to use: User wants to reorder elements, move elements into/out of containers, or rearrange page layout.
+    WHAT it does: Moves each element to a new position, parent, or container slot.
+    RETURNS: List of moved elements with their new positions.
+    DO NOT USE when: You need to create new elements — use create_*_elements instead.
+
+    ## Parameters per move
+    - element_id: ID of the element to move (from list_elements).
+    - before_id: Place before this element. null = move to end.
+    - parent_element_id: New parent container. null = move to root level.
+    - place_in_container: Slot inside parent_element_id (e.g. "0", "1" for columns). Only valid together with parent_element_id; null = default. When moving to the root level leave it null.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    if not moves:
+        return {"moved_elements": []}
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Moving %(count)d elements on %(name)s...")
+        % {"count": len(moves), "name": page.name}
+    )
+
+    moved: list[dict] = []
+    errors: list[str] = []
+
+    for element_move in moves:
+        tool_helpers.raise_if_cancelled()
+        try:
+            with transaction.atomic():
+                element = helpers.move_element(user, page, element_move)
+            moved.append(
+                {
+                    "element_id": element.id,
+                    "parent_element_id": element.parent_element_id,
+                    "place_in_container": element.place_in_container,
+                }
+            )
+        except PermissionException:
+            errors.append(
+                f"Permission denied for element {element_move.element_id}; it was not moved. "
+                "Do not retry the denied operation."
+            )
+        except Exception as exc:
+            errors.append(f"element {element_move.element_id}: {exc}")
+
+    result: dict[str, Any] = {"moved_elements": moved}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Workflow action tools
+# ---------------------------------------------------------------------------
+
+
+def list_actions(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    List all workflow actions on a page.
+
+    WHEN to use: Check existing actions, find action IDs, or review field mappings.
+    WHAT it does: Lists actions with id, type, element_id, event, field_mappings.
+    RETURNS: Workflow actions array.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    tool_helpers.update_status(
+        _("Listing actions on %(name)s...") % {"name": page.name}
+    )
+
+    actions = helpers.list_workflow_actions(user, page)
+    return {"workflow_actions": [a.model_dump() for a in actions]}
+
+
+def create_actions(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[int, Field(description="The page ID.")],
+    actions: Annotated[
+        list[ActionCreate], Field(description="Workflow actions to create.")
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Create workflow actions attached to elements (click, submit events).
+
+    WHEN to use: User wants buttons/forms to perform actions (navigate, create/update rows, show notifications).
+    WHAT it does: Creates workflow actions with formula support for dynamic values.
+    RETURNS: Created actions with id, type, element, event.
+    REQUIRED: `page_id` and `actions` must arrive in the same call. The ID says where to act; the payload says what to create. A call carrying only the ID creates nothing and is rejected.
+
+    ## Attaching Actions
+    - element: a ref from the same batch, or an existing element ID (from list_elements)
+    - event: "click" for buttons/links, "submit" for form containers
+    - Per-row buttons: add a button column to the table element, then attach each action to the table element with event "<column name>_click" (e.g. "View_click", "Delete_click") or "<uid>_click" with the column uid from list_elements. Use the column name, not its button label. Bare "click" works only for a table with one button column; duplicate column names require the "<uid>_click" event. Pass the row with page_parameters, e.g. {"name": "id", "value": "$formula: get('current_record.id')"}.
+
+    ## Action Types
+    - notification: Show a message (title/description are formulas)
+    - open_page: Navigate to another page (set navigate_to_page_id). Use page_parameters to pass context like the current row's ID to the target page's path parameters.
+    - create_row: Insert a row (needs table_id and field_values)
+    - update_row: Update a row (needs table_id, row_id, field_values)
+    - delete_row: Delete a row (needs table_id and row_id)
+    - refresh_data_source: Reload a data source
+    - logout: Log out the user
+
+    ## Dynamic Values with $formula:
+    Use "$formula: <intent>" — describe the data you want using references or ids when possible.
+    - field_values: {"field_id": "123", "value": "$formula: the Name form input"}
+    - row_id: "$formula: the id from the page parameter"
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    require_payload("create_actions", "actions", actions)
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    integration = helpers.get_local_baserow_integration(user, page.builder)
+
+    el_refs = _get_element_refs(tool_helpers, page_id)
+    ds_refs = _get_data_source_refs(tool_helpers, page_id)
+    created: list[dict] = []
+    action_pairs: list[tuple] = []
+
+    errors: list[str] = []
+    with transaction.atomic():
+        for action_create in actions:
+            tool_helpers.raise_if_cancelled()
+            tool_helpers.update_status(
+                _("Creating %(type)s action...") % {"type": action_create.type}
+            )
+            try:
+                orm_action, action_id = helpers.create_workflow_action(
+                    user, page, action_create, el_refs, ds_refs, integration
+                )
+            except Exception as exc:
+                raise_if_permission_denied(exc)
+                errors.append(f"{action_create.type} on {action_create.element}: {exc}")
+                continue
+            action_pairs.append((orm_action, action_create))
+            created.append(
+                {
+                    "id": action_id,
+                    "type": action_create.type,
+                    "element": action_create.element,
+                    "event": action_create.event,
+                }
+            )
+
+    # Formula generation (separate transactions)
+    errors.extend(
+        agents.update_workflow_action_formulas(user, page, action_pairs, tool_helpers)
+    )
+
+    result: dict[str, Any] = {"created_actions": created}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def add_action_field_mapping(
+    ctx: RunContext[AssistantDeps],
+    action_id: Annotated[int, Field(description="The workflow action ID.")],
+    field_id: Annotated[int, Field(description="The target table field ID.")],
+    value_formula: Annotated[
+        str,
+        Field(
+            description="Formula for the value, e.g. get('form_data.123') or get('page_parameter.id')."
+        ),
+    ],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Add or update a field mapping on an existing create_row/update_row action.
+
+    WHEN to use: Adding a new form input to an existing form that already has a row action.
+    WHAT it does: Maps a table field to a formula value without recreating the action.
+    RETURNS: Updated field mappings list.
+    """
+
+    tool_helpers = ctx.deps.tool_helpers
+    tool_helpers.update_status(
+        _("Adding field mapping to action %(id)d...") % {"id": action_id}
+    )
+
+    return helpers.add_field_mapping_to_action(
+        ctx.deps.user, ctx.deps.workspace, action_id, field_id, value_formula
+    )
+
+
+# ---------------------------------------------------------------------------
+# Composite page setup — phase helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_data_sources(
+    user,
+    page,
+    data_sources: list,
+    ds_ref_to_id: dict[str, int],
+    integration,
+    tool_helpers,
+) -> tuple[list[dict], list[str]]:
+    """
+    Create data sources, skipping duplicates by name or structural match.
+
+    :param user: The acting user.
+    :param page: The page to create data sources on.
+    :param data_sources: The requested data source definitions.
+    :param ds_ref_to_id: Ref-to-ID mapping, mutated in place.
+    :param integration: The local Baserow integration to attach to.
+    :param tool_helpers: Provides status updates and cancellation.
+    :return: ``(created, errors)``.
+    """
+
+    created: list[dict] = []
+    errors: list[str] = []
+    if not data_sources:
+        return created, errors
+
+    existing_ds = helpers.list_data_sources(user, page)
+    existing_by_name = {ds.name.lower(): ds for ds in existing_ds}
+    ds_pairs: list[tuple] = []
+
+    with transaction.atomic():
+        for ds_create in data_sources:
+            tool_helpers.raise_if_cancelled()
+            ex = existing_by_name.get(ds_create.name.lower())
+            if not ex:
+                ex = next(
+                    (ds for ds in existing_ds if ds_create.matches_existing(ds)),
+                    None,
+                )
+            if ex:
+                ds_ref_to_id[ds_create.ref] = ex.id
+                continue
+            tool_helpers.update_status(
+                _("Creating data source '%(name)s'...") % {"name": ds_create.name}
+            )
+            try:
+                orm_ds, ds_id = helpers.create_data_source(
+                    user, page, ds_create, integration
+                )
+                ds_ref_to_id[ds_create.ref] = ds_id
+                ds_pairs.append((orm_ds, ds_create))
+                created.append(
+                    {
+                        "id": ds_id,
+                        "ref": ds_create.ref,
+                        "name": ds_create.name,
+                        "type": ds_create.type,
+                    }
+                )
+            except Exception as exc:
+                raise_if_permission_denied(exc)
+                errors.append(f"data_source {ds_create.ref}: {exc}")
+    errors.extend(
+        agents.update_data_source_formulas(user, page, ds_pairs, tool_helpers)
+    )
+    return created, errors
+
+
+def _setup_elements(
+    user,
+    page,
+    elements: list,
+    el_ref_to_id: dict[str, int],
+    ds_ref_to_id: dict[str, int],
+    shared_page_refs: set[str],
+    tool_helpers,
+) -> tuple[list[dict], list[str]]:
+    """
+    Create elements in order, generate formulas, and handle table actions.
+
+    :param user: The acting user.
+    :param page: The page to create elements on.
+    :param elements: The requested element definitions.
+    :param el_ref_to_id: Ref-to-ID mapping, mutated in place.
+    :param ds_ref_to_id: Data source ref-to-ID mapping.
+    :param shared_page_refs: Refs placed on the shared page, mutated in place.
+    :param tool_helpers: Provides status updates and cancellation.
+    :return: ``(created, errors)``.
+    """
+
+    created: list[dict] = []
+    errors: list[str] = []
+    if not elements:
+        return created, errors
+
+    element_mapping: dict[str, tuple[Any, ElementItemCreate]] = {}
+    table_action_pairs: list[tuple] = []
+
+    tool_helpers.update_status(
+        _("Creating %(count)d elements on %(name)s...")
+        % {"count": len(elements), "name": page.name}
+    )
+    with transaction.atomic():
+        for el_create in elements:
+            tool_helpers.raise_if_cancelled()
+            try:
+                element, el_id, action_pairs = helpers.create_element(
+                    user,
+                    page,
+                    el_create,
+                    el_ref_to_id,
+                    ds_ref_to_id,
+                    shared_page_refs,
+                    None,
+                )
+                el_ref_to_id[el_create.ref] = el_id
+                element_mapping[el_create.ref] = (element, el_create)
+                table_action_pairs.extend(action_pairs)
+                created.append(
+                    {"id": el_id, "ref": el_create.ref, "type": el_create.type}
+                )
+            except Exception as exc:
+                raise_if_permission_denied(exc)
+                errors.append(f"element {el_create.ref}: {exc}")
+    errors.extend(
+        agents.update_element_formulas(
+            user, page, elements, element_mapping, tool_helpers
+        )
+    )
+    if table_action_pairs:
+        errors.extend(
+            agents.update_workflow_action_formulas(
+                user, page, table_action_pairs, tool_helpers
+            )
+        )
+    return created, errors
+
+
+def _setup_actions(
+    user,
+    page,
+    actions: list,
+    el_ref_to_id: dict[str, int],
+    ds_ref_to_id: dict[str, int],
+    integration,
+    tool_helpers,
+) -> tuple[list[dict], list[str]]:
+    """
+    Create workflow actions and generate their formulas.
+
+    :param user: The acting user.
+    :param page: The page to create actions on.
+    :param actions: The requested action definitions.
+    :param el_ref_to_id: Element ref-to-ID mapping.
+    :param ds_ref_to_id: Data source ref-to-ID mapping.
+    :param integration: The local Baserow integration to attach to.
+    :param tool_helpers: Provides status updates and cancellation.
+    :return: ``(created, errors)``.
+    """
+
+    created: list[dict] = []
+    errors: list[str] = []
+    if not actions:
+        return created, errors
+
+    action_pairs: list[tuple] = []
+    with transaction.atomic():
+        for action_create in actions:
+            tool_helpers.raise_if_cancelled()
+            tool_helpers.update_status(
+                _("Creating %(type)s action...") % {"type": action_create.type}
+            )
+            try:
+                orm_action, action_id = helpers.create_workflow_action(
+                    user,
+                    page,
+                    action_create,
+                    el_ref_to_id,
+                    ds_ref_to_id,
+                    integration,
+                )
+                action_pairs.append((orm_action, action_create))
+                created.append(
+                    {
+                        "id": action_id,
+                        "type": action_create.type,
+                        "element": action_create.element,
+                        "event": action_create.event,
+                    }
+                )
+            except Exception as exc:
+                raise_if_permission_denied(exc)
+                errors.append(
+                    f"action {action_create.type} on {action_create.element}: {exc}"
+                )
+    errors.extend(
+        agents.update_workflow_action_formulas(user, page, action_pairs, tool_helpers)
+    )
+    return created, errors
+
+
+# ---------------------------------------------------------------------------
+# Composite page setup tool
+# ---------------------------------------------------------------------------
+
+
+def setup_page(
+    ctx: RunContext[AssistantDeps],
+    page_id: Annotated[
+        int,
+        Field(
+            description="Existing page ID from list_pages or create_pages, never an application ID. Create a requested new page with create_pages first."
+        ),
+    ],
+    data_sources: Annotated[
+        list[DataSourceCreate] | None,
+        Field(default=None, description="Data sources to create."),
+    ] = None,
+    elements: Annotated[
+        list[ElementItemCreate] | None,
+        Field(default=None, description="Elements to create (all types)."),
+    ] = None,
+    actions: Annotated[
+        list[ActionCreate] | None,
+        Field(default=None, description="Workflow actions to create."),
+    ] = None,
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ] = "",
+) -> dict[str, Any]:
+    """\
+    Populate an existing page with data sources, elements, and actions.
+
+    WHEN to use: Building a complete page with data, UI elements, and interactions.
+    WHAT it does: Adds content to an existing page; it does not create the page itself. For a requested new page, call create_pages first and use its returned ID. Creates data sources first, then elements (in order), then actions. Handles ref resolution across all three phases.
+    RETURNS: Created items with ref-to-ID mappings and any errors. Partial success is possible — some items may be created even when others fail. Check the ``errors`` key.
+    ARGS: ``page_id`` is WHERE to build; ``data_sources``, ``elements`` and ``actions`` are WHAT to build. Each of the three is optional on its own, but a call carrying none of them creates nothing and is rejected. To only open a page, use ``navigate``.
+
+    ## Deduplication
+    Data sources are deduplicated by name (case-insensitive) and by structural match (same type and table). Existing data sources are reused and their IDs mapped to the provided refs.
+
+    ## Execution Order
+    1. Data sources (list_rows, get_row) — so elements can reference them.
+    2. Elements (in order — parents before children): heading, text, button, link, image, column, form_container, simple_container, input_text, choice, checkbox, datetime_picker, record_selector, table, repeat.
+    3. Actions (click, submit) — attached to elements via ref.
+
+    ## Element Fields by Type
+    - heading: value (text), level (1-5)
+    - text: value (text), format ("plain"/"markdown")
+    - button/link: value (label)
+    - image: image_url, alt_text
+    - column: column_count
+    - form_container: submit_button_label
+    - input_text: label, placeholder, default_value, required, validation_type, is_multiline
+    - choice: label, choice_options, multiple
+    - checkbox: label, default_value
+    - table: data_source (ref), fields [{name, type ("text"/"button"), value (text) or label (button)}]
+    - repeat: data_source (ref), orientation
+
+    ## Refs
+    - data_source refs: referenced by elements (data_source field) and actions (data_source field)
+    - element refs: referenced by child elements (parent_element field) and actions (element field)
+    - Use string refs for items created in this call, int IDs for pre-existing items.
+
+    ## Dynamic Values
+    Use "$formula: <intent>" — describe the data you want using references or ids when possible.
+    Examples: "$formula: the Name field from the projects data source", "$formula: the Email form input".
+
+    ## Shared Elements (header, footer) — CRITICAL
+    Headers and footers are shared across ALL pages. Any element placed inside
+    a header/footer (as a child) is also shared and appears on every page.
+    - ONLY put site-wide navigation in headers/footers: menus, logo, links to fixed pages.
+    - NEVER put page-specific content as children of headers/footers: page titles,
+      data-bound text, forms, "back" buttons, or content that varies per page.
+    - Page-specific content belongs directly on the page root, NOT inside shared containers.
+    - If a header already exists (page_name="[shared]" in list_elements), do NOT
+      add page-specific children to it.
+    """
+
+    user = ctx.deps.user
+    tool_helpers = ctx.deps.tool_helpers
+
+    if not data_sources and not elements and not actions:
+        raise ModelRetry(
+            "setup_page was called with no content: `data_sources`, `elements` "
+            "and `actions` were all empty, so nothing was created. An ID "
+            "argument says where to act, never what to do — send the items to "
+            "build in the same call that carries the ID. To only open a page, "
+            "use `navigate` instead."
+        )
+
+    page = helpers.get_page(user, ctx.deps.workspace, page_id)
+    shared_page = PageHandler().get_shared_page(page.builder)
+    integration = helpers.get_local_baserow_integration(user, page.builder)
+
+    ds_ref_to_id: dict[str, int] = _get_data_source_refs(tool_helpers, page_id)
+    el_ref_to_id: dict[str, int] = _get_element_refs(tool_helpers, page_id)
+    shared_page_refs: set[str] = set(
+        _get_element_refs(tool_helpers, shared_page.id).keys()
+    )
+
+    result: dict[str, Any] = {}
+    all_errors: list[str] = []
+
+    # Phase 1: Data sources
+    try:
+        created_ds, ds_errors = _setup_data_sources(
+            user, page, data_sources or [], ds_ref_to_id, integration, tool_helpers
+        )
+    except PermissionException:
+        return {
+            **result,
+            "errors": all_errors,
+            **permission_denied_result("setup_page"),
+        }
+    all_errors.extend(ds_errors)
+    _track_data_source_refs(tool_helpers, page_id, ds_ref_to_id)
+    if created_ds:
+        result["created_data_sources"] = created_ds
+
+    # Phase 2: Elements
+    try:
+        created_el, el_errors = _setup_elements(
+            user,
+            page,
+            elements or [],
+            el_ref_to_id,
+            ds_ref_to_id,
+            shared_page_refs,
+            tool_helpers,
+        )
+    except PermissionException:
+        return {
+            **result,
+            "errors": all_errors,
+            **permission_denied_result("setup_page"),
+        }
+    all_errors.extend(el_errors)
+    _track_element_refs(tool_helpers, page_id, el_ref_to_id)
+    _track_element_refs(
+        tool_helpers,
+        shared_page.id,
+        {r: 0 for r in el_ref_to_id if r in shared_page_refs},
+    )
+    if created_el:
+        result["created_elements"] = created_el
+
+    # Phase 3: Actions
+    try:
+        created_actions, action_errors = _setup_actions(
+            user,
+            page,
+            actions or [],
+            el_ref_to_id,
+            ds_ref_to_id,
+            integration,
+            tool_helpers,
+        )
+    except PermissionException:
+        return {
+            **result,
+            "errors": all_errors,
+            **permission_denied_result("setup_page"),
+        }
+    all_errors.extend(action_errors)
+    if created_actions:
+        result["created_actions"] = created_actions
+
+    if all_errors:
+        result["errors"] = all_errors
+
+    # Navigate to the page
+    tool_helpers.navigate_to(
+        BuilderPageNavigationType(
+            type="builder-page",
+            application_id=page.builder_id,
+            page_id=page_id,
+            page_name=page.name,
+        )
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: setup_user_source
+# ---------------------------------------------------------------------------
+
+
+def setup_user_source(
+    ctx: RunContext[AssistantDeps],
+    application_id: Annotated[int, Field(description="The builder application ID.")],
+    setup: Annotated[UserSourceSetup, Field(description="User source configuration.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Set up a user source so the application can have logged-in users with roles.
+
+    WHEN to use: User wants login, authentication, role-based access, or user accounts in their app.
+    WHAT it does: Creates a users table (or uses an existing one) and configures a Local Baserow user source with password authentication.
+    RETURNS: User source ID, table ID, available roles.
+    DO NOT USE when: A user source already exists for this application.
+    HOW: If user mentions a specific table, use table_id. Otherwise use database_id to create a new users table.
+    """
+
+    user = ctx.deps.user
+    workspace = ctx.deps.workspace
+    tool_helpers = ctx.deps.tool_helpers
+
+    try:
+        builder = helpers.get_builder(user, workspace, application_id)
+    except Exception as exc:
+        raise_if_permission_denied(exc)
+        return {"error": f"Could not find application: {exc}"}
+
+    tool_helpers.update_status(_("Setting up user source..."))
+    integration = helpers.get_local_baserow_integration(user, builder)
+
+    try:
+        with transaction.atomic():
+            if setup.table_id:
+                tool_helpers.update_status(_("Validating existing table..."))
+                table, field_map = helpers.resolve_existing_table(
+                    user, workspace, setup.table_id
+                )
+            else:
+                tool_helpers.update_status(_("Creating users table..."))
+                table, field_map = helpers.create_users_table(
+                    user, setup.database_id, workspace, setup.get_roles()
+                )
+
+            tool_helpers.update_status(_("Creating user source..."))
+            user_source = helpers.create_user_source(
+                user, builder, setup.name, table, field_map, integration
+            )
+    except Exception as exc:
+        raise_if_permission_denied(exc)
+        return {"error": str(exc)}
+
+    # Create login page if not already set
+    login_page_id = builder.login_page_id
+    if not login_page_id:
+        tool_helpers.update_status(_("Creating login page..."))
+        login_page = helpers.create_login_page(user, builder, user_source.id)
+        login_page_id = login_page.id
+
+    from baserow.core.user_sources.handler import UserSourceHandler
+
+    roles = UserSourceHandler().get_all_roles_for_application(builder)
+
+    result: dict[str, Any] = {
+        "user_source_id": user_source.id,
+        "table_id": table.id,
+        "roles": roles,
+        "login_page_id": login_page_id,
+    }
+    if "hint" in field_map:
+        result["hint"] = field_map["hint"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Theme tools
+# ---------------------------------------------------------------------------
+
+
+def set_theme(
+    ctx: RunContext[AssistantDeps],
+    application_id: Annotated[int, Field(description="The builder application ID.")],
+    theme_name: Annotated[ThemeName, Field(description="Theme name to apply.")],
+    thought: Annotated[
+        str, Field(description="Brief reasoning for calling this tool.")
+    ],
+) -> dict[str, Any]:
+    """\
+    Change the theme of a builder application.
+
+    WHEN to use: User wants to change the look and feel of an existing application.
+    WHAT it does: Applies a predefined theme (colors, typography, button styles, etc.) to the application.
+    RETURNS: Confirmation with applied theme name.
+    DO NOT USE when: Creating a new application — use the theme parameter on create_builders instead.
+
+    ## Available Themes
+    {theme_list}
+    """
+
+    user = ctx.deps.user
+    workspace = ctx.deps.workspace
+    tool_helpers = ctx.deps.tool_helpers
+
+    builder = helpers.get_builder(user, workspace, application_id)
+    tool_helpers.update_status(
+        _("Applying %(theme)s theme to %(app)s...")
+        % {"theme": theme_name, "app": builder.name}
+    )
+
+    applied = apply_theme(builder, theme_name, user=user)
+
+    if not applied:
+        return {
+            "status": "error",
+            "application_id": application_id,
+            "theme": theme_name,
+            "error": f"Theme template '{theme_name}' could not be loaded.",
+        }
+
+    return {
+        "status": "ok",
+        "application_id": application_id,
+        "theme": theme_name,
+        "description": THEME_CATALOG.get(theme_name, ""),
+    }
+
+
+set_theme.__doc__ = set_theme.__doc__.format(
+    theme_list="\n    ".join(
+        f"- {name}: {desc}" for name, desc in THEME_CATALOG.items()
+    )
+)
+
+
+# ---------------------------------------------------------------------------
+# Exports
+# ---------------------------------------------------------------------------
+
+TOOL_FUNCTIONS = [
+    list_pages,
+    create_pages,
+    update_page,
+    list_data_sources,
+    create_data_sources,
+    update_data_source,
+    list_elements,
+    create_display_elements,
+    create_layout_elements,
+    create_form_elements,
+    create_collection_elements,
+    update_element,
+    update_element_style,
+    move_elements,
+    list_actions,
+    create_actions,
+    add_action_field_mapping,
+    setup_page,
+    setup_user_source,
+    set_theme,
+]
+builder_toolset = AssistantFunctionToolset(TOOL_FUNCTIONS, max_retries=3)

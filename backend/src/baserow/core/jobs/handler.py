@@ -1,0 +1,367 @@
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Type
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import AbstractUser
+from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
+from django.db.models import Q, QuerySet
+
+from celery.exceptions import SoftTimeLimitExceeded
+
+from baserow.core.utils import Progress
+
+from .constants import JOB_CANCELLED
+from .exceptions import JobCancelled, JobDoesNotExist, JobNotCancellable
+from .models import Job
+from .registries import job_type_registry
+from .signals import job_started
+from .tasks import run_async_job
+from .types import AnyJob
+
+
+class JobHandler:
+    @classmethod
+    def cancel_job(cls, job: AnyJob) -> Job | None:
+        """
+        Marks a job for cancellation. It will mark the job as cancelled, but won't
+        cancel a Celery task directly. The task's responsible to drop job's processing
+        as soon as it detects the marker.
+
+        :param job: The job to cancel.
+        :return: The job that was marked for cancellation.
+        :raises JobNotCancellable: If the job is already finished or failed, or its
+            type refuses the cancellation, and cannot be cancelled.
+        """
+
+        job_type = job_type_registry.get_by_model(job.specific_class)
+        with transaction.atomic():
+            current_job = cls.lock_job(job) if job_type.lock_on_cancel else job
+            if current_job.cancelled:
+                return
+            elif current_job.ended or (
+                job_type.lock_on_cancel and not job_type.is_cancellable(current_job)
+            ):
+                raise JobNotCancellable()
+
+            # Only the state is saved, so that what the job saved in the meantime
+            # is kept. The task checks the cache, so it's only updated once the
+            # cancellation commits: a rolled back one mustn't drop the task.
+            job.state = JOB_CANCELLED
+            job.save(update_fields=["state", "updated_on"])
+            transaction.on_commit(job.set_cached_state)
+        return job
+
+    @classmethod
+    def lock_job(cls, job: AnyJob) -> AnyJob:
+        """
+        Locks the row of the job until the end of the current transaction, see
+        `JobType.lock_on_cancel`.
+
+        Only the row of the base job is locked. A multi-table save of the job
+        updates that row first, so the locks are always taken in the same order.
+
+        :param job: The job to lock.
+        :return: The specific job, as it is in the database.
+        """
+
+        Job._base_manager.select_for_update().only("id").get(id=job.id)
+        return job.specific_class._base_manager.get(id=job.id)
+
+    @classmethod
+    def run(cls, job: AnyJob):
+        def progress_updated(percentage, state):
+            """
+            Every time the progress of the job changes, this callback function is
+            called. If the percentage or the state has changed, the job will be updated.
+            """
+
+            nonlocal job
+
+            # Periodically check for a job cancellation marker. Users can cancel jobs
+            # via the UI, but this won't stop tasks already running in Celery. To handle
+            # cancellations within a worker, the JobType.run method should periodically
+            # check for a cancellation marker, either manually or whenever Progress
+            # methods are called.
+            if job.cancelled:
+                raise JobCancelled()
+            job.progress_percentage = percentage
+
+            if state:
+                job.set_state(state)
+            job.set_cached_state()
+
+        progress = Progress(100)
+        progress.register_updated_event(progress_updated)
+
+        job_started.send(JobHandler, job=job, user=job.user)
+
+        job_type = job_type_registry.get_by_model(job)
+        out = job_type.run(job, progress)
+
+        # Final check if the job was cancelled because we don't want to overwrite the
+        # state if the `job_type.run` didn't notice the cancellation.
+        if job.cancelled:
+            raise JobCancelled()
+
+        return out
+
+    @classmethod
+    def get_job(
+        cls,
+        user: AbstractUser,
+        job_id: int,
+        job_model: Optional[Type[AnyJob]] = None,
+        base_queryset: Optional[QuerySet] = None,
+    ) -> Job:
+        """
+        Returns the job corresponding to the given id.
+
+        :param job_id: The job id we want to fetch.
+        :param job_model: An optional Job model.
+        :param base_queryset: An optional base queryset to use instead of the default
+            one.
+        :return: the job.
+        """
+
+        # Numeric IDs are only meaningful within the same principal type.
+        if not isinstance(user, get_user_model()) or user.pk is None:
+            raise JobDoesNotExist(f"The job with id {job_id} does not exist.")
+
+        if not job_model:
+            job_model = Job
+
+        if base_queryset is None:
+            base_queryset = job_model.objects
+
+        try:
+            return base_queryset.select_related("user").get(id=job_id, user_id=user.id)
+        except job_model.DoesNotExist:
+            raise JobDoesNotExist(f"The job with id {job_id} does not exist.")
+
+    @classmethod
+    def get_jobs_for_user(
+        cls,
+        user: AbstractUser,
+        filter_states: Optional[List[str]],
+        filter_ids: Optional[List[int]],
+        base_model: Optional[Type[AnyJob]] = None,
+        type_filters: Optional[Dict[str, Any]] = None,
+    ) -> QuerySet:
+        """
+        Returns all jobs belonging to the specified user.
+
+        :param user: The user we want the jobs for.
+        :param filter_states: A list of states that the jobs should have, or not
+            have if prefixed with a !.
+        :param filter_ids: A list of specific job ids to return.
+        :param base_model: An optional Job model.
+        :param type_filters: Optional type-specific filters (e.g., field_id for
+            GenerateAIValuesJob).
+        :return: A QuerySet with the filtered jobs visible to the user.
+        """
+
+        if base_model is None:
+            base_model = Job
+
+        if not isinstance(user, get_user_model()) or user.pk is None:
+            return base_model.objects.none()
+
+        def get_job_states_filter(states):
+            states_q = Q()
+            for state in states:
+                if state.startswith("!"):
+                    states_q &= ~Q(state=state[1:])
+                else:
+                    states_q |= Q(state=state)
+            return states_q
+
+        queryset = base_model.objects.all().order_by("-id")
+
+        if filter_states:
+            queryset = queryset.filter(get_job_states_filter(filter_states))
+
+        if filter_ids:
+            queryset = queryset.filter(id__in=filter_ids)
+
+        if type_filters:
+            queryset = queryset.filter(**type_filters)
+
+        queryset = cls._scope_queryset_to_user(user, queryset, base_model, filter_ids)
+
+        return queryset.select_related("content_type")
+
+    @classmethod
+    def _scope_queryset_to_user(
+        cls,
+        user: AbstractUser,
+        queryset: QuerySet,
+        base_model: Type[AnyJob],
+        filter_ids: Optional[List[int]],
+    ) -> QuerySet:
+        """
+        Delegates the user-visibility scoping of a jobs listing queryset to the
+        job types. When a specific job model is requested its job type scopes
+        the whole queryset. On the generic model, jobs of other users are only
+        considered when explicitly requested by id, and each foreign job type
+        decides whether the user may see them.
+
+        :param user: The user requesting the jobs listing.
+        :param queryset: The already filtered queryset of jobs.
+        :param base_model: The job model the queryset is based on.
+        :param filter_ids: The specific job ids requested, if any.
+        :return: The queryset restricted to what the user may see.
+        """
+
+        if base_model is not Job:
+            job_type = job_type_registry.get_by_model(base_model)
+            return job_type.scope_queryset_to_user(user, queryset)
+
+        if not filter_ids:
+            return queryset.filter(user=user)
+
+        visible_q = Q(user=user)
+        foreign_content_type_ids = list(
+            Job.objects.filter(id__in=filter_ids)
+            .exclude(user=user)
+            .values_list("content_type_id", flat=True)
+            .distinct()
+        )
+        content_types_by_id = ContentType.objects.in_bulk(foreign_content_type_ids)
+        for content_type_id in foreign_content_type_ids:
+            content_type = content_types_by_id.get(content_type_id)
+            model_class = content_type.model_class() if content_type else None
+            if model_class is None:
+                continue
+            try:
+                job_type = job_type_registry.get_by_model(model_class)
+            except job_type_registry.does_not_exist_exception_class:
+                continue
+            scoped = job_type.scope_queryset_to_user(
+                user, job_type.model_class.objects.filter(id__in=filter_ids)
+            )
+            visible_q |= Q(id__in=scoped.values("id"))
+
+        return queryset.filter(visible_q)
+
+    @classmethod
+    def get_pending_or_running_jobs(
+        cls,
+        job_type_name: str,
+    ) -> QuerySet:
+        """
+        Returns a queryset of pending or running jobs of a provided job type
+        that can be further filtered.
+
+        :param job_type_name: The job type for which we want the queryset.
+        :return: Queryset of all pending or running jobs of the job type.
+        """
+
+        job_type = job_type_registry.get(job_type_name)
+        model_class = job_type.model_class
+        return model_class.objects.filter().is_pending_or_running()
+
+    def create_and_start_job(
+        self, user: AbstractUser, job_type_name: str, sync=False, **kwargs
+    ) -> Job:
+        """
+        Creates a new job and schedule the asynchronous task.
+
+        :param user: The user whom launch the task.
+        :param job_type_name: The job type we want to launch.
+        :param sync: True if you want to execute the job immediately.
+
+        :return: The newly created job.
+        """
+
+        job_type = job_type_registry.get(job_type_name)
+        model_class = job_type.model_class
+        job_values = job_type.prepare_values(kwargs, user)
+        job: AnyJob = model_class(user=user, **job_values)
+        job_type.can_schedule_or_raise(job)
+        job.save()
+        job_type.after_job_creation(job, kwargs)
+
+        if sync:
+            run_async_job(job.id)
+            job.refresh_from_db()
+        else:
+            # This wrapper ensure the job doesn't stay in pending state if something
+            # goes wrong during the delay call. This is related to the redis connection
+            # failure that triggers a sys.exit(1) to be called in gunicorn.
+            def call_async_job_safe():
+                try:
+                    run_async_job.delay(job.id)
+                except BaseException as e:
+                    job.refresh_from_db()
+                    if job.pending:
+                        job.set_state_failed(
+                            str(e),
+                            f"Something went wrong during the job({job.id}) execution.",
+                        )
+                        job.save()
+                    raise
+
+            transaction.on_commit(call_async_job_safe)
+
+        return job
+
+    def clean_up_jobs(self):
+        """
+        Terminate running jobs after the soft limit and delete expired jobs.
+        """
+
+        # Delete old job
+        now = datetime.now(tz=timezone.utc)
+        limit_date = now - timedelta(
+            minutes=(settings.BASEROW_JOB_EXPIRATION_TIME_LIMIT)
+        )
+        for job_to_delete in Job.objects.filter(created_on__lte=limit_date).is_ended():
+            self.delete_job(job_to_delete.specific)
+
+        # Expire non expired jobs
+        limit_date = now - timedelta(seconds=(settings.BASEROW_JOB_SOFT_TIME_LIMIT + 1))
+
+        #  Use updated_on instead of created_on to verify the last update date
+        # but use the cache since the DB is not updated until the end of the transaction
+        jobs_to_update = []
+        for job in Job.objects.filter(
+            created_on__lte=limit_date
+        ).is_pending_or_running():
+            if (
+                last_updated_on := job.last_updated_on
+            ) and last_updated_on < limit_date:
+                job.set_state_failed(
+                    "Timeout error",
+                    "Something went wrong during the job execution.",
+                    SoftTimeLimitExceeded.__name__,
+                )
+                # Set the updated_on manually because it won't be set by bulk_update
+                job.updated_on = now
+                jobs_to_update.append(job)
+        if jobs_to_update:
+            Job.objects.bulk_update(
+                jobs_to_update,
+                fields=[
+                    "updated_on",
+                    "state",
+                    "error",
+                    "human_readable_error",
+                    "error_code",
+                ],
+            )
+
+    @classmethod
+    def delete_job(cls, job: Type[Job]):
+        """
+        Deletes a job, calls the job type's before_delete method and clears the job
+        cache.
+
+        :param job: The specific job to delete.
+        """
+
+        job_type = job_type_registry.get_by_model(job)
+        job_type.before_delete(job)
+        job.clear_job_cache()
+        job.delete()

@@ -1,0 +1,181 @@
+import { isSecureURL } from '@baserow/modules/core/utils/string'
+import { pageFinished } from '@baserow/modules/core/utils/routing'
+import { getCookieName } from '@baserow/modules/core/utils/cookie'
+import { jwtDecode } from 'jwt-decode'
+import tldjs from 'tldjs'
+import { useCookie, useRuntimeConfig, nextTick } from '#imports'
+import {
+  USER_SOURCE_COOKIE_TOKEN_NAME,
+  REFRESH_TOKEN_MAX_AGE,
+  getRefreshTokenCookieOptions,
+} from '@baserow/modules/core/utils/userSourceAuth'
+
+const cookieTokenName = 'jwt_token'
+export const userSourceCookieTokenName = USER_SOURCE_COOKIE_TOKEN_NAME
+export const userSessionCookieName = 'user_session'
+
+export const setToken = (
+  appOrContext,
+  token,
+  key = cookieTokenName,
+  configuration = { sameSite: null }
+) => {
+  const { runWithContext } = appOrContext
+  return runWithContext(() => {
+    const config = useRuntimeConfig()
+    const secure =
+      configuration.secure ??
+      isSecureURL(configuration.cookieUrl || config.public.publicWebFrontendUrl)
+    const cookie = useCookie(
+      getCookieName(config, key),
+      getRefreshTokenCookieOptions({
+        path: configuration.path || '/',
+        sameSite:
+          configuration.sameSite || config.public.baserowFrontendSameSiteCookie,
+        secure,
+      })
+    )
+    cookie.value = token
+  })
+}
+
+/**
+ * Sets a session cookie in the browser to store the user's signed session payload upon
+ * login. This cookie facilitates backend authentication for GET requests, such as
+ * downloading files with the secure_file_serve feature, when the Authorization header
+ * is unavailable. The payload includes a token hash to invalidate the cookie upon
+ * logout.
+ *
+ * @param {*} app: the nuxt app instance
+ * @param {*} signedUserSession: the signed user session payload to be stored in the
+ * cookie
+ * @param {*} key: the cookie name
+ * @param {*} configuration: the configuration object with the sameSite key
+ * @returns
+ */
+export const setUserSessionCookie = (
+  appOrContext,
+  signedUserSession,
+  key = userSessionCookieName,
+  configuration = { sameSite: null }
+) => {
+  const { runWithContext } = appOrContext
+  return runWithContext(() => {
+    const config = useRuntimeConfig()
+    const secure = isSecureURL(config.public.publicWebFrontendUrl)
+
+    // To make the cookie available to all subdomains, set the domain to the top-level
+    // domain. This is necessary for the secure_file_serve feature to work across
+    // subdomains, as when the backend serves files from a different subdomain from the
+    // frontend. The top-level domain is extracted from the backend URL.
+    // NOTE: For security reasons, it's not possible to set a cookie for a different
+    // domain, so this won't work if the frontend and backend are on different domains.
+    const topLevelDomain = tldjs.getDomain(config.public.publicBackendUrl)
+
+    const cookie = useCookie(getCookieName(config, key), {
+      path: '/',
+      maxAge: REFRESH_TOKEN_MAX_AGE,
+      sameSite:
+        configuration.sameSite || config.public.baserowFrontendSameSiteCookie,
+      secure,
+      domain: topLevelDomain,
+    })
+    cookie.value = signedUserSession
+  })
+}
+
+export const unsetToken = (
+  appOrContext,
+  key = cookieTokenName,
+  configuration = {}
+) => {
+  const { runWithContext } = appOrContext
+  return runWithContext(() => {
+    const config = useRuntimeConfig()
+    const cookie = useCookie(getCookieName(config, key), configuration)
+    cookie.value = null
+  })
+}
+
+export const unsetUserSessionCookie = (
+  appOrContext,
+  key = userSessionCookieName
+) => {
+  const { runWithContext } = appOrContext
+  runWithContext(() => {
+    const config = useRuntimeConfig()
+    const cookie = useCookie(getCookieName(config, key))
+    cookie.value = null
+  })
+}
+
+export const getToken = async (
+  appOrContext,
+  key = cookieTokenName,
+  configuration = {}
+) => {
+  const { runWithContext } = appOrContext
+  return await runWithContext(() => {
+    const config = useRuntimeConfig()
+    const cookie = useCookie(getCookieName(config, key), configuration)
+    return cookie.value
+  })
+}
+
+/**
+ * Returns the id of the login session a refresh token belongs to. A rotated refresh
+ * token carries it in the `session_id` claim, the first one of a login uses its own
+ * id.
+ */
+export const getRefreshTokenSessionId = (token) => {
+  try {
+    const payload = jwtDecode(token)
+    return payload.session_id || payload.jti || null
+  } catch {
+    return null
+  }
+}
+
+export const getTokenIfEnoughTimeLeft = async (
+  appOrContext,
+  key = cookieTokenName,
+  configuration = {}
+) => {
+  const token = await getToken(appOrContext, key, configuration)
+  const now = Math.ceil(new Date().getTime() / 1000)
+
+  let data
+  try {
+    data = jwtDecode(token)
+  } catch (error) {
+    return null
+  }
+  // Return the token if it is still valid for more of the 10% of the lifespan.
+  return data && (data.exp - now) / (data.exp - data.iat) > 0.1 ? token : null
+}
+
+export const logoutAndRedirectToLogin = async (
+  router,
+  store,
+  showSessionExpiredToast = false,
+  showPasswordChangedToast = false,
+  invalidateToken = false
+) => {
+  if (showPasswordChangedToast) {
+    await store.dispatch('auth/forceLogoff')
+  } else {
+    await store.dispatch('auth/logoff', { invalidateToken })
+  }
+
+  await router.push({ name: 'login', query: { noredirect: null } })
+  await pageFinished(store.app)
+  await nextTick()
+
+  if (showSessionExpiredToast) {
+    store.dispatch('toast/setUserSessionExpired', true)
+  } else if (showPasswordChangedToast) {
+    store.dispatch('toast/setUserPasswordChanged', true)
+  }
+
+  await store.dispatch('auth/clearAllStoreUserData')
+}

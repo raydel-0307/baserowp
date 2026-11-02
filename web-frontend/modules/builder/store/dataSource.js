@@ -1,0 +1,485 @@
+import DataSourceService from '@baserow/modules/builder/services/dataSource'
+import PublishedBuilderService from '@baserow/modules/builder/services/publishedBuilder'
+import { ELEMENT_EVENTS } from '@baserow/modules/builder/enums'
+
+const state = () => ({})
+
+const updateContext = {
+  updateTimeout: null,
+  promiseResolve: null,
+  lastUpdatedValues: null,
+  valuesToUpdate: {},
+}
+
+const mutations = {
+  ADD_ITEM(state, { page, dataSource, beforeId = null }) {
+    if (beforeId === null) {
+      page.dataSources.push(dataSource)
+    } else {
+      const insertionIndex = page.dataSources.findIndex(
+        (e) => e.id === beforeId
+      )
+      page.dataSources.splice(insertionIndex, 0, dataSource)
+    }
+  },
+  UPDATE_ITEM(state, { page, dataSource: dataSourceToUpdate, values }) {
+    const index = page.dataSources.findIndex(
+      (dataSource) => dataSource.id === dataSourceToUpdate.id
+    )
+    if (index === -1) {
+      return
+    }
+    page.dataSources.splice(index, 1, {
+      ...page.dataSources[index],
+      ...values,
+    })
+  },
+  FULL_UPDATE_ITEM(state, { page, dataSource: dataSourceToUpdate, values }) {
+    const index = page.dataSources.findIndex(
+      (dataSource) => dataSource.id === dataSourceToUpdate.id
+    )
+    if (index === -1) {
+      return
+    }
+    page.dataSources.splice(index, 1, {
+      ...values,
+    })
+  },
+  DELETE_ITEM(state, { page, dataSourceId }) {
+    const index = page.dataSources.findIndex(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+    if (index > -1) {
+      page.dataSources.splice(index, 1)
+    }
+  },
+  MOVE_ITEM(state, { page, index, oldIndex }) {
+    page.dataSources.splice(index, 0, page.dataSources.splice(oldIndex, 1)[0])
+  },
+  MOVE_ITEM_PAGE(state, { pageSource, pageDest, dataSourceId }) {
+    const index = pageSource.dataSources.findIndex(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+
+    if (index > -1) {
+      const moved = { ...pageSource.dataSources[index], page_id: pageDest.id }
+      pageSource.dataSources.splice(index, 1)
+      pageDest.dataSources.push(moved)
+    }
+  },
+  CLEAR_ITEMS(state, { page }) {
+    page.dataSources = []
+  },
+  SET_LOADING(state, { page, value }) {
+    page._.dataSourceLoading = value
+  },
+  SET_FETCHED(state, { page }) {
+    page._.dataSourceFetched = true
+  },
+}
+
+const actions = {
+  forceCreate({ commit }, { page, dataSource, beforeId = null }) {
+    commit('ADD_ITEM', { page, dataSource, beforeId })
+  },
+  forceUpdate({ commit, dispatch }, { page, dataSource, values }) {
+    commit('UPDATE_ITEM', { page, dataSource, values })
+  },
+  forceDelete({ commit, dispatch }, { page, dataSourceId }) {
+    commit('DELETE_ITEM', { page, dataSourceId })
+  },
+  forceMove({ commit, getters }, { page, dataSourceId, beforeDataSourceId }) {
+    const currentOrder = getters
+      .getPageDataSources(page)
+      .map((dataSource) => dataSource.id)
+
+    const oldIndex = currentOrder.findIndex((id) => id === dataSourceId)
+    const index = beforeDataSourceId
+      ? currentOrder.findIndex((id) => id === beforeDataSourceId)
+      : getters.getPageDataSources(page).length
+
+    // If the dataSource is before the beforeDataSource we must decrease the target index by
+    // one to compensate the removed dataSource.
+    if (oldIndex < index) {
+      commit('MOVE_ITEM', { page, index: index - 1, oldIndex })
+    } else {
+      commit('MOVE_ITEM', { page, index, oldIndex })
+    }
+  },
+  forcePageMove({ commit, getters }, { pageDest, pageSource, dataSourceId }) {
+    commit('MOVE_ITEM_PAGE', { pageSource, pageDest, dataSourceId })
+  },
+  async create({ commit, dispatch }, { page, values, beforeId }) {
+    const { $registry, $i18n, $client, $config } = this
+    commit('SET_LOADING', { page, value: true })
+    const { data: dataSource } = await DataSourceService($client).create(
+      page.id,
+      values,
+      beforeId
+    )
+
+    await dispatch('forceCreate', { page, dataSource, beforeId })
+    await dispatch('application/refreshPermissions', page.builder_id, {
+      root: true,
+    })
+    commit('SET_LOADING', { page, value: false })
+
+    return dataSource
+  },
+  async update({ commit, dispatch, getters }, { page, dataSourceId, values }) {
+    const { $registry, $i18n, $client, $config } = this
+    const dataSourcesOfPage = getters.getPageDataSources(page)
+    const dataSource = dataSourcesOfPage.find(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+    const oldValues = {}
+    const newValues = {}
+    Object.keys(values).forEach((name) => {
+      if (Object.prototype.hasOwnProperty.call(dataSource, name)) {
+        oldValues[name] = dataSource[name]
+        newValues[name] = values[name]
+      }
+    })
+
+    await dispatch('forceUpdate', { page, dataSource, values: newValues })
+
+    commit('SET_LOADING', { page, value: true })
+    try {
+      const { data: updatedDataSource } = await DataSourceService(
+        $client
+      ).update(dataSource.id, values)
+
+      await dispatch('forceUpdate', {
+        page,
+        dataSource,
+        values: updatedDataSource,
+      })
+      return updatedDataSource
+    } catch (error) {
+      await dispatch('forceUpdate', { page, dataSource, values: oldValues })
+      throw error
+    } finally {
+      commit('SET_LOADING', { page, value: false })
+    }
+  },
+
+  async debouncedUpdate(
+    { dispatch, getters, commit },
+    { page, dataSourceId, values }
+  ) {
+    const { $registry, $i18n, $client, $config } = this
+    const dataSourcesOfPage = getters.getPageDataSources(page)
+    const dataSource = dataSourcesOfPage.find(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+    const oldValues = {}
+
+    Object.keys(values).forEach((name) => {
+      if (Object.prototype.hasOwnProperty.call(dataSource, name)) {
+        oldValues[name] = dataSource[name]
+        // Accumulate the changed values to send all the ongoing changes with the
+        // final request
+        updateContext.valuesToUpdate[name] = values[name]
+      }
+    })
+
+    // If we have a dataSource type, fetch it from the service type registry
+    // then call the registry's `beforeUpdate` hook to optionally manipulate
+    // the values prior to performing an update.
+    if (dataSource.type !== null) {
+      const dataSourceType = $registry.get('service', dataSource.type)
+      updateContext.valuesToUpdate = dataSourceType.beforeUpdate(
+        updateContext.valuesToUpdate,
+        oldValues
+      )
+    }
+
+    await dispatch('forceUpdate', {
+      page,
+      dataSource,
+      values: updateContext.valuesToUpdate,
+    })
+
+    return new Promise((resolve, reject) => {
+      const fire = async () => {
+        const toUpdate = updateContext.valuesToUpdate
+        updateContext.valuesToUpdate = {}
+        commit('SET_LOADING', { page, value: true })
+        try {
+          const { data } = await DataSourceService($client).update(
+            dataSource.id,
+            toUpdate
+          )
+          await commit('FULL_UPDATE_ITEM', { page, dataSource, values: data })
+          updateContext.lastUpdatedValues = null
+          resolve()
+        } catch (error) {
+          // Revert to old values on error
+          await dispatch('forceUpdate', {
+            page,
+            dataSource,
+            values: updateContext.lastUpdatedValues,
+          })
+          updateContext.lastUpdatedValues = null
+          reject(error)
+        }
+        commit('SET_LOADING', { page, value: false })
+      }
+
+      if (updateContext.promiseResolve) {
+        updateContext.promiseResolve()
+        updateContext.promiseResolve = null
+      }
+
+      clearTimeout(updateContext.updateTimeout)
+
+      if (!updateContext.lastUpdatedValues) {
+        updateContext.lastUpdatedValues = oldValues
+      }
+
+      updateContext.updateTimeout = setTimeout(fire, 500)
+      updateContext.promiseResolve = resolve
+    })
+  },
+  /**
+   * Re-dispatches every data source bound to the given integration so that the
+   * collection elements pointing at them reset their content. Used when an
+   * integration is trashed (its data sources become misconfigured and have no
+   * records to show) or restored (they repopulate). Affected data sources are
+   * resolved across the current and shared pages.
+   */
+  redispatchForIntegration(
+    { dispatch, getters, rootGetters },
+    { builder, integrationId }
+  ) {
+    // Integrations exist on multiple application types (e.g. automations) and
+    // the realtime integration events fire for all of them. Only builder
+    // applications have pages with data sources to re-dispatch; for any other
+    // type resolving the shared page below would crash on `pages`.
+    if (builder.type !== 'builder') {
+      return
+    }
+    const selectedPage = rootGetters['page/getSelected']
+    const sharedPage = rootGetters['page/getSharedPage'](builder)
+    const pages = [selectedPage, sharedPage].filter(Boolean)
+    if (!pages.length) {
+      return
+    }
+
+    const affectedDataSources = getters
+      .getPagesDataSources(pages)
+      .filter((dataSource) => dataSource.integration_id === integrationId)
+    if (!affectedDataSources.length) {
+      return
+    }
+
+    const elements = pages.flatMap((page) =>
+      rootGetters['element/getElementsOrdered'](page)
+    )
+    affectedDataSources.forEach((dataSource) => {
+      dispatch(
+        'element/emitElementEvent',
+        {
+          event: ELEMENT_EVENTS.DATA_SOURCE_AFTER_UPDATE,
+          elements,
+          dataSourceId: dataSource.id,
+          builder,
+        },
+        { root: true }
+      )
+    })
+  },
+  async moveToPage(
+    { commit, dispatch, getters },
+    { pageSource, pageDest, dataSourceId }
+  ) {
+    const { $registry, $i18n, $client, $config } = this
+    const dataSourcesOfSourcePage = getters.getPageDataSources(pageSource)
+    const dataSource = dataSourcesOfSourcePage.find(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+
+    await dispatch('forcePageMove', {
+      pageDest,
+      pageSource,
+      dataSourceId: dataSource.id,
+    })
+
+    commit('SET_LOADING', { page: pageSource, value: true })
+    try {
+      const { data: updatedDataSource } = await DataSourceService(
+        $client
+      ).update(dataSource.id, {
+        page_id: pageDest.id,
+      })
+
+      // Update the order and the name if it has been updated to prevent conflicts
+      await dispatch('forceUpdate', {
+        page: pageDest,
+        dataSource: updatedDataSource,
+        values: {
+          order: updatedDataSource.order,
+          name: updatedDataSource.name,
+        },
+      })
+    } catch (error) {
+      await dispatch('forcePageMove', {
+        pageDest: pageSource,
+        pageSource: pageDest,
+        dataSourceId: dataSource.id,
+      })
+      throw error
+    }
+    commit('SET_LOADING', { page: pageSource, value: false })
+  },
+  async delete({ commit, dispatch, getters }, { page, dataSourceId }) {
+    const { $registry, $i18n, $client, $config } = this
+    const dataSourcesOfPage = getters.getPageDataSources(page)
+    const dataSourceIndex = dataSourcesOfPage.findIndex(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+    const dataSourceToDelete = dataSourcesOfPage[dataSourceIndex]
+    const beforeId =
+      dataSourceIndex !== dataSourcesOfPage.length - 1
+        ? dataSourcesOfPage[dataSourceIndex + 1].id
+        : null
+
+    await dispatch('forceDelete', { page, dataSourceId })
+
+    commit('SET_LOADING', { page, value: true })
+    try {
+      await DataSourceService($client).delete(dataSourceId)
+    } catch (error) {
+      await dispatch('forceCreate', {
+        page,
+        dataSource: dataSourceToDelete,
+        beforeId,
+      })
+      throw error
+    }
+    // After deleting the data source, find all collection elements
+    // which use this data source, and clear their element content.
+    const dataSourceCollectionElements = page.elements.filter((element) => {
+      return element.data_source_id === dataSourceToDelete.id
+    })
+    dataSourceCollectionElements.map(async (collectionElement) => {
+      await dispatch(
+        'elementContent/clearElementContent',
+        {
+          element: collectionElement,
+        },
+        { root: true }
+      )
+    })
+    commit('SET_LOADING', { page, value: false })
+  },
+  async fetch({ dispatch, commit }, { page }) {
+    const { $registry, $i18n, $client, $config } = this
+    commit('SET_LOADING', { page, value: true })
+    dispatch(
+      'dataSourceContent/clearDataSourceContents',
+      { page },
+      { root: true }
+    )
+    const { data: dataSources } = await DataSourceService($client).fetchAll(
+      page.id
+    )
+
+    commit('CLEAR_ITEMS', { page })
+    await Promise.all(
+      dataSources.map((dataSource) =>
+        dispatch('forceCreate', { page, dataSource })
+      )
+    )
+    commit('SET_FETCHED', { page })
+    commit('SET_LOADING', { page, value: false })
+
+    return dataSources
+  },
+  async fetchPublished({ dispatch, commit, rootGetters }, { page }) {
+    const { $registry, $i18n, $client, $config } = this
+    commit('SET_LOADING', { page, value: true })
+    dispatch(
+      'dataSourceContent/clearDataSourceContents',
+      { page },
+      { root: true }
+    )
+
+    const previewBuilderId = rootGetters['publicBuilder/getPreviewBuilderId']
+    const { data: dataSources } = await PublishedBuilderService(
+      $client
+    ).fetchDataSources(page.id, previewBuilderId)
+
+    commit('CLEAR_ITEMS', { page })
+    await Promise.all(
+      dataSources.map((dataSource) =>
+        dispatch('forceCreate', { page, dataSource })
+      )
+    )
+    commit('SET_FETCHED', { page })
+    commit('SET_LOADING', { page, value: false })
+
+    return dataSources
+  },
+  async move({ dispatch }, { page, dataSourceId, beforeDataSourceId }) {
+    const { $registry, $i18n, $client, $config } = this
+    await dispatch('forceMove', { page, dataSourceId, beforeDataSourceId })
+
+    try {
+      await DataSourceService($client).move(dataSourceId, beforeDataSourceId)
+    } catch (error) {
+      await dispatch('forceMove', {
+        page,
+        dataSourceId: beforeDataSourceId,
+        beforeDataSourceId: dataSourceId,
+      })
+      throw error
+    }
+  },
+  async duplicate({ commit, getters, dispatch }, { page, dataSourceId }) {
+    const dataSourcesOfPage = getters.getPageDataSources(page)
+    const dataSource = dataSourcesOfPage.find((e) => e.id === dataSourceId)
+    commit('SET_LOADING', { page, value: true })
+    await dispatch('create', {
+      page,
+      dataSourceType: dataSource.type,
+      beforeId: dataSource.id,
+    })
+    commit('SET_LOADING', { page, value: false })
+  },
+}
+
+const getters = {
+  getPageDataSources: (state) => (page) => {
+    return page.dataSources
+  },
+  getPagesDataSources: (state) => (pages) => {
+    // A page's `dataSources` can be undefined when the page exists in the store
+    // (e.g. a builder's shared page listed in the sidebar) but its data sources
+    // haven't been loaded, such as when a realtime event arrives while viewing a
+    // non-builder scope. Default to an empty array so callers don't hit undefined.
+    return pages.map(({ dataSources }) => dataSources || []).flat()
+  },
+  getPagesDataSourceById: (state, getters) => (pages, id) => {
+    return getters
+      .getPagesDataSources(pages)
+      .find((dataSource) => dataSource.id === id)
+  },
+  getPageDataSourceById: (state, getters) => (page, id) => {
+    return getters.getPagesDataSourceById([page], id)
+  },
+  getLoading: (state) => (page) => {
+    return page._.dataSourceLoading
+  },
+  getFetched: (state) => (page) => {
+    return page._.dataSourceFetched === true
+  },
+}
+
+export default {
+  namespaced: true,
+  state,
+  getters,
+  actions,
+  mutations,
+}

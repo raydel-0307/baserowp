@@ -1,0 +1,396 @@
+import {
+  uuid,
+  generateUUID,
+  upperCaseFirst,
+  slugify,
+  isValidURL,
+  isValidEmail,
+  isValidStrictEmail,
+  isSecureURL,
+  isNumeric,
+  parseLocalizedNumber,
+  isInteger,
+  isSubstringOfStrings,
+  collatedStringCompare,
+} from '@baserow/modules/core/utils/string'
+
+describe('test string utils', () => {
+  const originalCrypto = globalThis.crypto
+  const uuidV4Pattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+  afterEach(() => {
+    Object.defineProperty(globalThis, 'crypto', {
+      value: originalCrypto,
+      configurable: true,
+      writable: true,
+    })
+    vi.restoreAllMocks()
+  })
+
+  test('uuid', () => {
+    const value = uuid()
+    expect(typeof value).toBe('string')
+  })
+
+  test('generateUUID uses crypto.randomUUID when available', () => {
+    const randomUUID = vi.fn(() => 'test-random-uuid')
+    const getRandomValues = vi.fn()
+
+    Object.defineProperty(globalThis, 'crypto', {
+      value: { randomUUID, getRandomValues },
+      configurable: true,
+      writable: true,
+    })
+
+    expect(generateUUID()).toBe('test-random-uuid')
+    expect(randomUUID).toHaveBeenCalledTimes(1)
+    expect(getRandomValues).not.toHaveBeenCalled()
+  })
+
+  test('generateUUID uses crypto.getRandomValues when randomUUID is unavailable', () => {
+    const getRandomValues = vi.fn((bytes) => {
+      bytes.set([
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+        0xcc, 0xdd, 0xee, 0xff,
+      ])
+      return bytes
+    })
+
+    Object.defineProperty(globalThis, 'crypto', {
+      value: { getRandomValues },
+      configurable: true,
+      writable: true,
+    })
+
+    expect(generateUUID()).toBe('00112233-4455-4677-8899-aabbccddeeff')
+    expect(getRandomValues).toHaveBeenCalledTimes(1)
+  })
+
+  test('generateUUID falls back to Math.random when crypto is unavailable', () => {
+    Object.defineProperty(globalThis, 'crypto', {
+      value: undefined,
+      configurable: true,
+      writable: true,
+    })
+
+    const mathRandomSpy = vi.spyOn(Math, 'random')
+
+    const value = generateUUID()
+
+    expect(value).toMatch(uuidV4Pattern)
+    expect(mathRandomSpy).toHaveBeenCalled()
+  })
+
+  test('upperCaseFirst', () => {
+    expect(upperCaseFirst('test string')).toBe('Test string')
+    expect(upperCaseFirst('Test string')).toBe('Test string')
+    expect(upperCaseFirst('TEST string')).toBe('TEST string')
+    expect(upperCaseFirst('tEST String')).toBe('TEST String')
+    expect(upperCaseFirst('test')).toBe('Test')
+    expect(upperCaseFirst('a')).toBe('A')
+    expect(upperCaseFirst('A')).toBe('A')
+    expect(upperCaseFirst('')).toBe('')
+  })
+
+  test('slugify', () => {
+    expect(slugify('')).toBe('')
+    expect(slugify('test')).toBe('test')
+    expect(slugify('This is A test')).toBe('this-is-a-test')
+    expect(slugify('/ā/t+?,.;!@')).toBe('a-t')
+    expect(slugify('/a&--b/')).toBe('a-and-b')
+  })
+
+  test('isValidURL', () => {
+    const validURLs = [
+      'baserow.io',
+      'ftp://baserow.io',
+      'git://example.com/',
+      'ws://baserow.io',
+      'http://baserow.io',
+      'https://baserow.io',
+      'https://www.baserow.io',
+      'HTTP://BASEROW.IO',
+      'https://test.nl/test',
+      'https://test.nl/test',
+      'http://localhost',
+      '//localhost',
+      'https://test.nl/test?with=a-query&that=has-more',
+      'https://test.nl/test',
+      "http://-.~_!$&'()*+,;=%40:80%2f@example.com",
+      'http://उदाहरण.परीक्षा',
+      'http://foo.com/(something)?after=parens',
+      'http://142.42.1.1/',
+      'http://userid:password@example.com:65535/',
+      'http://su--b.valid-----hyphens.com/',
+      '//baserow.io/test',
+      '127.0.0.1',
+      'https://test.nl#test',
+      'http://baserow.io/hrscywv4p/image/upload/c_fill,g_faces:center,h_128,w_128/yflwk7vffgwyyenftkr7.png',
+      'https://gitlab.com/baserow/baserow/-/issues?row=nice/route',
+      'https://web.archive.org/web/20210313191012/https://baserow.io/',
+      'mailto:bram@baserow.io?test=test',
+    ]
+
+    const invalidURLs = [
+      'test',
+      'test.',
+      'localhost',
+      '\nwww.test.nl',
+      'www\n.test.nl',
+      'www .test.nl',
+      ' www.test.nl',
+    ]
+
+    for (const invalidUrl of invalidURLs) {
+      expect(isValidURL(invalidUrl)).toBe(false)
+    }
+    for (const validUrl of validURLs) {
+      expect(isValidURL(validUrl)).toBe(true)
+    }
+  })
+
+  test('isValidEmail', () => {
+    const invalidEmails = [
+      'test@' + 'a'.repeat(246) + '.com',
+      '@a',
+      'a@',
+      'not-an-email',
+      'bram.test.nl',
+      'invalid_email',
+      'invalid@invalid@com',
+      '\nhello@gmail.com',
+      'asdds asdd@gmail.com',
+    ]
+
+    const validEmails = [
+      'test@' + 'a'.repeat(245) + '.com',
+      'a@a',
+      '用户@例子.广告',
+      'अजय@डाटा.भारत',
+      'квіточка@пошта.укр',
+      'χρήστης@παράδειγμα.ελ',
+      'Dörte@Sörensen.example.com',
+      'коля@пример.рф',
+      'bram@localhost',
+      'bram@localhost.nl',
+      'first_part_underscores_ok@hyphens-ok.com',
+      'wierd@[1.1.1.1]',
+      'bram.test.test@sub.domain.nl',
+      'BRAM.test.test@sub.DOMAIN.nl',
+    ]
+
+    for (const invalidEmail of invalidEmails) {
+      expect(isValidEmail(invalidEmail)).toBe(false)
+    }
+    for (const validEmail of validEmails) {
+      expect(isValidEmail(validEmail)).toBe(true)
+    }
+  })
+
+  // These vectors are shared with the backend test
+  // `test_input_text_element_is_valid` in
+  // `backend/tests/baserow/contrib/builder/elements/test_element_types.py` so
+  // the two validators stay pinned to each other. Keep both lists identical.
+  const strictEmailsAcceptedByBothSides = [
+    'foo@bar.com',
+    'FOO@BAR.COM',
+    'first.last+tag@sub.domain.co.uk',
+    'first_part_underscores_ok@hyphens-ok.com',
+    'user@localhost',
+    'user@пример.рф',
+    'test@example.xn--p1ai',
+    'x@xn--80ak6aa92e.com',
+    'a@b.cd',
+    'test@' + 'a'.repeat(63) + '.com',
+  ]
+  const strictEmailsRejectedByBothSides = [
+    'aaa@aa',
+    'dzd@vz',
+    'a@b',
+    'a@b.c',
+    'foobar.com',
+    'a@',
+    '@b',
+    'a@@b',
+    'a @b.com',
+    '.a@b.com',
+    'a..b@c.com',
+    'a@-b.com',
+    'a@b-.com',
+    'a@b..com',
+    'a@b.com.',
+    'коля@пример.рф',
+    'Dörte@Sörensen.example.com',
+    'test@' + 'a'.repeat(64) + '.com',
+    // 321 characters, over Django's 320 limit.
+    'a'.repeat(315) + '@b.com',
+  ]
+  // Accepted by Django but deliberately not by the helper: IP literal domains
+  // and quoted-string local parts.
+  const strictEmailsAcceptedByBackendOnly = [
+    'wierd@[1.1.1.1]',
+    '"john..doe"@example.com',
+  ]
+  // Accepted by Django and the helper, which mirrors it, but rejected by the
+  // database email field regex behind `isValidEmail`. The builder input text
+  // element checks both, see `elementTypes.spec.js`.
+  const strictEmailsRejectedByEmailFieldOnly = [
+    "o'brien@example.com",
+    '100%@example.com',
+  ]
+
+  test.each(strictEmailsAcceptedByBothSides)(
+    'isValidStrictEmail accepts %s',
+    (email) => {
+      expect(isValidStrictEmail(email)).toBe(true)
+    }
+  )
+
+  test.each([
+    ...strictEmailsRejectedByBothSides,
+    ...strictEmailsAcceptedByBackendOnly,
+  ])('isValidStrictEmail rejects %s', (email) => {
+    expect(isValidStrictEmail(email)).toBe(false)
+  })
+
+  test.each(strictEmailsRejectedByEmailFieldOnly)(
+    'isValidStrictEmail accepts %s, which isValidEmail rejects',
+    (email) => {
+      expect(isValidStrictEmail(email)).toBe(true)
+      expect(isValidEmail(email)).toBe(false)
+    }
+  )
+
+  test('isSecureURL', () => {
+    expect(isSecureURL('test')).toBe(false)
+    expect(isSecureURL('http://test.nl')).toBe(false)
+    expect(isSecureURL('https://test.nl')).toBe(true)
+    expect(isSecureURL('HTTPS://test.nl')).toBe(true)
+    expect(isSecureURL('https://test.domain.nl?test=test')).toBe(true)
+  })
+
+  test('isNumeric', () => {
+    expect(isNumeric('a')).toBe(false)
+    expect(isNumeric('1.2')).toBe(true)
+    expect(isNumeric('1,2')).toBe(false)
+    expect(isNumeric('')).toBe(false)
+    expect(isNumeric('null')).toBe(false)
+    expect(isNumeric('12px')).toBe(false)
+    expect(isNumeric('1')).toBe(true)
+    expect(isNumeric('9999')).toBe(true)
+    expect(isNumeric('-100')).toBe(true)
+  })
+
+  test('isInteger', () => {
+    expect(isInteger('a')).toBe(false)
+    expect(isInteger('1.2')).toBe(false)
+    expect(isInteger('1,2')).toBe(false)
+    expect(isInteger('')).toBe(false)
+    expect(isInteger('null')).toBe(false)
+    expect(isInteger('12px')).toBe(false)
+    expect(isInteger('1')).toBe(true)
+    expect(isInteger('9999')).toBe(true)
+    expect(isInteger('-100')).toBe(true)
+  })
+  test('isSubstringOfStrings', () => {
+    expect(isSubstringOfStrings(['hello'], 'hell')).toBe(true)
+    expect(isSubstringOfStrings(['test'], 'hell')).toBe(false)
+    expect(isSubstringOfStrings(['hello', 'test'], 'hell')).toBe(true)
+    expect(isSubstringOfStrings([], 'hell')).toBe(false)
+    expect(isSubstringOfStrings(['hello'], '')).toBe(true)
+  })
+
+  test('collatedStringCompare does locale-aware sorting', () => {
+    const roles = [
+      'Editor',
+      'Admin',
+      'Viewer',
+      'Manager',
+      'Éditeur',
+      'Über-admin',
+      'Évaluateur',
+    ]
+
+    expect(
+      [...roles].sort((a, b) => collatedStringCompare(a, b, 'ASC'))
+    ).toStrictEqual([
+      'Admin',
+      'Éditeur',
+      'Editor',
+      'Évaluateur',
+      'Manager',
+      'Über-admin',
+      'Viewer',
+    ])
+
+    // DESC reverses the same locale-aware ordering.
+    expect(
+      [...roles].sort((a, b) => collatedStringCompare(a, b, 'DESC'))
+    ).toStrictEqual([
+      'Viewer',
+      'Über-admin',
+      'Manager',
+      'Évaluateur',
+      'Editor',
+      'Éditeur',
+      'Admin',
+    ])
+  })
+})
+
+describe('parseLocalizedNumber', () => {
+  test.each([
+    ['en', ''],
+    ['en', '3,2'],
+    ['en', '3,2,.2,'],
+    ['en', ',32'],
+    ['en', '32,'],
+    ['en', '1,,234'],
+    ['en', '1234,567'],
+    ['en', '1.2,345'],
+    ['en', '1,234.5,6'],
+    ['en', '1,234\n'],
+    ['de', '3.2'],
+    ['es', '3.2'],
+    ['de', '3.2,.2.'],
+    ['fr', '3 2'],
+    ['fr', '3,2,.2,'],
+    ['fr', '3,2.5'],
+    ['fr', '3.2,5'],
+    ['fr', '3.2.5'],
+    ['fr', '1 23.5'],
+    ['fr', '1\t234.5'],
+    ['fr', '1\t234'],
+    ['hi-IN', '123,456'],
+  ])('rejects invalid input in %s: %s', (locale, input) => {
+    expect(() => parseLocalizedNumber(input, locale)).toThrow()
+  })
+
+  test.each([
+    ['en', '3.2', '3.2'],
+    ['en', '1,234.5', '1234.5'],
+    ['en', '-1,234,567.89', '-1234567.89'],
+    ['en', '+1,234.5', '+1234.5'],
+    ['en', '0', '0'],
+    ['de', '3,2', '3.2'],
+    ['de', '1.234,5', '1234.5'],
+    ['fr', '3,2', '3.2'],
+    ['fr', '3.2', '3.2'],
+    ['fr', '1 234.5', '1234.5'],
+    ['fr', '1\u00a0234.5', '1234.5'],
+    ['fr', '1\u202f234.5', '1234.5'],
+    ['fr', '-3.2', '-3.2'],
+    ['ru', '3.2', '3.2'],
+    ['de', '1.234', '1234'],
+    ['es', '1.234', '1234'],
+    ['fr', '1 234,5', '1234.5'],
+    ['fr', '1\u00a0234,5', '1234.5'],
+    ['fr', '1\u202f234,5', '1234.5'],
+    ['hi-IN', '1,23,456.7', '123456.7'],
+    ['hi-IN', '12,345.6', '12345.6'],
+    ['es', '1.234,5', '1234.5'],
+  ])('normalizes valid input in %s: %s', (locale, input, expected) => {
+    expect(parseLocalizedNumber(input, locale)).toBe(expected)
+  })
+})

@@ -1,0 +1,226 @@
+<template>
+  <form @submit.prevent="submit">
+    <FormGroup
+      small-label
+      :label="$t('userForm.fullName')"
+      required
+      class="margin-bottom-2"
+      :error="fieldHasErrors('name')"
+    >
+      <FormInput
+        ref="name"
+        v-model="v$.values.name.$model"
+        size="large"
+        :error="fieldHasErrors('name')"
+        @blur="v$.values.name.$touch"
+      >
+      </FormInput>
+
+      <template #error>
+        <span v-if="v$.values.name.required.$invalid">
+          {{ $t('error.requiredField') }}
+        </span>
+        <span v-else-if="v$.values.name.minLength.$invalid">
+          {{ $t('error.minLength', { min: 2 }) }}
+        </span>
+        <span v-else-if="v$.values.name.maxLength.$invalid">
+          {{ $t('error.maxLength', { max: 60 }) }}
+        </span>
+        <span v-else-if="v$.values.name.nameIsNotEmail.$invalid">
+          {{ $t('error.nameCantBeEmail') }}
+        </span>
+        <span v-else-if="v$.values.name.nameContainsNoUrl.$invalid">
+          {{ $t('error.nameContainsUrl') }}
+        </span>
+        <span v-else-if="v$.values.name.nameContainsNoSpam.$invalid">
+          {{ $t('error.nameContainsSpam') }}
+        </span>
+      </template>
+    </FormGroup>
+
+    <FormGroup
+      small-label
+      :label="$t('userForm.email')"
+      required
+      class="margin-bottom-2"
+      :error="fieldHasErrors('username')"
+    >
+      <FormInput
+        ref="email"
+        v-model="v$.values.username.$model"
+        size="large"
+        :error="fieldHasErrors('username')"
+        @blur="v$.values.username.$touch"
+      >
+      </FormInput>
+
+      <template #warning>
+        <span
+          v-show="
+            values.username !== user.username && !v$.values.username.$invalid
+          "
+        >
+          {{ $t('userForm.warning.changeEmail') }}
+        </span>
+      </template>
+
+      <template #error>
+        <span v-if="v$.values.username.required.$invalid">
+          {{ $t('error.requiredField') }}
+        </span>
+        <span v-else-if="v$.values.username.email.$invalid">
+          {{ $t('error.invalidEmail') }}
+        </span>
+      </template>
+    </FormGroup>
+
+    <FormGroup
+      small-label
+      :label="$t('userForm.isActive')"
+      required
+      class="margin-bottom-2"
+    >
+      <Checkbox
+        v-model="v$.values.is_active.$model"
+        :disabled="loading"
+      ></Checkbox>
+
+      <template #warning>
+        <span v-show="!values.is_active">
+          {{ $t('userForm.warning.inactiveUser') }}
+        </span>
+      </template>
+    </FormGroup>
+
+    <FormGroup small-label :label="$t('user.isStaff')" required>
+      <Checkbox
+        v-model="v$.values.is_staff.$model"
+        :disabled="loading"
+      ></Checkbox>
+
+      <template #warning>
+        <span v-show="values.is_staff">
+          {{ $t('userForm.warning.userStaff') }}
+        </span>
+      </template>
+    </FormGroup>
+
+    <FormGroup
+      small-label
+      :label="$t('userForm.twoFactorAuth')"
+      class="margin-top-2"
+    >
+      <div class="user-admin-edit__two-factor">
+        <Badge
+          :color="twoFactorAuthEnabled ? 'green' : 'neutral'"
+          :rounded="true"
+        >
+          {{
+            twoFactorAuthEnabled
+              ? twoFactorAuthProviderName
+              : $t('twoFactorAuthField.disabled')
+          }}
+        </Badge>
+        <a
+          v-if="twoFactorAuthEnabled"
+          class="user-admin-edit__remove-2fa"
+          @click.prevent="$emit('remove-two-factor-auth')"
+        >
+          {{ $t('userForm.removeTwoFactorAuth') }}
+        </a>
+      </div>
+    </FormGroup>
+
+    <div class="actions">
+      <slot></slot>
+      <div class="align-right">
+        <Button
+          type="primary"
+          size="large"
+          :disabled="loading"
+          :loading="loading"
+        >
+          {{ $t('action.save') }}</Button
+        >
+      </div>
+    </div>
+  </form>
+</template>
+
+<script>
+import { useVuelidate } from '@vuelidate/core'
+import { reactive } from 'vue'
+import { email, maxLength, minLength, required } from '@vuelidate/validators'
+
+import form from '@baserow/modules/core/mixins/form'
+import {
+  nameContainsNoSpam,
+  nameContainsNoUrl,
+  nameIsNotEmail,
+} from '@baserow/modules/core/validators'
+
+export default {
+  name: 'UserForm',
+  mixins: [form],
+  props: {
+    user: {
+      type: Object,
+      required: true,
+    },
+    loading: {
+      type: Boolean,
+      required: true,
+    },
+  },
+  emits: ['remove-two-factor-auth'],
+  setup() {
+    const values = reactive({
+      values: {
+        username: '',
+        name: '',
+        is_active: '',
+        is_staff: '',
+      },
+    })
+
+    const rules = {
+      values: {
+        name: {
+          required,
+          minLength: minLength(2),
+          maxLength: maxLength(60),
+          nameIsNotEmail,
+          nameContainsNoUrl,
+          nameContainsNoSpam,
+        },
+        username: {
+          required,
+          email,
+        },
+        is_active: {},
+        is_staff: {},
+      },
+    }
+
+    return {
+      values: values.values,
+      v$: useVuelidate(rules, values, { $lazy: true }),
+    }
+  },
+  data() {
+    return {
+      allowedValues: ['username', 'name', 'is_active', 'is_staff'],
+    }
+  },
+  computed: {
+    twoFactorAuthEnabled() {
+      return Boolean(this.user.two_factor_auth?.is_enabled)
+    },
+    twoFactorAuthProviderName() {
+      const type = this.user.two_factor_auth?.type
+      const registered = this.$registry.getAll('twoFactorAuth')
+      return registered[type] ? registered[type].name : type
+    },
+  },
+}
+</script>

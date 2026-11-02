@@ -1,0 +1,411 @@
+.data-table {
+  @include absolute(0, 0, 0, 0);
+
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-bottom: 24px;
+  background-color: $palette-neutral-0;
+}
+
+.data-table__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 24px 0;
+  padding: 0 24px;
+  color: $palette-neutral-1200;
+}
+
+.data-table__title {
+  @extend %ellipsis;
+
+  font-size: 18px;
+  line-height: 24px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.data-table__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+
+  // Existing callers add a margin before their action. The shared gap owns it now.
+  > .button {
+    margin-left: 0;
+
+    @include button-size;
+  }
+}
+
+.data-table__search {
+  width: 224px;
+  max-width: 100%;
+}
+
+.data-table__filters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 24px;
+  margin-bottom: 20px;
+}
+
+.data-table__cell-link {
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+.data-table__body {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  margin: 0 24px;
+  border: 1px solid $palette-neutral-200;
+  border-radius: 6px;
+
+  &--empty {
+    border-style: dashed;
+    border-color: $palette-neutral-400;
+  }
+}
+
+.data-table__table {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  border-collapse: separate;
+  border-spacing: 0;
+
+  .data-table__body--empty & {
+    height: 100%;
+  }
+}
+
+.data-table__table-cell {
+  padding: 0;
+
+  &:first-child {
+    padding-left: 24px;
+  }
+
+  &:last-child {
+    padding-right: 24px;
+  }
+
+  &--sticky-left {
+    position: sticky;
+    z-index: 1;
+    left: 0;
+    background-color: $palette-neutral-0;
+  }
+
+  &--sticky-right {
+    position: sticky;
+    z-index: 2;
+    right: 0;
+    background-color: $palette-neutral-0;
+  }
+
+  &--header {
+    position: sticky;
+    z-index: 3;
+    top: 0;
+    background-color: $palette-neutral-25;
+    border-bottom: 1px solid $palette-neutral-200;
+    width: var(--width, auto);
+  }
+
+  &--header#{&}--sticky-left {
+    z-index: 4;
+  }
+
+  &--header#{&}--sticky-right {
+    z-index: 5;
+  }
+
+  .data-table__table-row:where(:hover) &,
+  .data-table__table-row--hover & {
+    background-color: $palette-neutral-25;
+  }
+
+  .data-table__table-row--selected & {
+    background-color: $palette-blue-50;
+  }
+}
+
+%data-table-table-cell-content {
+  position: relative;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  min-width: 0;
+  padding: 0 10px;
+
+  .data-table__table-cell:first-child & {
+    padding-left: 0;
+  }
+
+  .data-table__table-cell:last-child & {
+    padding-right: 0;
+  }
+}
+
+.data-table__table-cell-content {
+  @extend %data-table-table-cell-content;
+
+  height: 64px;
+  font-size: 13px;
+  line-height: 20px;
+  padding: 0 10px;
+  border-top: solid 1px $palette-neutral-200;
+
+  .data-table__table-row--hover &,
+  .data-table__table-row--selected &,
+  :where(tbody:not(.data-table__row-group))
+    .data-table__table-row:where(:first-child)
+    & {
+    border-top-color: transparent;
+  }
+}
+
+.data-table__expanded-rows .data-table__table-cell-content {
+  border-top: 0;
+}
+
+.data-table__row-group .data-table__table-cell-content {
+  border-top-color: $palette-neutral-200;
+}
+
+thead + .data-table__row-group .data-table__table-cell-content {
+  border-top-color: transparent;
+}
+
+.data-table__table-cell-content-full-width {
+  width: 100%;
+}
+
+.data-table__table-row--hover
+  + .data-table__table-row
+  .data-table__table-cell-content,
+.data-table__table-row--selected
+  + .data-table__table-row
+  .data-table__table-cell-content {
+  border-top-color: transparent;
+}
+
+.data-table__table-cell-head {
+  @extend %data-table-table-cell-content;
+
+  height: 40px;
+  color: $palette-neutral-900;
+  font-weight: 500;
+  font-size: 12px;
+  justify-content: space-between;
+}
+
+.data-table__table-cell-head-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+  color: $palette-neutral-900;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+.data-table__table-cell-head-sort-icon {
+  font-size: 14px;
+
+  @include flex-align-items(4px);
+}
+
+.data-table__more-wrapper {
+  width: 100%;
+  text-align: right;
+}
+
+.data-table__more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: $palette-neutral-900;
+  cursor: pointer;
+
+  &:hover {
+    background-color: $palette-neutral-100;
+    color: $palette-neutral-1200;
+  }
+}
+
+.data-table__more-icon {
+  font-size: 16px;
+}
+
+.data-table__footer {
+  align-self: center;
+  flex-shrink: 0;
+  padding: 24px 24px 0;
+  width: 253px;
+  max-width: 100%;
+}
+
+.data-table__empty-cell {
+  padding: 0;
+  vertical-align: middle;
+}
+
+.data-table__empty {
+  padding: 48px 24px;
+  color: $palette-neutral-900;
+  text-align: center;
+
+  .placeholder {
+    width: 100%;
+    max-width: 520px;
+    margin: 0 auto;
+  }
+}
+
+.data-table__empty-action {
+  margin-top: 24px;
+
+  &:empty {
+    display: none;
+  }
+
+  > .button {
+    margin-left: 0;
+
+    @include button-size;
+  }
+}
+
+.data-table__table-row--expandable {
+  cursor: pointer;
+}
+
+.data-table__expand {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid $palette-blue-100;
+  border-radius: 16px;
+  background: $palette-blue-50;
+  color: $palette-blue-700;
+  font: inherit;
+  cursor: pointer;
+
+  &:hover {
+    background: $palette-blue-100;
+  }
+}
+
+.data-table__expanded-rows {
+  background: $palette-neutral-25;
+
+  .data-table__table-cell {
+    background: $palette-neutral-25;
+  }
+
+  .data-table__table-cell:first-child {
+    position: relative;
+
+    &::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 36px;
+      width: 1px;
+      background: $palette-neutral-200;
+    }
+
+    .data-table__table-cell-content {
+      padding-left: 56px;
+    }
+  }
+
+  tr:first-child .data-table__table-cell::before {
+    top: 16px;
+  }
+
+  tr:last-child .data-table__table-cell::before {
+    bottom: 16px;
+  }
+}
+
+.data-table__expanded-content {
+  padding: 24px;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: normal;
+}
+
+.data-table__more:focus-visible,
+.data-table__expand:focus-visible,
+.data-table__table-cell-head-link:focus-visible {
+  outline: 2px solid $palette-blue-500;
+  outline-offset: 2px;
+}
+
+@media screen and (max-width: 600px) {
+  .data-table__header {
+    padding: 0 16px;
+  }
+
+  .data-table__body {
+    margin: 0 16px;
+  }
+
+  .data-table__actions {
+    width: 100%;
+    gap: 8px;
+  }
+
+  .data-table__search {
+    flex: 1;
+    min-width: 120px;
+  }
+}
+
+.data-table__table--fixed {
+  table-layout: fixed;
+
+  .data-table__table-cell-content > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  // Text fields opt into clipping; avatar groups must retain visible overflow.
+  .data-table__text-field {
+    @extend %ellipsis;
+  }
+}
+
+.data-table__body--fixed {
+  scrollbar-gutter: stable;
+}

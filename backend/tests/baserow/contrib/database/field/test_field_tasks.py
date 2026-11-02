@@ -1,0 +1,1534 @@
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+from django.core.cache import cache
+from django.db import DataError, connection, transaction
+from django.test import override_settings
+
+import pytest
+from celery.exceptions import SoftTimeLimitExceeded
+from freezegun import freeze_time
+
+from baserow.celery_singleton_backend import SingletonAutoRescheduleFlag
+from baserow.contrib.database.fields.field_types import FormulaFieldType
+from baserow.contrib.database.fields.models import FormulaField
+from baserow.contrib.database.fields.periodic_field_update_handler import (
+    PeriodicFieldUpdateHandler,
+)
+from baserow.contrib.database.fields.tasks import (
+    RUN_LOCK_KEY,
+    RUN_LOCK_TTL,
+    _update_workspace_periodic_fields,
+    delete_mentions_marked_for_deletion,
+    finish_periodic_fields_update,
+    run_periodic_fields_updates,
+    update_workspaces_periodic_fields,
+)
+from baserow.contrib.database.rows.handler import RowHandler
+from baserow.contrib.database.table.models import RichTextFieldMention
+from baserow.core.cache import local_cache
+from baserow.core.models import Workspace
+from baserow.core.psycopg import psycopg
+from baserow.core.trash.handler import TrashHandler
+
+
+def create_table_with_row_in_workspace(data_fixture, workspace):
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    formula_field = data_fixture.create_formula_field(
+        table=table, formula="now()", date_include_time=True
+    )
+    return table.get_model(), formula_field
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_dispatches_only_eligible_workspaces(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+
+    with freeze_time("2020-01-01 0:00"):
+        workspace = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, workspace)
+        workspace_2 = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, workspace_2)
+
+        # workspace 1 recently used -> eligible
+        PeriodicFieldUpdateHandler.mark_workspace_as_recently_used(workspace.id)
+        workspace.refresh_now()
+        # workspace 2 refreshed just now and not recently used -> not eligible yet
+        workspace_2.refresh_now()
+
+    with (
+        patch("baserow.contrib.database.fields.tasks.chord") as chord_mock,
+        freeze_time("2020-01-01 00:04"),
+    ):
+        run_periodic_fields_updates()
+
+    header = chord_mock.call_args.args[0]
+    dispatched = {wid for sig in header.tasks for wid in sig.args[0]}
+    assert workspace.id in dispatched
+    assert workspace_2.id not in dispatched
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_dispatches_never_refreshed_workspace(
+    data_fixture, settings
+):
+    # A workspace whose `now` was never set (isnull) is due regardless of the interval
+    # or recent use: it covers the Q(now__isnull=True) branch.
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    create_table_with_row_in_workspace(data_fixture, workspace)
+    # Creating the formula sets `now`; clear it so the workspace looks never-refreshed.
+    Workspace.objects.filter(id=workspace.id).update(now=None)
+
+    with patch("baserow.contrib.database.fields.tasks.chord") as chord_mock:
+        run_periodic_fields_updates()
+
+    header = chord_mock.call_args.args[0]
+    dispatched = {wid for sig in header.tasks for wid in sig.args[0]}
+    assert workspace.id in dispatched
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_dispatch_false_runs_inline(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    with (
+        patch("baserow.contrib.database.fields.tasks.chord") as chord_mock,
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields"
+        ) as inline,
+        freeze_time("2023-02-27 10:30"),
+    ):
+        run_periodic_fields_updates(workspace_id=workspace.id, dispatch=False)
+
+    chord_mock.assert_not_called()
+    inline.assert_called_once_with(workspace.id, True)
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_update_per_non_existing_workspace_does_nothing(
+    django_assert_num_queries,
+):
+    with django_assert_num_queries(1):
+        run_periodic_fields_updates(workspace_id=9999)
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+
+    def create_table_with_row_in_workspace(workspace):
+        database = data_fixture.create_database_application(workspace=workspace)
+        table = data_fixture.create_database_table(database=database)
+        formula_field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+        return table.get_model(), formula_field
+
+    # when the workspace is created the now field is set to the current time
+    with freeze_time("2023-02-27 9:55"):
+        workspace = data_fixture.create_workspace(user=user)
+        table_model, formula_field = create_table_with_row_in_workspace(workspace)
+        row = RowHandler().create_row(
+            user=user, table=table_model.baserow_table, model=table_model
+        )
+
+        workspace_2 = data_fixture.create_workspace(user=user)
+        table_model_2, formula_field_2 = create_table_with_row_in_workspace(workspace_2)
+        row_2 = RowHandler().create_row(
+            user=user, table=table_model_2.baserow_table, model=table_model_2
+        )
+
+    assert getattr(row, f"field_{formula_field.id}") == datetime(
+        2023, 2, 27, 9, 55, 0, tzinfo=timezone.utc
+    )
+    assert getattr(row_2, f"field_{formula_field_2.id}") == datetime(
+        2023, 2, 27, 9, 55, 0, tzinfo=timezone.utc
+    )
+
+    # the now field is updated to the current time by default
+    # and all the values updated accordingly
+    with freeze_time("2023-02-27 10:00"):
+        run_periodic_fields_updates()
+
+    workspace.refresh_from_db()
+    workspace_2.refresh_from_db()
+
+    assert workspace.now == datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+    assert workspace_2.now == datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+
+    # the task can be run without updating the now field
+    with freeze_time("2023-02-27 10:15"):
+        run_periodic_fields_updates(update_now=False)
+
+    workspace.refresh_from_db()
+    workspace_2.refresh_from_db()
+
+    assert workspace.now == datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+    assert workspace_2.now == datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_update_per_workspace(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    with freeze_time("2023-02-27 10:00"):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+
+    row = RowHandler().create_row(user=user, table=table)
+
+    assert getattr(row, f"field_{field.id}") == datetime(
+        2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc
+    )
+
+    with freeze_time("2023-02-27 10:30"), local_cache.context():
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        row.refresh_from_db()
+        assert getattr(row, f"field_{field.id}") == datetime(
+            2023, 2, 27, 10, 30, 0, tzinfo=timezone.utc
+        )
+
+        workspace.refresh_from_db()
+        assert workspace.now == datetime(2023, 2, 27, 10, 30, tzinfo=timezone.utc)
+
+
+def _workspace_with_now_formula(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    with freeze_time("2023-02-27 10:00"):
+        data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+    RowHandler().create_row(user=user, table=table)
+    return workspace
+
+
+@pytest.mark.django_db
+def test_update_workspace_periodic_fields_updates_now_fields(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    with freeze_time("2023-02-27 10:00"):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+    row = RowHandler().create_row(user=user, table=table)
+
+    with freeze_time("2023-02-27 10:30"), local_cache.context():
+        _update_workspace_periodic_fields(workspace.id)
+
+    row.refresh_from_db()
+    assert getattr(row, f"field_{field.id}") == datetime(
+        2023, 2, 27, 10, 30, 0, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_splits_into_configured_batches(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    settings.PERIODIC_FIELD_UPDATE_BATCH_COUNT = 2
+    user = data_fixture.create_user()
+
+    with freeze_time("2023-02-27 09:00"):
+        ws_a = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_a)
+        ws_b = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_b)
+        ws_c = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_c)
+
+    Workspace.objects.filter(id=ws_a.id).update(
+        now=datetime(2023, 2, 27, 8, 0, tzinfo=timezone.utc)
+    )
+    Workspace.objects.filter(id=ws_b.id).update(
+        now=datetime(2023, 2, 27, 7, 0, tzinfo=timezone.utc)
+    )
+    Workspace.objects.filter(id=ws_c.id).update(
+        now=datetime(2023, 2, 27, 9, 0, tzinfo=timezone.utc)
+    )
+
+    with (
+        patch("baserow.contrib.database.fields.tasks.chord") as chord_mock,
+        freeze_time("2023-02-27 10:00"),
+    ):
+        run_periodic_fields_updates()
+
+    # 3 stalest-first workspaces round-robined across 2 batches, so the two stalest
+    # (b, a) are picked up first in parallel and each batch stays stalest-first.
+    sigs = list(chord_mock.call_args.args[0].tasks)
+    assert len(sigs) == 2
+    assert sigs[0].args[0] == [ws_b.id, ws_c.id]
+    assert sigs[0].kwargs["batch_index"] == 0
+    assert sigs[1].args[0] == [ws_a.id]
+    assert sigs[1].kwargs["batch_index"] == 1
+
+
+@pytest.mark.django_db
+def test_update_workspace_periodic_fields_skips_missing_workspace():
+    with patch(
+        "baserow.contrib.database.fields.tasks."
+        "_run_periodic_field_type_update_per_workspace"
+    ) as inner:
+        _update_workspace_periodic_fields(9999999)
+    inner.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_dispatches_stalest_first(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+
+    with freeze_time("2023-02-27 09:00"):
+        ws_a = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_a)
+        ws_b = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_b)
+        ws_c = data_fixture.create_workspace(user=user)
+        create_table_with_row_in_workspace(data_fixture, ws_c)
+
+    # b is the most out-of-date, then a, then c
+    Workspace.objects.filter(id=ws_a.id).update(
+        now=datetime(2023, 2, 27, 8, 0, tzinfo=timezone.utc)
+    )
+    Workspace.objects.filter(id=ws_b.id).update(
+        now=datetime(2023, 2, 27, 7, 0, tzinfo=timezone.utc)
+    )
+    Workspace.objects.filter(id=ws_c.id).update(
+        now=datetime(2023, 2, 27, 9, 0, tzinfo=timezone.utc)
+    )
+
+    with (
+        patch("baserow.contrib.database.fields.tasks.chord") as chord_mock,
+        freeze_time("2023-02-27 10:00"),
+    ):
+        run_periodic_fields_updates()
+
+    # default single batch keeps the most out-of-date workspaces first
+    sigs = list(chord_mock.call_args.args[0].tasks)
+    assert len(sigs) == 1
+    assert sigs[0].args[0] == [ws_b.id, ws_a.id, ws_c.id]
+
+
+@pytest.mark.django_db
+def test_update_workspace_periodic_fields_warns_when_slow(data_fixture, settings):
+    from loguru import logger
+
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    messages = []
+    sink_id = logger.add(messages.append, level="WARNING")
+    try:
+        # threshold 0 makes any duration count as slow
+        with (
+            patch(
+                "baserow.contrib.database.fields.tasks."
+                "SLOW_WORKSPACE_LOG_THRESHOLD_SECONDS",
+                0,
+            ),
+            freeze_time("2023-02-27 10:30"),
+            local_cache.context(),
+        ):
+            _update_workspace_periodic_fields(workspace.id)
+    finally:
+        logger.remove(sink_id)
+
+    slow_logs = [m for m in messages if "took" in str(m)]
+    assert len(slow_logs) == 1
+    assert str(workspace.id) in str(slow_logs[0])
+
+
+@pytest.mark.django_db
+def test_run_field_type_updates_dependant_fields(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    with freeze_time("2023-02-27 10:15"):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+        dependant = data_fixture.create_formula_field(
+            table=table, formula=f"field('{field.name}')", date_include_time=True
+        )
+        dependant_2 = data_fixture.create_formula_field(
+            table=table, formula=f"field('{dependant.name}')", date_include_time=True
+        )
+
+    table_model = table.get_model()
+    row = RowHandler().create_row(user=user, table=table, model=table_model)
+
+    assert getattr(row, f"field_{field.id}") == datetime(
+        2023, 2, 27, 10, 15, 0, tzinfo=timezone.utc
+    )
+    assert getattr(row, f"field_{dependant.id}") == datetime(
+        2023, 2, 27, 10, 15, 0, tzinfo=timezone.utc
+    )
+    assert getattr(row, f"field_{dependant_2.id}") == datetime(
+        2023, 2, 27, 10, 15, 0, tzinfo=timezone.utc
+    )
+
+    with freeze_time("2023-02-27 10:45"), local_cache.context():
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        row.refresh_from_db()
+        assert getattr(row, f"field_{field.id}") == datetime(
+            2023, 2, 27, 10, 45, 0, tzinfo=timezone.utc
+        )
+        assert getattr(row, f"field_{dependant.id}") == datetime(
+            2023, 2, 27, 10, 45, 0, tzinfo=timezone.utc
+        )
+        assert getattr(row, f"field_{dependant_2.id}") == datetime(
+            2023, 2, 27, 10, 45, 0, tzinfo=timezone.utc
+        )
+
+
+@pytest.mark.django_db
+def test_workspace_updated_last_will_be_updated_first_this_time(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 0
+    user = data_fixture.create_user()
+
+    def create_table_with_now_in_workspace(workspace):
+        database = data_fixture.create_database_application(workspace=workspace)
+        table = data_fixture.create_database_table(database=database)
+        formula_field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+        return table.get_model(), formula_field
+
+    # when the workspace is created the now field is set to the current time
+    now = datetime.now(tz=timezone.utc)
+    workspace_updated_most_recently = data_fixture.create_workspace(user=user)
+    workspace_updated_most_recently.now = now
+    workspace_updated_most_recently.save()
+    table_model, formula_field = create_table_with_now_in_workspace(
+        workspace_updated_most_recently
+    )
+    row = table_model.objects.create()
+
+    a_day_ago = datetime.now(tz=timezone.utc) - timedelta(days=1)
+    workspace_that_should_be_updated_first_this_time = data_fixture.create_workspace(
+        user=user
+    )
+    workspace_that_should_be_updated_first_this_time.now = a_day_ago
+    workspace_that_should_be_updated_first_this_time.save()
+    table_model_2, formula_field_2 = create_table_with_now_in_workspace(
+        workspace_that_should_be_updated_first_this_time
+    )
+    row_2 = table_model_2.objects.create()
+
+    assert a_day_ago < now
+    assert a_day_ago == workspace_that_should_be_updated_first_this_time.now
+    assert (
+        workspace_that_should_be_updated_first_this_time.now
+        < workspace_updated_most_recently.now
+    )
+
+    run_periodic_fields_updates()
+
+    workspace_updated_most_recently.refresh_from_db()
+    workspace_that_should_be_updated_first_this_time.refresh_from_db()
+
+    assert workspace_that_should_be_updated_first_this_time.now != a_day_ago
+    assert workspace_updated_most_recently.now != now
+    # The first workspace that got updated will have the lowest now value
+    assert (
+        workspace_that_should_be_updated_first_this_time.now
+        < workspace_updated_most_recently.now
+    )
+
+
+@pytest.mark.django_db
+def test_one_formula_failing_doesnt_block_others(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 0
+    user = data_fixture.create_user()
+
+    def create_table_with_now_in_workspace(workspace):
+        database = data_fixture.create_database_application(workspace=workspace)
+        table = data_fixture.create_database_table(database=database)
+        formula_field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+        return table.get_model(), formula_field
+
+    # when the workspace is created the now field is set to the current time
+    now = datetime.now(tz=timezone.utc)
+    second_updated_workspace = data_fixture.create_workspace(user=user)
+    second_updated_workspace.now = now
+    second_updated_workspace.save()
+    table_model, working_other_formula = create_table_with_now_in_workspace(
+        second_updated_workspace
+    )
+    row = RowHandler().create_row(
+        user=user, table=table_model.baserow_table, model=table_model
+    )
+
+    a_day_ago = datetime.now(tz=timezone.utc) - timedelta(days=1)
+    first_updated_workspace = data_fixture.create_workspace(user=user)
+    first_updated_workspace.now = a_day_ago
+    first_updated_workspace.save()
+    table_model_2, broken_first_formula = create_table_with_now_in_workspace(
+        first_updated_workspace
+    )
+    row_2 = RowHandler().create_row(
+        user=user, table=table_model_2.baserow_table, model=table_model_2
+    )
+    broken_first_formula.internal_formula = "broken"
+    broken_first_formula.save(recalculate=False)
+
+    assert a_day_ago < now
+    assert a_day_ago == first_updated_workspace.now
+    assert first_updated_workspace.now < second_updated_workspace.now
+
+    assert getattr(row, f"field_{working_other_formula.id}") == now
+    assert getattr(row_2, f"field_{broken_first_formula.id}") == a_day_ago
+
+    with local_cache.context():
+        run_periodic_fields_updates()
+
+    row_2.refresh_from_db()
+    # It didn't get refreshed
+    assert getattr(row_2, f"field_{broken_first_formula.id}") == a_day_ago
+    row.refresh_from_db()
+    # It did get refreshed
+    assert getattr(row, f"field_{working_other_formula.id}") != now
+
+    second_updated_workspace.refresh_from_db()
+    first_updated_workspace.refresh_from_db()
+
+    assert first_updated_workspace.now != a_day_ago
+    assert second_updated_workspace.now != now
+    assert first_updated_workspace.now < second_updated_workspace.now
+
+
+@pytest.mark.django_db
+def test_all_formula_that_needs_updates_are_periodically_updated(data_fixture):
+    workspace = data_fixture.create_workspace()
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    with freeze_time("2023-02-27 10:15"):
+        now_field = data_fixture.create_formula_field(
+            name="now", table=table, formula="now()", date_include_time=True
+        )
+        data_fixture.create_formula_field(
+            name="ref_now",
+            table=table,
+            formula=f"field('{now_field.name}')",
+            date_include_time=True,
+        )
+
+        date_field = data_fixture.create_date_field(table=table, date_include_time=True)
+        data_fixture.create_formula_field(
+            name="now_vs_date",
+            table=table,
+            formula=f"now() > field('{date_field.name}')",
+            date_include_time=True,
+        )
+
+        assert FormulaFieldType().get_fields_needing_periodic_update().count() == 2
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_doesnt_update_trashed_table(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+
+    original_datetime = datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+
+    with freeze_time(original_datetime):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+
+    row = RowHandler().create_row(user=user, table=table)
+
+    assert getattr(row, f"field_{field.id}") == original_datetime
+
+    TrashHandler.trash(user, workspace, database, table)
+
+    with freeze_time("2023-02-27 10:30"):
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        row.refresh_from_db()
+        assert getattr(row, f"field_{field.id}") == original_datetime
+
+        assert FormulaFieldType().get_fields_needing_periodic_update().count() == 0
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_doesnt_update_trashed_database(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+
+    original_datetime = datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+
+    with freeze_time(original_datetime):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+
+    row = RowHandler().create_row(user=user, table=table)
+
+    assert getattr(row, f"field_{field.id}") == original_datetime
+
+    TrashHandler.trash(user, workspace, database, database)
+
+    with freeze_time("2023-02-27 10:30"):
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        row.refresh_from_db()
+        assert getattr(row, f"field_{field.id}") == original_datetime
+
+        assert FormulaFieldType().get_fields_needing_periodic_update().count() == 0
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_doesnt_update_trashed_workspace(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+
+    original_datetime = datetime(2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc)
+
+    with freeze_time(original_datetime):
+        field = data_fixture.create_formula_field(
+            table=table, formula="now()", date_include_time=True
+        )
+
+    row = RowHandler().create_row(user=user, table=table)
+
+    assert getattr(row, f"field_{field.id}") == original_datetime
+
+    TrashHandler.trash(user, workspace, None, workspace)
+
+    with freeze_time("2023-02-27 10:30"):
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        row.refresh_from_db()
+        assert getattr(row, f"field_{field.id}") == original_datetime
+
+        assert FormulaFieldType().get_fields_needing_periodic_update().count() == 0
+
+
+@override_settings(STALE_MENTIONS_CLEANUP_INTERVAL_MINUTES=60)
+@pytest.mark.django_db
+def test_run_delete_mentions_marked_for_deletion(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    rich_text_field = data_fixture.create_long_text_field(
+        table=table, long_text_enable_rich_text=True
+    )
+    model = table.get_model()
+
+    # Create a user mention
+    with freeze_time("2023-02-27 9:00"):
+        row_1, row_2 = (
+            RowHandler()
+            .create_rows(
+                user=user,
+                table=table,
+                rows_values=[
+                    {f"field_{rich_text_field.id}": f"Hello @{user.id}!"},
+                    {f"field_{rich_text_field.id}": f"Hi @{user.id}!"},
+                ],
+                model=model,
+            )
+            .created_rows
+        )
+
+    mentions = RichTextFieldMention.objects.all()
+    assert len(mentions) == 2
+    assert mentions[0].marked_for_deletion_at is None
+    assert mentions[1].marked_for_deletion_at is None
+
+    with freeze_time("2023-02-27 10:00"):
+        RowHandler().update_rows(
+            user=user,
+            table=table,
+            rows_values=[{"id": row_1.id, f"field_{rich_text_field.id}": "Bye!"}],
+            model=model,
+        )
+
+    mentions = RichTextFieldMention.objects.order_by("row_id")
+    assert len(mentions) == 2
+    assert mentions[0].marked_for_deletion_at == datetime(
+        2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc
+    )
+    assert mentions[1].marked_for_deletion_at is None
+
+    with freeze_time("2023-02-27 11:00"):
+        RowHandler().update_rows(
+            user,
+            table,
+            [{"id": row_2.id, f"field_{rich_text_field.id}": "Bye!"}],
+        )
+
+    mentions = RichTextFieldMention.objects.order_by("row_id")
+    assert len(mentions) == 2
+    assert mentions[0].marked_for_deletion_at == datetime(
+        2023, 2, 27, 10, 0, 0, tzinfo=timezone.utc
+    )
+    assert mentions[1].marked_for_deletion_at == datetime(
+        2023, 2, 27, 11, 0, 0, tzinfo=timezone.utc
+    )
+
+    # Since STALE_MENTIONS_CLEANUP_INTERVAL_MINUTES=60, only mentions
+    # marked for deletion before 10:30 will be deleted
+    with freeze_time("2023-02-27 11:30"):
+        delete_mentions_marked_for_deletion()
+
+    mentions = RichTextFieldMention.objects.all()
+    assert len(mentions) == 1
+    assert mentions[0].row_id == row_2.id
+    assert mentions[0].marked_for_deletion_at == datetime(
+        2023, 2, 27, 11, 0, 0, tzinfo=timezone.utc
+    )
+
+    # Delete also the other mention
+    with freeze_time("2023-02-27 12:30"):
+        delete_mentions_marked_for_deletion()
+
+    assert RichTextFieldMention.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_link_row_fields_deps_are_excluded_from_periodic_updates(data_fixture):
+    # Fixes https://gitlab.com/baserow/baserow/-/issues/3379
+    with freeze_time("2023-01-01"):
+        table_b = data_fixture.create_database_table()
+        primary_b = data_fixture.create_formula_field(
+            table=table_b, primary=True, formula="now()"
+        )
+        table_a = data_fixture.create_database_table(database=table_b.database)
+        link_a_to_b = data_fixture.create_link_row_field(
+            table=table_a, link_row_table=table_b
+        )
+        formula_a = data_fixture.create_formula_field(
+            table=table_a,
+            formula=f"join(datetime_format(field('{link_a_to_b.name}'), 'DD'), ',')",
+        )
+        row_b = RowHandler().force_create_row(None, table_b, {})
+        row_a = RowHandler().force_create_row(
+            None, table_a, {link_a_to_b.db_column: [row_b.id]}
+        )
+
+    with freeze_time("2023-01-02"), local_cache.context():
+        run_periodic_fields_updates()
+
+    row_a.refresh_from_db()
+    assert getattr(row_a, formula_a.db_column) == "02"
+
+
+@pytest.mark.django_db
+def test_invalid_formula_is_skipped_by_periodic_update(data_fixture):
+    table = data_fixture.create_database_table()
+    date_field = data_fixture.create_date_field(table=table, date_include_time=True)
+    bool_formula = data_fixture.create_formula_field(
+        table=table,
+        formula=f"today() > field('{date_field.name}')",
+    )
+    data_fixture.create_formula_field(
+        table=table,
+        formula=f"if(field('{bool_formula.name}'), 'YES', 'NO')",
+    )
+
+    assert bool_formula.needs_periodic_update is True
+    assert bool_formula.formula_type == "boolean"
+
+    bool_formula.mark_as_invalid_and_save("simulated invalid state")
+    bool_formula.refresh_from_db()
+    assert bool_formula.formula_type == "invalid"
+    assert bool_formula.needs_periodic_update is True
+
+    assert FormulaFieldType().get_fields_needing_periodic_update().exists() is False
+
+
+@pytest.mark.django_db
+def test_cross_table_dependent_formulas_update_when_multiple_tables_have_now(
+    data_fixture,
+):
+    with freeze_time("2023-01-01"):
+        database = data_fixture.create_database_application()
+
+        table_b = data_fixture.create_database_table(database=database)
+        primary_b = data_fixture.create_formula_field(
+            table=table_b, primary=True, formula="now()"
+        )
+
+        table_a = data_fixture.create_database_table(database=database)
+        link_a_to_b = data_fixture.create_link_row_field(
+            table=table_a, link_row_table=table_b
+        )
+        formula_a = data_fixture.create_formula_field(
+            table=table_a,
+            formula=(f"join(datetime_format(field('{link_a_to_b.name}'), 'DD'), ',')"),
+        )
+
+        # Second formula with now()
+        now_in_a = data_fixture.create_formula_field(
+            table=table_a,
+            formula="datetime_format(now(), 'YYYY-MM-DD')",
+        )
+
+        row_b = RowHandler().force_create_row(None, table_b, {})
+        row_a = RowHandler().force_create_row(
+            None, table_a, {link_a_to_b.db_column: [row_b.id]}
+        )
+
+    with freeze_time("2023-01-02"), local_cache.context():
+        run_periodic_fields_updates()
+
+    row_a.refresh_from_db()
+    assert getattr(row_a, formula_a.db_column) == "02"
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_command_runs_inline(data_fixture, settings):
+    from django.core.management import call_command
+
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    with patch(
+        "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields"
+    ) as inline:
+        with freeze_time("2023-02-27 10:30"):
+            call_command("run_periodic_fields_updates", workspace_id=workspace.id)
+
+    inline.assert_called_once_with(workspace.id, True)
+
+
+@pytest.mark.django_db
+def test_finish_periodic_fields_update_releases_only_matching_token():
+    flag = SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL)
+    flag.acquire("cycle-token")
+
+    # Stale callback with a different token is a no-op.
+    finish_periodic_fields_update("other-token")
+    assert cache.get(RUN_LOCK_KEY) == "cycle-token"
+
+    # The owning callback releases the lock.
+    finish_periodic_fields_update("cycle-token")
+    assert cache.get(RUN_LOCK_KEY) is None
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_clears_lock_after_completion(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    with freeze_time("2023-02-27 10:30"), local_cache.context():
+        run_periodic_fields_updates(workspace_id=workspace.id)
+
+        # The chord ran eagerly and the finish callback released the lock. Checked
+        # inside the freeze so the lock's TTL (computed against the frozen clock)
+        # can't look expired against the real clock once we leave this block.
+        assert cache.get(RUN_LOCK_KEY) is None
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_skips_when_cycle_running(data_fixture, settings):
+    from loguru import logger
+
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    # Simulate a cycle already in flight.
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    messages = []
+    sink_id = logger.add(messages.append, level="ERROR")
+    try:
+        with (
+            patch("baserow.contrib.database.fields.tasks.chord") as chord_mock,
+            freeze_time("2023-02-27 10:30"),
+        ):
+            run_periodic_fields_updates(workspace_id=workspace.id)
+    finally:
+        logger.remove(sink_id)
+
+    chord_mock.assert_not_called()
+    assert cache.get(RUN_LOCK_KEY) == "held"
+    # The overlap is surfaced as an error, naming the settings self-hosters can tune.
+    skip_logs = [m for m in messages if "still running" in str(m)]
+    assert len(skip_logs) == 1
+    assert skip_logs[0].record["level"].name == "ERROR"
+    assert "BASEROW_PERIODIC_FIELD_UPDATE_BATCH_COUNT" in str(skip_logs[0])
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_empty_cycle_releases_lock():
+    # The lock is acquired before the eligibility scan; an empty cycle must release it
+    # again (via clear_if) so it isn't left held.
+    with patch("baserow.contrib.database.fields.tasks.chord") as chord_mock:
+        run_periodic_fields_updates()
+
+    chord_mock.assert_not_called()
+    assert cache.get(RUN_LOCK_KEY) is None
+
+
+@pytest.mark.django_db
+def test_run_periodic_fields_updates_releases_lock_on_dispatch_failure(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks.chord",
+            side_effect=RuntimeError("boom"),
+        ),
+        freeze_time("2023-02-27 10:30"),
+    ):
+        with pytest.raises(RuntimeError):
+            run_periodic_fields_updates(workspace_id=workspace.id)
+
+        # The fenced except released the lock. Checked inside the freeze, see the
+        # comment on test_run_periodic_fields_updates_clears_lock_after_completion.
+        assert cache.get(RUN_LOCK_KEY) is None
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_extends_run_lock(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields"
+        ),
+        freeze_time("2023-02-27 10:30"),
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+        # Heartbeat extends TTL without overwriting the token. Checked inside the
+        # freeze, see the comment on
+        # test_run_periodic_fields_updates_clears_lock_after_completion.
+        assert cache.get(RUN_LOCK_KEY) == "held"
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_aborts_when_lock_not_owned(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    # A different cycle owns the lock (e.g. this batch was delayed and a newer cycle
+    # took over). The batch must not run and must not touch the other cycle's lock.
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields"
+        ) as inner,
+        freeze_time("2023-02-27 10:30"),
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="stale"
+        )
+
+        inner.assert_not_called()
+        assert cache.get(RUN_LOCK_KEY) == "held"
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_continues_after_workspace_error():
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    processed = []
+
+    def side_effect(workspace_id, update_now):
+        if workspace_id == 1:
+            raise RuntimeError("boom")
+        processed.append(workspace_id)
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields",
+            side_effect=side_effect,
+        ),
+        freeze_time("2023-02-27 10:30"),
+    ):
+        # A failing workspace must not raise out of the batch, so the chord callback
+        # still runs and releases the lock.
+        update_workspaces_periodic_fields([1, 2], True, batch_index=0, run_token="held")
+
+    # The second workspace was still processed after the first one failed.
+    assert processed == [2]
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_stops_on_soft_time_limit():
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    processed = []
+
+    def side_effect(workspace_id, update_now):
+        if workspace_id == 1:
+            raise SoftTimeLimitExceeded()
+        processed.append(workspace_id)
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields",
+            side_effect=side_effect,
+        ),
+        freeze_time("2023-02-27 10:30"),
+    ):
+        # The soft limit must stop the batch cleanly (no raise) so the chord callback
+        # still runs, rather than being swallowed and looping to the hard-limit SIGKILL.
+        update_workspaces_periodic_fields([1, 2], True, batch_index=0, run_token="held")
+
+    # The batch returned on the soft timeout, so workspace 2 was not processed.
+    assert processed == []
+
+
+@pytest.mark.django_db
+def test_run_periodic_field_type_reraises_soft_time_limit(data_fixture, settings):
+    # The inner per-field-type helper must let SoftTimeLimitExceeded propagate instead of
+    # catching it like a normal update failure, so the batch can stop cleanly.
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+
+    with patch.object(
+        FormulaFieldType, "run_periodic_update", side_effect=SoftTimeLimitExceeded()
+    ):
+        with pytest.raises(SoftTimeLimitExceeded):
+            _update_workspace_periodic_fields(workspace.id, True)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_cancels_statement_at_deadline(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace_1 = _workspace_with_now_formula(data_fixture)
+    workspace_2 = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    started_workspace_ids = []
+
+    def slow_update(fields, **kwargs):
+        started_workspace_ids.append(fields[0].table.database.workspace_id)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_sleep(1)")
+            # Starts with about 3 seconds left, so only a statement_timeout lowered
+            # before this statement ends it at the deadline.
+            cursor.execute("SELECT pg_sleep(10)")
+        return []
+
+    # A 14s soft limit minus the 10s margin leaves the batch 4 seconds.
+    with (
+        patch("baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 14),
+        patch.object(FormulaFieldType, "run_periodic_update", side_effect=slow_update),
+        patch("baserow.contrib.database.fields.tasks.logger") as mock_logger,
+    ):
+        started_at = time.monotonic()
+        update_workspaces_periodic_fields(
+            [workspace_1.id, workspace_2.id], True, batch_index=0, run_token="held"
+        )
+        elapsed = time.monotonic() - started_at
+
+    assert elapsed < 4.6
+    assert started_workspace_ids == [workspace_1.id]
+    # Reported as running out of time at the slow workspace, not as a failed update.
+    mock_logger.error.assert_not_called()
+    assert mock_logger.warning.call_args.kwargs["workspace_id"] == workspace_1.id
+    assert mock_logger.warning.call_args.kwargs["skipped"] == 2
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_skips_workspaces_after_deadline(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    now_before = workspace.now
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    # A soft limit below the margin puts the deadline in the past.
+    with patch("baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 5):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    # Not started, so it keeps its old `now` and stays first in line next cycle.
+    workspace.refresh_from_db()
+    assert workspace.now == now_before
+
+
+def _show_statement_timeout():
+    with connection.cursor() as cursor:
+        cursor.execute("SHOW statement_timeout")
+        return cursor.fetchone()[0]
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_keeps_stricter_statement_timeout(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+    with connection.cursor() as cursor:
+        cursor.execute("SET LOCAL statement_timeout = '2s'")
+
+    timeouts_during_update = []
+
+    def record_timeout(fields, **kwargs):
+        timeouts_during_update.append(_show_statement_timeout())
+        return []
+
+    with patch.object(
+        FormulaFieldType, "run_periodic_update", side_effect=record_timeout
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    assert timeouts_during_update == ["2s"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_statement_timeout_does_not_leak(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+    timeout_before = _show_statement_timeout()
+
+    timeouts_during_update = []
+
+    def record_timeout(fields, **kwargs):
+        timeouts_during_update.append(_show_statement_timeout())
+        return []
+
+    with patch.object(
+        FormulaFieldType, "run_periodic_update", side_effect=record_timeout
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    # Applied during the update, and gone once its transaction ended.
+    assert len(timeouts_during_update) == 1
+    assert timeouts_during_update[0] != timeout_before
+    assert _show_statement_timeout() == timeout_before
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_stops_on_soft_time_limit_in_formula_code(
+    data_fixture, settings
+):
+    # Outside tests, formula errors are reported and replaced with an empty value.
+    settings.TESTS = False
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace_1 = _workspace_with_now_formula(data_fixture)
+    workspace_2 = _workspace_with_now_formula(data_fixture)
+    now_before = Workspace.objects.get(id=workspace_2.id).now
+    table = workspace_1.application_set.get().specific.table_set.get()
+    formula_field = table.field_set.get().specific
+    model = table.get_model()
+    assert getattr(model.objects.get(), formula_field.db_column) is not None
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    with patch(
+        "baserow.contrib.database.formula.expression_generator.generator."
+        "BaserowExpressionToDjangoExpressionGenerator.__init__",
+        side_effect=SoftTimeLimitExceeded(),
+    ):
+        update_workspaces_periodic_fields(
+            [workspace_1.id, workspace_2.id], True, batch_index=0, run_token="held"
+        )
+
+    assert getattr(model.objects.get(), formula_field.db_column) is not None
+    assert Workspace.objects.get(id=workspace_2.id).now == now_before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_stops_stalled_refresh_now_at_deadline(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    def stalled_refresh_now(self):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_sleep(10)")
+
+    # A 14s soft limit minus the 10s margin leaves the batch 4 seconds.
+    with (
+        patch("baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 14),
+        patch.object(Workspace, "refresh_now", stalled_refresh_now),
+    ):
+        started_at = time.monotonic()
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+        elapsed = time.monotonic() - started_at
+
+    assert elapsed < 5.5
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_allows_nested_atomic_after_error(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    results = []
+
+    def update_with_failing_savepoint(fields, **kwargs):
+        with pytest.raises(DataError):
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute("SELECT 1/0")
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            results.append(cursor.fetchone()[0])
+        return []
+
+    with patch.object(
+        FormulaFieldType,
+        "run_periodic_update",
+        side_effect=update_with_failing_savepoint,
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    assert results == [1]
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_allows_named_cursors(data_fixture, settings):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    workspace_ids = []
+
+    def update_with_iterator(fields, **kwargs):
+        workspace_ids.extend(
+            Workspace.objects.values_list("id", flat=True).iterator(chunk_size=10)
+        )
+        return []
+
+    with patch.object(
+        FormulaFieldType, "run_periodic_update", side_effect=update_with_iterator
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    assert workspace_ids == [workspace.id]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_runs_on_commit_hooks_near_deadline(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    hook_results = []
+
+    def hook():
+        hook_results.append(Workspace.objects.count())
+
+    def update_until_deadline(fields, **kwargs):
+        transaction.on_commit(hook)
+        # Ends with less than a second left, so the hook runs after the deadline check
+        # would have stopped it.
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_sleep(1.5)")
+        return []
+
+    # A 12.2s soft limit minus the 10s margin leaves the batch 2.2 seconds.
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 12.2
+        ),
+        patch.object(
+            FormulaFieldType, "run_periodic_update", side_effect=update_until_deadline
+        ),
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    assert hook_results == [1]
+
+
+@contextmanager
+def _lock_table_from_another_connection(table_name, seconds):
+    """Holds an ACCESS EXCLUSIVE lock on the table for up to `seconds`."""
+
+    other = psycopg.connect(**connection.get_connection_params())
+    release_lock = threading.Lock()
+
+    def release():
+        with release_lock:
+            if not other.closed:
+                other.rollback()
+                other.close()
+
+    timer = threading.Timer(seconds, release)
+    try:
+        with other.cursor() as cursor:
+            cursor.execute(f"LOCK TABLE {table_name} IN ACCESS EXCLUSIVE MODE")
+        timer.start()
+        yield
+    finally:
+        timer.cancel()
+        release()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_stops_at_deadline_when_locked_after_update(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace_1 = _workspace_with_now_formula(data_fixture)
+    workspace_2 = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    lock = None
+
+    def update_then_lock(fields, **kwargs):
+        # Locked after the update, before its search updates are scheduled.
+        nonlocal lock
+        if lock is None:
+            lock = _lock_table_from_another_connection("core_application", 8)
+            lock.__enter__()
+        return list(fields)
+
+    # A 14s soft limit minus the 10s margin leaves the batch 4 seconds.
+    try:
+        with (
+            patch(
+                "baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 14
+            ),
+            patch.object(
+                FormulaFieldType, "run_periodic_update", side_effect=update_then_lock
+            ),
+        ):
+            started_at = time.monotonic()
+            update_workspaces_periodic_fields(
+                [workspace_1.id, workspace_2.id], True, batch_index=0, run_token="held"
+            )
+            elapsed = time.monotonic() - started_at
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+    assert elapsed < 5.5
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_stops_at_deadline_when_workspace_locked(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    # A 14s soft limit minus the 10s margin leaves the batch 4 seconds.
+    with (
+        patch("baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 14),
+        _lock_table_from_another_connection("core_workspace", 8),
+    ):
+        started_at = time.monotonic()
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+        elapsed = time.monotonic() - started_at
+
+    assert elapsed < 5.5
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_skips_workspace_with_under_a_second_left(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    now_before = workspace.now
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    # A 10.5s soft limit minus the 10s margin leaves the batch half a second.
+    with patch(
+        "baserow.contrib.database.fields.tasks.BATCH_UPDATE_SOFT_TIME_LIMIT", 10.5
+    ):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    workspace.refresh_from_db()
+    assert workspace.now == now_before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_workspaces_periodic_fields_continues_after_stricter_timeout_cancel(
+    data_fixture, settings
+):
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace_1 = _workspace_with_now_formula(data_fixture)
+    workspace_2 = _workspace_with_now_formula(data_fixture)
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    started_workspace_ids = []
+
+    def update_slower_than_stricter_timeout(fields, **kwargs):
+        workspace_id = fields[0].table.database.workspace_id
+        started_workspace_ids.append(workspace_id)
+        if workspace_id == workspace_1.id:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(2)")
+        return []
+
+    with connection.cursor() as cursor:
+        cursor.execute("SET statement_timeout = '500ms'")
+    try:
+        with (
+            patch.object(
+                FormulaFieldType,
+                "run_periodic_update",
+                side_effect=update_slower_than_stricter_timeout,
+            ),
+            patch("baserow.contrib.database.fields.tasks.logger") as mock_logger,
+        ):
+            update_workspaces_periodic_fields(
+                [workspace_1.id, workspace_2.id], True, batch_index=0, run_token="held"
+            )
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("RESET statement_timeout")
+
+    # A cancel with plenty of time left is an ordinary failure, not the deadline.
+    assert started_workspace_ids == [workspace_1.id, workspace_2.id]
+    mock_logger.error.assert_called_once()
+    mock_logger.warning.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_updates_formulas_without_jit(
+    data_fixture, settings
+):
+    # JIT compiled the large UPDATEs of lookup-based formulas for minutes, which
+    # can't be cancelled, so the batch ran into its hard time limit.
+    settings.BASEROW_PERIODIC_FIELD_UPDATE_UNUSED_WORKSPACE_INTERVAL_MIN = 5
+    workspace = _workspace_with_now_formula(data_fixture)
+    formula_field = FormulaField.objects.get(
+        table__database__workspace=workspace, formula="now()"
+    )
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+    jit_per_update = []
+
+    def record_jit(execute, sql, params, many, context):
+        if isinstance(sql, str) and sql.startswith(
+            f'UPDATE "database_table_{formula_field.table_id}" '
+            f'SET "{formula_field.db_column}"'
+        ):
+            with context["connection"].connection.cursor() as cursor:
+                cursor.execute("SHOW jit")
+                jit_per_update.append(cursor.fetchone()[0])
+        return execute(sql, params, many, context)
+
+    with connection.cursor() as cursor:
+        cursor.execute("SET LOCAL jit = on")
+    with connection.execute_wrapper(record_jit):
+        update_workspaces_periodic_fields(
+            [workspace.id], True, batch_index=0, run_token="held"
+        )
+
+    assert jit_per_update == ["off"]
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_stops_on_soft_time_limit_in_heartbeat():
+    with (
+        patch.object(
+            SingletonAutoRescheduleFlag,
+            "extend_if",
+            side_effect=SoftTimeLimitExceeded(),
+        ),
+        patch.object(SingletonAutoRescheduleFlag, "clear_if") as clear_if,
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields"
+        ) as inner,
+        patch("baserow.contrib.database.fields.tasks.logger") as mock_logger,
+    ):
+        # Returns instead of raising, so the chord callback releases the lock.
+        update_workspaces_periodic_fields([1, 2], True, batch_index=0, run_token="held")
+
+    inner.assert_not_called()
+    clear_if.assert_not_called()
+    assert mock_logger.warning.call_args.kwargs["workspace_id"] == 1
+    assert mock_logger.warning.call_args.kwargs["skipped"] == 2
+
+
+@pytest.mark.django_db
+def test_update_workspaces_periodic_fields_stops_on_soft_time_limit_while_logging():
+    SingletonAutoRescheduleFlag(RUN_LOCK_KEY, timeout=RUN_LOCK_TTL).acquire("held")
+
+    with (
+        patch(
+            "baserow.contrib.database.fields.tasks._update_workspace_periodic_fields",
+            side_effect=RuntimeError("boom"),
+        ) as inner,
+        patch("baserow.contrib.database.fields.tasks.logger") as mock_logger,
+    ):
+        # The soft limit fires while the failure of the first workspace is logged.
+        mock_logger.exception.side_effect = SoftTimeLimitExceeded()
+        update_workspaces_periodic_fields([1, 2], True, batch_index=0, run_token="held")
+
+    assert inner.call_count == 1
+    assert mock_logger.warning.call_args.kwargs["workspace_id"] == 1
+    assert mock_logger.warning.call_args.kwargs["skipped"] == 2

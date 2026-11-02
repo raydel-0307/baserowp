@@ -1,0 +1,566 @@
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test.utils import override_settings
+
+import pytest
+import responses
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
+from rest_framework.fields import (
+    BooleanField,
+    CharField,
+    ChoiceField,
+    DateField,
+    DateTimeField,
+    DecimalField,
+    EmailField,
+    FloatField,
+    IntegerField,
+    ListField,
+    SerializerMethodField,
+    UUIDField,
+)
+from rest_framework.serializers import ListSerializer, Serializer
+
+from baserow.contrib.database.api.fields.serializers import FileFieldRequestSerializer
+from baserow.contrib.integrations.local_baserow.utils import (
+    guess_cast_function_from_response_serializer_field,
+    guess_json_type_from_response_serializer_field,
+    prepare_files_for_db,
+)
+from baserow.core.formula.service_file import ServiceFile
+from baserow.core.formula.validator import (
+    ensure_array,
+    ensure_boolean,
+    ensure_date,
+    ensure_datetime,
+    ensure_integer,
+    ensure_string,
+)
+from baserow.core.models import Agent
+from baserow.core.services.exceptions import (
+    ServiceImproperlyConfiguredDispatchException,
+)
+from baserow.core.user_files.handler import UserFileHandler
+from baserow.test_utils.helpers import AnyInt, AnyStr
+
+
+def test_guess_type_for_response_serialize_field_permutations():
+    TYPE_NULL = {"type": None}
+    TYPE_OBJECT = {"type": "object", "properties": {}}
+    TYPE_STRING = {"type": "string"}
+    TYPE_NUMBER = {"type": "number"}
+    TYPE_BOOLEAN = {"type": "boolean"}
+    TYPE_DATE = {"type": "string", "format": "date"}
+    TYPE_DATE_TIME = {"type": "string", "format": "date-time"}
+    TYPE_ARRAY_CHILD_OBJECT = {
+        "type": "array",
+        "items": TYPE_OBJECT,
+    }
+    TYPE_OBJECT_FROM_METHOD_SERIALIZER = {
+        "type": "object",
+        "properties": {
+            "answer": {"title": "answer", "type": "number"},
+            "url": {"title": "url", "type": "string"},
+        },
+    }
+
+    class FakeSerializer(Serializer):
+        """Dummy serializer for testing method serializers that use OpenAPI types."""
+
+        answer = SerializerMethodField()
+        url = SerializerMethodField()
+
+        @extend_schema_field(OpenApiTypes.NUMBER)
+        def get_answer(self, instance):
+            return 42
+
+        @extend_schema_field(OpenApiTypes.URI)
+        def get_url(self, instance):
+            return "https://baserow.io"
+
+    assert guess_json_type_from_response_serializer_field(UUIDField()) == TYPE_STRING
+    assert guess_json_type_from_response_serializer_field(CharField()) == TYPE_STRING
+    assert (
+        guess_json_type_from_response_serializer_field(
+            DecimalField(decimal_places=2, max_digits=4)
+        )
+        == TYPE_STRING
+    )
+    assert guess_json_type_from_response_serializer_field(FloatField()) == TYPE_STRING
+    assert (
+        guess_json_type_from_response_serializer_field(ChoiceField(choices=("a", "b")))
+        == TYPE_STRING
+    )
+    assert guess_json_type_from_response_serializer_field(IntegerField()) == TYPE_NUMBER
+    assert (
+        guess_json_type_from_response_serializer_field(BooleanField()) == TYPE_BOOLEAN
+    )
+    assert guess_json_type_from_response_serializer_field(DateField()) == TYPE_DATE
+    assert (
+        guess_json_type_from_response_serializer_field(DateTimeField())
+        == TYPE_DATE_TIME
+    )
+    assert (
+        guess_json_type_from_response_serializer_field(
+            ListSerializer(child=Serializer())
+        )
+        == TYPE_ARRAY_CHILD_OBJECT
+    )
+    assert guess_json_type_from_response_serializer_field(Serializer()) == TYPE_OBJECT
+    assert (
+        guess_json_type_from_response_serializer_field("unknown")  # type: ignore
+        == TYPE_NULL
+    )
+    assert (
+        guess_json_type_from_response_serializer_field((FakeSerializer()))
+    ) == TYPE_OBJECT_FROM_METHOD_SERIALIZER
+
+
+@pytest.mark.parametrize(
+    "serializer,expected",
+    [
+        (CharField(), ensure_string),
+        (UUIDField(), ensure_string),
+        (EmailField(), ensure_string),
+        (IntegerField(), ensure_integer),
+        (DecimalField(decimal_places=2, max_digits=4), ensure_string),
+        (BooleanField(), ensure_boolean),
+        (DateField(), ensure_date),
+        (DateTimeField(), ensure_datetime),
+        (ListSerializer(child=Serializer()), ensure_array),
+        (ListField(child=IntegerField()), ensure_array),
+        (ListField(), ensure_array),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_guess_cast_function_from_response_serialize_field(serializer, expected):
+    assert (
+        guess_cast_function_from_response_serializer_field(serializer, None) == expected
+    )
+
+
+@pytest.mark.django_db
+def test_guess_cast_function_for_filefieldserializer(data_fixture, fake):
+    user = data_fixture.create_user()
+    prepare = guess_cast_function_from_response_serializer_field(
+        FileFieldRequestSerializer(), user
+    )
+
+    value = {
+        "__file__": True,
+        "name": "superfile",
+        "file": SimpleUploadedFile(
+            name="avatar.png", content=fake.image(), content_type="image/png"
+        ),
+    }
+
+    assert prepare(value) == [
+        {
+            "image_height": 256,
+            "image_width": 256,
+            "is_image": True,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "superfile",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "value,result",
+    [
+        (None, []),
+        ("", []),
+        ({}, [{}]),
+        ({"prop": 1}, [{"prop": 1}]),
+        ([{}], [{}]),
+        ([{"prop": 1}], [{"prop": 1}]),
+    ],
+)
+@pytest.mark.django_db
+def test_prepare_file_for_db(data_fixture, value, result):
+    user = data_fixture.create_user()
+
+    assert prepare_files_for_db(value, user) == result
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_file(data_fixture, fake):
+    user = data_fixture.create_user()
+
+    image = fake.image()
+
+    value = {
+        "__file__": True,
+        "name": "superfile",
+        "file": SimpleUploadedFile(
+            name="avatar.png", content=image, content_type="image/png"
+        ),
+    }
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": 256,
+            "image_width": 256,
+            "is_image": True,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "superfile",
+        },
+    ]
+
+    value = [
+        {
+            "__file__": True,
+            "name": "superfile1",
+            "file": SimpleUploadedFile(
+                name="avatar.png", content=image, content_type="image/png"
+            ),
+        },
+        {
+            "__file__": True,
+            "name": "superfile2",
+            "file": SimpleUploadedFile(
+                name="avatar.png", content=image, content_type="image/png"
+            ),
+        },
+    ]
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": 256,
+            "image_width": 256,
+            "is_image": True,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "superfile1",
+        },
+        {
+            "image_height": 256,
+            "image_width": 256,
+            "is_image": True,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "superfile2",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_service_file(data_fixture):
+    user = data_fixture.create_user()
+    uploaded_file = SimpleUploadedFile(
+        name="people.csv",
+        content=b"Name\nAda\n",
+        content_type="text/csv",
+    )
+    service_file = ServiceFile(name="people.csv", file=uploaded_file)
+
+    assert prepare_files_for_db(service_file, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/csv",
+            "name": AnyStr(),
+            "size": 9,
+            "uploaded_at": AnyStr(),
+            "visible_name": "people.csv",
+        }
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_agent_creates_an_anonymous_user_file(data_fixture):
+    user = data_fixture.create_user()
+    agent = Agent.objects.create(
+        workspace=data_fixture.create_workspace(user=user), name="File writer"
+    )
+    service_file = ServiceFile(
+        name="people.csv",
+        file=SimpleUploadedFile(
+            name="people.csv",
+            content=b"Name\nAda\n",
+            content_type="text/csv",
+        ),
+    )
+
+    file_name = prepare_files_for_db(service_file, agent)[0]["name"]
+
+    assert UserFileHandler().get_user_file_by_name(file_name).uploaded_by is None
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_uploaded_file_named_like_user_file(data_fixture):
+    user = data_fixture.create_user()
+    uploaded_file = SimpleUploadedFile(
+        name="avatar.png",
+        content=b"content",
+        content_type="image/png",
+    )
+    service_file = ServiceFile(name="image_1.png", file=uploaded_file)
+
+    assert prepare_files_for_db(service_file, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": 7,
+            "uploaded_at": AnyStr(),
+            "visible_name": "image_1.png",
+        }
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_stored_user_file_url(data_fixture):
+    user = data_fixture.create_user()
+    user_file = data_fixture.create_user_file(original_name="stored.csv")
+
+    value = {
+        "__file__": True,
+        "name": user_file.name,
+        "url": UserFileHandler().get_user_file_url(user_file),
+    }
+
+    assert prepare_files_for_db(value, user)[0]["name"] == user_file.name
+
+
+@pytest.mark.django_db
+@responses.activate
+def test_prepare_file_for_db_with_remote_url(data_fixture):
+    user = data_fixture.create_user()
+    url = "https://example.com/a.csv"
+    responses.add(
+        responses.GET,
+        url,
+        body=b"Name\nAda\n",
+        headers={"Content-Type": "text/csv"},
+        status=200,
+    )
+
+    assert prepare_files_for_db(
+        {"__file__": True, "name": "filename", "url": url},
+        user,
+    ) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/csv",
+            "name": AnyStr(),
+            "size": 9,
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_unreachable_url(data_fixture):
+    user = data_fixture.create_user()
+
+    url = "https://somenthing.doesnt.exist.com"
+    value = {
+        "__file__": True,
+        "name": "filename",
+        "url": url,
+    }
+
+    with pytest.raises(ServiceImproperlyConfiguredDispatchException):
+        prepare_files_for_db(value, user)
+
+
+@pytest.mark.django_db
+@override_settings(BASEROW_FILE_UPLOAD_SIZE_LIMIT_MB=1)
+def test_prepare_file_for_db_with_toolarge_url(data_fixture, fake):
+    user = data_fixture.create_user()
+    image = fake.image(size=(1000, 1000))
+
+    value = {
+        "__file__": True,
+        "name": "superfile",
+        "file": SimpleUploadedFile(
+            name="avatar.png", content=image, content_type="image/png"
+        ),
+    }
+
+    with pytest.raises(ServiceImproperlyConfiguredDispatchException):
+        prepare_files_for_db(value, user)
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_existing_file(data_fixture):
+    user = data_fixture.create_user()
+    user_file = data_fixture.create_user_file(
+        original_name=f"a.txt",
+    )
+
+    value = {
+        "__file__": True,
+        "name": "filename",
+        "url": UserFileHandler().get_user_file_url(user_file),
+    }
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/plain",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+    ]
+
+    assert prepare_files_for_db([value, value], user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/plain",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/plain",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_prefers_url_over_user_file_like_visible_name(data_fixture):
+    user = data_fixture.create_user()
+    user_file = data_fixture.create_user_file(
+        original_name="sample_budget.xls",
+    )
+
+    value = {
+        "__file__": True,
+        "name": "sample_budget.xls",
+        "url": UserFileHandler().get_user_file_url(user_file),
+    }
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "application/vnd.ms-excel",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "sample_budget.xls",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_existing_file_and_stale_file_placeholder(
+    data_fixture,
+):
+    """
+    When updating a row through a form, an unchanged pre-existing file is sent as
+    a `url` reference, but the frontend may also include a `file` placeholder (a
+    uid string) that was never resolved into an upload stream. We must ignore the
+    non-readable placeholder and resolve the file via its URL instead of raising
+    "The provided stream is not readable.".
+    """
+
+    user = data_fixture.create_user()
+    user_file = data_fixture.create_user_file(original_name="imagen.png")
+
+    # Mirrors the exact payload the frontend sends for an unchanged file: the
+    # original `data` is `undefined`, so `file` holds a leftover uid placeholder
+    # (the multipart part for it is the literal string "undefined", never an
+    # uploaded stream) and the actual file is only addressable via `url`.
+    value = {
+        "__file__": True,
+        "name": "Screenshot 2026-06-29 at 10.34.28.png",
+        "url": UserFileHandler().get_user_file_url(user_file),
+        "content_type": "image/png",
+        "size": "17746",
+        "file": "46913887-0126-4d0f-80f0-d806ea93a360",
+    }
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "image/png",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "Screenshot 2026-06-29 at 10.34.28.png",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_prepare_file_for_db_with_mix(data_fixture, fake):
+    user = data_fixture.create_user()
+    user_file = data_fixture.create_user_file(
+        original_name=f"a.txt",
+    )
+    image = fake.image()
+
+    value = [
+        {
+            "__file__": True,
+            "name": "filename",
+            "url": UserFileHandler().get_user_file_url(user_file),
+        },
+        {
+            "__file__": True,
+            "name": "filename",
+            "file": SimpleUploadedFile(
+                name="avatar.png", content=image, content_type="image/png"
+            ),
+        },
+    ]
+
+    assert prepare_files_for_db(value, user) == [
+        {
+            "image_height": None,
+            "image_width": None,
+            "is_image": False,
+            "mime_type": "text/plain",
+            "name": user_file.name,
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+        {
+            "image_height": 256,
+            "image_width": 256,
+            "is_image": True,
+            "mime_type": "image/png",
+            "name": AnyStr(),
+            "size": AnyInt(),
+            "uploaded_at": AnyStr(),
+            "visible_name": "filename",
+        },
+    ]

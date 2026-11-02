@@ -1,0 +1,1530 @@
+"""Unit tests for RetryingModel."""
+
+import json
+import os
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import httpx2
+import pytest
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    UserPromptPart,
+)
+from pydantic_ai.models import ModelRequestParameters, StreamedResponse
+from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.providers.groq import GroqProvider
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.usage import RequestUsage
+
+from baserow_enterprise.assistant.retrying_model import (
+    RetryingModel,
+    _is_transient_provider_error,
+    _resolve_credentials,
+    _resolve_model,
+    _try_recover_tool_use_failed,
+    repair_printed_tool_call,
+)
+
+
+class TestIsTransientProviderError:
+    def test_groq_parse_error(self):
+        exc = Exception("Failed to parse tool call arguments as JSON")
+        assert _is_transient_provider_error(exc) is True
+
+    def test_other_providers_server_errors_are_unchanged(self):
+        exc = ModelHTTPError(status_code=503, model_name="test-model")
+        assert _is_transient_provider_error(exc) is False
+
+    def test_tool_validation_failed(self):
+        exc = Exception("Tool call validation failed: something")
+        assert _is_transient_provider_error(exc) is True
+
+    def test_auth_error_not_retryable(self):
+        exc = Exception("Invalid API key")
+        assert _is_transient_provider_error(exc) is False
+
+    def test_generic_error_not_retryable(self):
+        exc = ValueError("something went wrong")
+        assert _is_transient_provider_error(exc) is False
+
+    def test_rate_limit_http_error_is_retryable(self):
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        exc = ModelHTTPError(
+            status_code=429,
+            model_name="test-model",
+            body={"error": {"message": "Rate limit exceeded"}},
+        )
+
+        assert _is_transient_provider_error(exc) is True
+
+
+def _make_retrying(inner_mock, **kwargs):
+    """Create a RetryingModel with a pre-resolved mock as the wrapped model."""
+
+    model = RetryingModel.__new__(RetryingModel)
+    model._wrapped_or_name = inner_mock
+    model._resolved = inner_mock
+    model.max_attempts = kwargs.get("max_attempts", 3)
+    model.base_delay = kwargs.get("base_delay", 0.01)
+    model.max_delay = kwargs.get("max_delay", 10.0)
+    return model
+
+
+def _assert_balanced_model_scope(inner_mock, expected_count=1):
+    """Assert every model-client scope entered by a test was closed."""
+
+    assert inner_mock.__aenter__.await_count == expected_count
+    assert inner_mock.__aexit__.await_count == expected_count
+
+
+async def _request_anthropic(model, streaming):
+    args = (
+        [ModelRequest(parts=[UserPromptPart("OK")])],
+        {"timeout": 0.01, "max_tokens": 16},
+        ModelRequestParameters(),
+    )
+    if streaming:
+        async with model.request_stream(*args) as stream:
+            return [event async for event in stream]
+    return await model.request(*args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("from_registry", [False, True])
+@pytest.mark.parametrize(
+    "headers", [{"retry-after": "300"}, {"retry-after-ms": "300000"}]
+)
+async def test_anthropic_long_retry_after_fails_without_nested_retries(
+    monkeypatch, streaming, from_registry, headers
+):
+    from baserow.core.generative_ai.generative_ai_model_types import (
+        AnthropicGenerativeAIModelType,
+    )
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    inner = (
+        AnthropicGenerativeAIModelType().get_ai_model(
+            "claude-sonnet-4-5", settings_override={"api_key": "test"}
+        )
+        if from_registry
+        else "anthropic:claude-sonnet-4-5"
+    )
+    model = RetryingModel(inner)
+    response = httpx2.Response(
+        429,
+        headers=headers,
+        json={
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "Busy"},
+        },
+    )
+    with (
+        patch(
+            "httpx2.AsyncHTTPTransport.handle_async_request",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as send,
+        patch(
+            "anthropic._base_client.anyio.sleep", new_callable=AsyncMock
+        ) as sdk_sleep,
+        patch(
+            "baserow_enterprise.assistant.retrying_model.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as wrapper_sleep,
+        pytest.raises(ModelHTTPError) as error,
+    ):
+        await _request_anthropic(model, streaming)
+
+    assert error.value.status_code == 429
+    assert send.await_count == 1
+    sdk_sleep.assert_not_awaited()
+    wrapper_sleep.assert_not_awaited()
+    assert model.wrapped.provider.client.is_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("failure", [408, 409, 429, 500, 503, "connection", "timeout"])
+async def test_anthropic_transient_failures_retry_only_in_wrapper(
+    monkeypatch, streaming, failure
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    model = RetryingModel("anthropic:claude-sonnet-4-5")
+    if failure == "connection":
+        failed_response = httpx2.ConnectError("Connection failed")
+    elif failure == "timeout":
+        failed_response = httpx2.ReadTimeout("Read timed out")
+    else:
+        failed_response = httpx2.Response(
+            failure,
+            headers={"retry-after": "2"},
+            json={"type": "error", "error": {"type": "api_error", "message": "Busy"}},
+        )
+    successful_response = httpx2.Response(
+        200,
+        json={
+            "id": "msg-test",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": "OK"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    with (
+        patch(
+            "httpx2.AsyncHTTPTransport.handle_async_request",
+            new_callable=AsyncMock,
+            side_effect=[failed_response, successful_response],
+        ) as send,
+        patch(
+            "anthropic._base_client.anyio.sleep", new_callable=AsyncMock
+        ) as sdk_sleep,
+        patch(
+            "baserow_enterprise.assistant.retrying_model.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as wrapper_sleep,
+    ):
+        result = await _request_anthropic(model, streaming)
+
+    assert result
+    assert send.await_count == 2
+    sdk_sleep.assert_not_awaited()
+    wrapper_sleep.assert_awaited_once_with(
+        1.0 if failure in ("connection", "timeout") else 2.0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("status", [400, 401, 403])
+async def test_anthropic_non_transient_errors_are_not_retried(
+    monkeypatch, streaming, status
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    model = RetryingModel("anthropic:claude-sonnet-4-5")
+    response = httpx2.Response(
+        status,
+        json={"type": "error", "error": {"type": "api_error", "message": "Invalid"}},
+    )
+    with (
+        patch(
+            "httpx2.AsyncHTTPTransport.handle_async_request",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as send,
+        pytest.raises(ModelHTTPError),
+    ):
+        await _request_anthropic(model, streaming)
+
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_request_retries_on_transient_error():
+    """RetryingModel.request should retry transient errors."""
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    inner = MagicMock()
+    response = ModelResponse(parts=[TextPart(content="hello")])
+    inner.request = AsyncMock(
+        side_effect=[
+            Exception("Failed to parse tool call arguments as JSON"),
+            response,
+        ]
+    )
+
+    model = _make_retrying(inner)
+    result = await model.request(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    )
+
+    assert result == response
+    assert inner.request.call_count == 2
+    _assert_balanced_model_scope(inner)
+
+
+@pytest.mark.asyncio
+async def test_request_uses_provider_retry_after_for_rate_limit():
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    rate_limit_error = ModelHTTPError(
+        status_code=429,
+        model_name="test-model",
+        body={"error": {"message": "Rate limit exceeded"}},
+        headers={"Retry-After": "2"},
+    )
+    response = ModelResponse(parts=[TextPart(content="hello")])
+    inner = MagicMock()
+    inner.request = AsyncMock(side_effect=[rate_limit_error, response])
+    model = _make_retrying(inner, base_delay=0.01, max_delay=1.0)
+
+    with patch(
+        "baserow_enterprise.assistant.retrying_model.asyncio.sleep",
+        new_callable=AsyncMock,
+    ) as mock_sleep:
+        result = await model.request(
+            [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+        )
+
+    assert result == response
+    assert inner.request.call_count == 2
+    mock_sleep.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_request_raises_non_transient_error():
+    """RetryingModel.request should not retry non-transient errors."""
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    inner = MagicMock()
+    inner.request = AsyncMock(side_effect=ValueError("bad input"))
+
+    model = _make_retrying(inner)
+    with pytest.raises(ValueError, match="bad input"):
+        await model.request(
+            [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+        )
+
+    assert inner.request.call_count == 1
+    _assert_balanced_model_scope(inner)
+
+
+@pytest.mark.asyncio
+async def test_request_exhausts_retries():
+    """RetryingModel should raise after exhausting max_attempts."""
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    inner = MagicMock()
+    inner.request = AsyncMock(
+        side_effect=Exception("Failed to parse tool call arguments as JSON")
+    )
+
+    model = _make_retrying(inner, max_attempts=2)
+    with pytest.raises(Exception, match="Failed to parse"):
+        await model.request(
+            [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+        )
+
+    assert inner.request.call_count == 2
+    _assert_balanced_model_scope(inner)
+
+
+def test_deferred_model_resolution():
+    """RetryingModel should defer infer_model until first access."""
+
+    model = RetryingModel("groq:some-model")
+    # Should not raise at construction time
+    assert model._resolved is None
+
+
+# ---------------------------------------------------------------------------
+# tool_use_failed recovery
+# ---------------------------------------------------------------------------
+
+
+def _make_tool_use_failed_error(
+    failed_generation: str,
+    model_name: str = "test-model",
+):
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    return ModelHTTPError(
+        status_code=400,
+        model_name=model_name,
+        body={
+            "error": {
+                "message": "Failed to parse tool call arguments as JSON",
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": failed_generation,
+            }
+        },
+    )
+
+
+class TestTryRecoverToolUseFailed:
+    def test_recovers_valid_tool_call(self):
+        from pydantic_ai.messages import ToolCallPart
+
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        exc = _make_tool_use_failed_error(
+            '{"name": "list_tables", "arguments": {"thought": "test"}}'
+        )
+        result = _try_recover_tool_use_failed(exc)
+
+        assert result is not None
+        assert len(result.parts) == 1
+        part = result.parts[0]
+        assert isinstance(part, ToolCallPart)
+        assert part.tool_name == "list_tables"
+        assert "thought" in part.args
+
+    def test_recovers_malformed_json_as_tool_call(self):
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        exc = _make_tool_use_failed_error("{not valid json")
+        result = _try_recover_tool_use_failed(exc)
+
+        assert result is not None
+        assert len(result.parts) == 1
+        from pydantic_ai.messages import ToolCallPart
+
+        assert isinstance(result.parts[0], ToolCallPart)
+        assert result.parts[0].tool_name == "unknown"
+        assert result.parts[0].args == "{}"
+
+    def test_recovers_malformed_json_extracts_tool_name(self):
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        exc = _make_tool_use_failed_error(
+            '{"name": "create_elements", "arguments": {"page_id": 1, "elements": [truncated'
+        )
+        result = _try_recover_tool_use_failed(exc)
+
+        assert result is not None
+        from pydantic_ai.messages import ToolCallPart
+
+        assert isinstance(result.parts[0], ToolCallPart)
+        assert result.parts[0].tool_name == "create_elements"
+        assert result.parts[0].args == "{}"
+
+    def test_returns_none_for_non_tool_use_failed(self):
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        exc = ModelHTTPError(
+            status_code=400,
+            model_name="test",
+            body={"error": {"message": "other error", "code": "other"}},
+        )
+        assert _try_recover_tool_use_failed(exc) is None
+
+    def test_returns_none_for_non_model_http_error(self):
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        assert _try_recover_tool_use_failed(ValueError("nope")) is None
+
+    def test_recovers_raw_api_error_with_body(self):
+        """Handles raw provider APIError (e.g. groq.APIError) with body attr."""
+
+        from pydantic_ai.messages import ToolCallPart
+
+        from baserow_enterprise.assistant.retrying_model import (
+            _try_recover_tool_use_failed,
+        )
+
+        class FakeAPIError(Exception):
+            def __init__(self, message, body=None):
+                super().__init__(message)
+                self.body = body
+
+        exc = FakeAPIError(
+            "Failed to parse tool call arguments as JSON",
+            body={
+                "message": "Failed to parse tool call arguments as JSON",
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": '{"name": "create_rows", "arguments": {"table_id": 1}}',
+            },
+        )
+        result = _try_recover_tool_use_failed(exc)
+        assert result is not None
+        assert isinstance(result.parts[0], ToolCallPart)
+        assert result.parts[0].tool_name == "create_rows"
+
+
+@pytest.mark.asyncio
+async def test_request_recovers_tool_use_failed():
+    """request() should recover tool_use_failed into a ModelResponse."""
+
+    from unittest.mock import AsyncMock, MagicMock
+
+    inner = MagicMock()
+    inner.request = AsyncMock(
+        side_effect=_make_tool_use_failed_error(
+            '{"name": "create_rows", "arguments": {"thought": "hi"}}'
+        )
+    )
+
+    model = _make_retrying(inner)
+    result = await model.request(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    )
+
+    from pydantic_ai.messages import ToolCallPart
+
+    # Should return a recovered response, not raise
+    assert len(result.parts) == 1
+    assert isinstance(result.parts[0], ToolCallPart)
+    assert result.parts[0].tool_name == "create_rows"
+    # Should NOT have retried — recovery is immediate
+    assert inner.request.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_request_stream_recovers_tool_use_failed():
+    """request_stream() should recover tool_use_failed into a PreFetchedResponse."""
+
+    from unittest.mock import MagicMock
+
+    inner = MagicMock()
+
+    async def _failing_stream(*args, **kwargs):
+        raise _make_tool_use_failed_error(
+            '{"name": "list_rows", "arguments": {"table_id": 1}}'
+        )
+
+    # Make request_stream an async context manager that raises
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def failing_cm(*args, **kwargs):
+        raise _make_tool_use_failed_error(
+            '{"name": "list_rows", "arguments": {"table_id": 1}}'
+        )
+        yield  # pragma: no cover
+
+    inner.request_stream = failing_cm
+
+    model = _make_retrying(inner)
+    async with model.request_stream(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    ) as stream:
+        # Collect events from the pre-fetched response
+        events = [e async for e in stream]
+
+    from pydantic_ai.models import PartStartEvent
+
+    start_events = [e for e in events if isinstance(e, PartStartEvent)]
+    assert len(start_events) == 1
+    assert start_events[0].part.tool_name == "list_rows"
+    _assert_balanced_model_scope(inner)
+
+
+@pytest.mark.asyncio
+async def test_request_stream_closes_model_when_consumer_exits_early():
+    """Leaving a stream without consuming it must still close both scopes."""
+
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    inner = MagicMock()
+    stream_events = []
+
+    @asynccontextmanager
+    async def tracked_request_stream(*args, **kwargs):
+        stream_events.append("enter")
+        try:
+            yield MagicMock()
+        finally:
+            stream_events.append("exit")
+
+    inner.request_stream = tracked_request_stream
+    model = _make_retrying(inner)
+
+    async with model.request_stream(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    ):
+        pass
+
+    assert stream_events == ["enter", "exit"]
+    _assert_balanced_model_scope(inner)
+
+
+@pytest.mark.asyncio
+async def test_request_stream_retry_fallback_closes_nested_model_scopes():
+    """A setup failure and fallback request must leave no model scope open."""
+
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, MagicMock
+
+    from pydantic_ai.messages import ModelResponse, TextPart
+
+    inner = MagicMock()
+
+    @asynccontextmanager
+    async def failing_request_stream(*args, **kwargs):
+        raise Exception("Failed to parse tool call arguments as JSON")
+        yield  # pragma: no cover
+
+    response = ModelResponse(parts=[TextPart(content="fallback")])
+    inner.request_stream = failing_request_stream
+    inner.request = AsyncMock(return_value=response)
+    model = _make_retrying(inner)
+
+    async with model.request_stream(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    ) as stream:
+        events = [event async for event in stream]
+
+    from pydantic_ai.models import PartStartEvent
+
+    start_events = [event for event in events if isinstance(event, PartStartEvent)]
+    assert [event.part.content for event in start_events] == ["fallback"]
+    assert inner.request.await_count == 1
+    # request_stream owns the outer scope and request() owns its nested scope.
+    _assert_balanced_model_scope(inner, expected_count=2)
+
+
+@pytest.mark.asyncio
+async def test_request_stream_recovers_mid_stream_api_error():
+    """_ErrorRecoveringStream catches APIError during chunk iteration
+    and emits recovery events instead of crashing."""
+
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    from pydantic_ai.models import PartStartEvent
+    from pydantic_ai.usage import RequestUsage
+
+    # Simulate a real StreamedResponse whose _get_event_iterator raises APIError
+    class FakeAPIError(Exception):
+        """Simulates groq.APIError with a body attribute."""
+
+        def __init__(self, message, body=None):
+            super().__init__(message)
+            self.body = body
+
+    class FakeStreamedResponse(StreamedResponse):
+        """Fake that raises during iteration.
+
+        Subclasses the real base so the proxy's attribute resolution matches
+        production; a plain class cannot reproduce class-attribute shadowing.
+        """
+
+        def __init__(self):
+            super().__init__(model_request_parameters=ModelRequestParameters())
+            self._usage = RequestUsage(input_tokens=7, output_tokens=13)
+
+        @property
+        def model_name(self) -> str:
+            return "test-model"
+
+        @property
+        def provider_name(self) -> str | None:
+            return "test"
+
+        @property
+        def provider_url(self) -> str | None:
+            return "http://test"
+
+        @property
+        def timestamp(self) -> datetime:
+            return datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+        async def _get_event_iterator(self):
+            raise FakeAPIError(
+                "Failed to parse tool call arguments as JSON",
+                body={
+                    "message": "Failed to parse tool call arguments as JSON",
+                    "type": "invalid_request_error",
+                    "code": "tool_use_failed",
+                    "failed_generation": '{"name": "create_elements", "arguments": {"bad": true}}',
+                },
+            )
+            yield  # pragma: no cover — make it a generator
+
+    inner = MagicMock()
+
+    @asynccontextmanager
+    async def fake_request_stream(*args, **kwargs):
+        yield FakeStreamedResponse()
+
+    inner.request_stream = fake_request_stream
+
+    model = _make_retrying(inner)
+    async with model.request_stream(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    ) as stream:
+        events = [e async for e in stream]
+
+    start_events = [e for e in events if isinstance(e, PartStartEvent)]
+    assert len(start_events) == 1
+    assert start_events[0].part.tool_name == "create_elements"
+
+    # get() must read the inner stream's parts manager through the proxy;
+    # StreamedResponse._parts_manager is a cached_property that would
+    # otherwise build an empty proxy-local one.
+    response = stream.get()
+    assert [p.tool_name for p in response.parts] == ["create_elements"]
+
+
+@pytest.mark.asyncio
+async def test_request_stream_recovers_mid_stream_malformed_json():
+    """_ErrorRecoveringStream recovers even when failed_generation JSON is
+    unparseable — returns a ToolCallPart with empty args so pydantic-ai's
+    validation loop can retry."""
+
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.models import PartStartEvent
+    from pydantic_ai.usage import RequestUsage
+
+    class FakeAPIError(Exception):
+        def __init__(self, message, body=None):
+            super().__init__(message)
+            self.body = body
+
+    class FakeStreamedResponse(StreamedResponse):
+        """Fake that raises during iteration.
+
+        Subclasses the real base so the proxy's attribute resolution matches
+        production; a plain class cannot reproduce class-attribute shadowing.
+        """
+
+        def __init__(self):
+            super().__init__(model_request_parameters=ModelRequestParameters())
+            self._usage = RequestUsage(input_tokens=7, output_tokens=13)
+
+        @property
+        def model_name(self) -> str:
+            return "test-model"
+
+        @property
+        def provider_name(self) -> str | None:
+            return "test"
+
+        @property
+        def provider_url(self) -> str | None:
+            return "http://test"
+
+        @property
+        def timestamp(self) -> datetime:
+            return datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+        async def _get_event_iterator(self):
+            raise FakeAPIError(
+                "Failed to parse tool call arguments as JSON",
+                body={
+                    "message": "Failed to parse tool call arguments as JSON",
+                    "type": "invalid_request_error",
+                    "code": "tool_use_failed",
+                    "failed_generation": '{"name": "create_elements", "arguments": {truncated',
+                },
+            )
+            yield  # pragma: no cover
+
+    inner = MagicMock()
+
+    @asynccontextmanager
+    async def fake_request_stream(*args, **kwargs):
+        yield FakeStreamedResponse()
+
+    inner.request_stream = fake_request_stream
+
+    model = _make_retrying(inner)
+    async with model.request_stream(
+        [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+    ) as stream:
+        events = [e async for e in stream]
+
+    start_events = [e for e in events if isinstance(e, PartStartEvent)]
+    assert len(start_events) == 1
+    assert isinstance(start_events[0].part, ToolCallPart)
+    assert start_events[0].part.tool_name == "create_elements"
+    assert start_events[0].part.args == "{}"
+
+
+@pytest.mark.asyncio
+async def test_request_stream_reraises_after_yield():
+    """Errors during stream __aexit__ (non-recoverable) must re-raise."""
+
+    from contextlib import asynccontextmanager
+    from unittest.mock import MagicMock
+
+    inner = MagicMock()
+
+    @asynccontextmanager
+    async def stream_that_fails_during_consumption(*args, **kwargs):
+        # Yield a mock stream, then raise on __aexit__
+        yield MagicMock()
+        raise Exception("some unrelated error")
+
+    inner.request_stream = stream_that_fails_during_consumption
+
+    model = _make_retrying(inner)
+    with pytest.raises(Exception, match="some unrelated error"):
+        async with model.request_stream(
+            [], None, ModelRequestParameters(function_tools=[], output_tools=[])
+        ):
+            pass  # stream consumed, then __aexit__ raises
+
+
+# gpt-oss on Groq printed these in the evals; uid lists are trimmed, endings kept.
+_PRINTED_REORDER = (
+    '{"name": "update_element", "arguments": {"page_id":2175,"element":'
+    '{"element_id":1548,"reorder_table_columns":['
+    '"9437b5db-404b-46da-839e-28f1edb61f0c","4f4729d6-3876-4212-a15e-4f8c119d9055"],'
+    '"thought":"Reorder Email column after Website on Students page table."}"}'
+)
+_REORDER_ARGUMENTS = {
+    "page_id": 2175,
+    "element": {
+        "element_id": 1548,
+        "reorder_table_columns": [
+            "9437b5db-404b-46da-839e-28f1edb61f0c",
+            "4f4729d6-3876-4212-a15e-4f8c119d9055",
+        ],
+        "thought": "Reorder Email column after Website on Students page table.",
+    },
+}
+_WEBSITE_FORMULA = "$formula: the Website field from the Students data source"
+# Completing this cut would save 15 where the model was writing 1500.
+_CUT_IN_A_NUMBER_AFTER_A_STRAY_QUOTE = (
+    '{"name": "update_rows_in_table_12", "arguments": {"rows": '
+    '[{"id": 1, "tags": [3]"}, {"id": 2, "amount": 15'
+)
+
+
+@pytest.mark.parametrize(
+    "text, arguments",
+    [
+        pytest.param(_PRINTED_REORDER, _REORDER_ARGUMENTS, id="reorder-columns"),
+        pytest.param(
+            '{"name": "update_element", "arguments": {"element":{"element_id":1528,'
+            '"fields":[{"name":"Website","type":"button","value":"$formula: the '
+            'Website field from the Students data source","navigation_type":"custom",'
+            '"navigate_to_url":"$formula: the Website field from the Students data '
+            'source","link_target":"blank"}],"page_id":2115,"thought":"Update the '
+            "Website column in the table element to be a button that opens the URL "
+            'in a new tab."}"}',
+            {
+                "element": {
+                    "element_id": 1528,
+                    "fields": [
+                        {
+                            "name": "Website",
+                            "type": "button",
+                            "value": _WEBSITE_FORMULA,
+                            "navigation_type": "custom",
+                            "navigate_to_url": _WEBSITE_FORMULA,
+                            "link_target": "blank",
+                        }
+                    ],
+                    "page_id": 2115,
+                    "thought": "Update the Website column in the table element to "
+                    "be a button that opens the URL in a new tab.",
+                }
+            },
+            id="page-inside-element",
+        ),
+        pytest.param(
+            '{"name": "update_element", "arguments": {"page_id":2148,"element":'
+            '{"element_id":1539,"update_table_columns":[{"uid":"80d6a3b7-b3e7-4684-'
+            '8329-a79496371af3","navigation_type":"custom","navigate_to_url":'
+            '"$formula: get(\'current_record.Website\')","link_target":"blank"}],'
+            '"thought":"Update Website column to open URL in new tab."}"}',
+            {
+                "page_id": 2148,
+                "element": {
+                    "element_id": 1539,
+                    "update_table_columns": [
+                        {
+                            "uid": "80d6a3b7-b3e7-4684-8329-a79496371af3",
+                            "navigation_type": "custom",
+                            "navigate_to_url": "$formula: get('current_record.Website')",
+                            "link_target": "blank",
+                        }
+                    ],
+                    "thought": "Update Website column to open URL in new tab.",
+                },
+            },
+            id="update-columns",
+        ),
+        pytest.param(
+            '{"name": "update_element", "arguments": {"page_id":2133,"element":'
+            '{"element_id":1534,"update_table_columns":[{"uid":"76b07268-7869-47be-'
+            'a379-9e50bbaac66d","name":"Full name"},{"uid":"96a5de96-0f81-4771-827d-'
+            '9250b58d5ee5","field_id":4842}],"reorder_table_columns":["76b07268-7869-'
+            '47be-a379-9e50bbaac66d","96a5de96-0f81-4771-827d-9250b58d5ee5"],'
+            '"thought":"Rename Name column to Full name, map Adding date column to '
+            'Joined field, and move Email column to end on Students page table."}"}',
+            {
+                "page_id": 2133,
+                "element": {
+                    "element_id": 1534,
+                    "update_table_columns": [
+                        {
+                            "uid": "76b07268-7869-47be-a379-9e50bbaac66d",
+                            "name": "Full name",
+                        },
+                        {
+                            "uid": "96a5de96-0f81-4771-827d-9250b58d5ee5",
+                            "field_id": 4842,
+                        },
+                    ],
+                    "reorder_table_columns": [
+                        "76b07268-7869-47be-a379-9e50bbaac66d",
+                        "96a5de96-0f81-4771-827d-9250b58d5ee5",
+                    ],
+                    "thought": "Rename Name column to Full name, map Adding date "
+                    "column to Joined field, and move Email column to end on Students "
+                    "page table.",
+                },
+            },
+            id="update-and-reorder-columns",
+        ),
+        pytest.param(
+            '{"name": "update_element", "arguments": {"page_id":2196,"element":'
+            '{"element_id":1555,"add_table_columns":[{"name":"Editar","type":"button",'
+            '"label":"Editar"}],"thought":"Add a button column named Editar to the '
+            'table on the Students page."}"}',
+            {
+                "page_id": 2196,
+                "element": {
+                    "element_id": 1555,
+                    "add_table_columns": [
+                        {"name": "Editar", "type": "button", "label": "Editar"}
+                    ],
+                    "thought": "Add a button column named Editar to the table on the "
+                    "Students page.",
+                },
+            },
+            id="add-columns",
+        ),
+    ],
+)
+def test_repair_printed_tool_call_recovers_captured_texts(
+    text: str, arguments: dict[str, Any]
+) -> None:
+    assert repair_printed_tool_call(text) == ("update_element", arguments)
+
+
+def test_repair_printed_tool_call_reads_the_ending_before_trailing_whitespace() -> None:
+    assert repair_printed_tool_call(_PRINTED_REORDER + "\n") == (
+        "update_element",
+        _REORDER_ARGUMENTS,
+    )
+
+
+def test_repair_printed_tool_call_keeps_valid_json() -> None:
+    text = '{"name": "list_tables", "arguments": {"thought": "Find } and ]"}}'
+
+    assert repair_printed_tool_call(text) == (
+        "list_tables",
+        {"thought": "Find } and ]"},
+    )
+
+
+@pytest.mark.parametrize(
+    "text, arguments",
+    [
+        pytest.param(
+            '{"name": "t", "arguments": {"page": {"template": "{{x}}"}"}',
+            {"page": {"template": "{{x}}"}},
+            id="closing-quote-after-brackets-in-a-string",
+        ),
+        pytest.param(
+            '{"name": "t", "arguments": {"page": {"text": "say \\"}\\" now"}"}',
+            {"page": {"text": 'say "}" now'}},
+            id="escaped-quotes-around-a-bracket",
+        ),
+    ],
+)
+def test_repair_printed_tool_call_reads_brackets_outside_strings_only(
+    text: str, arguments: dict[str, Any]
+) -> None:
+    assert repair_printed_tool_call(text) == ("t", arguments)
+
+
+def test_repair_printed_tool_call_drops_a_stray_quote_inside_a_complete_call() -> None:
+    text = (
+        '{"name": "t", "arguments": {"rows": [{"tags": [3]"}], '
+        '"thought": "Tag the row."}"}'
+    )
+
+    assert repair_printed_tool_call(text) == (
+        "t",
+        {"rows": [{"tags": [3]}], "thought": "Tag the row."},
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("The Email column now comes after Website.", id="prose"),
+        pytest.param('{"answer": "Done"}', id="other-object"),
+        pytest.param('[{"name": "t", "arguments": {}}]', id="list"),
+        pytest.param('{"name": "t", "arguments": "{}"}', id="arguments-as-text"),
+        pytest.param('{"name": 7, "arguments": {}}', id="name-not-text"),
+        pytest.param('{"name": "t", "arguments": {}, "id": "call-1"}', id="extra-key"),
+        pytest.param('{"name": "t", "arguments": {"thought": "Cut', id="open-string"),
+        pytest.param('{"name": "t", "arguments": {}} Done.', id="trailing-prose"),
+    ],
+)
+def test_repair_printed_tool_call_returns_none_for_other_text(text: str) -> None:
+    assert repair_printed_tool_call(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            '{"name": "t", "arguments": {"rows": [{"a": "]"}',
+            id="three-closers-missing",
+        ),
+        pytest.param(
+            '{"name": "delete_rows", "arguments": {"table_id": 12, '
+            '"row_ids": [1, 2, 45',
+            id="cut-after-a-number",
+        ),
+        pytest.param(
+            '{"name": "create_rows", "arguments": {"table_id": 12, "rows": [{',
+            id="cut-after-an-opening-bracket",
+        ),
+        pytest.param(
+            '{"name": "delete_rows", "arguments": {"thought": "Delete the rows.", '
+            '"table_id": 12}',
+            id="cut-and-closed-by-groq",
+        ),
+        pytest.param(
+            _CUT_IN_A_NUMBER_AFTER_A_STRAY_QUOTE,
+            id="cut-in-a-number-after-a-stray-quote",
+        ),
+        pytest.param(
+            '{"name": "t", "arguments": {"rows": [{"id": 1, "tags": [3]"}',
+            id="cut-right-after-a-stray-quote",
+        ),
+        pytest.param(
+            '{"name": "delete_rows", "arguments": {"rows": [{"id": 1}"], '
+            '"table_id": 12}',
+            id="cut-and-closed-by-groq-after-a-stray-quote",
+        ),
+    ],
+)
+def test_repair_printed_tool_call_never_completes_a_cut_off_call(text: str) -> None:
+    assert repair_printed_tool_call(text) is None
+
+
+def test_repair_printed_tool_call_returns_none_for_json_too_deep_to_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def overflow(text: str, **kwargs: Any) -> Any:
+        raise RecursionError
+
+    # Whether json.loads overflows on deep nesting depends on the stack size.
+    monkeypatch.setattr(json, "loads", overflow)
+
+    assert repair_printed_tool_call('{"name": "t", "arguments": [[[') is None
+
+
+def test_tool_use_failed_keeps_the_arguments_of_a_repairable_generation() -> None:
+    recovered = _try_recover_tool_use_failed(
+        _make_tool_use_failed_error(_PRINTED_REORDER)
+    )
+
+    (part,) = recovered.parts
+    assert isinstance(part, ToolCallPart)
+    assert part.tool_name == "update_element"
+    assert part.args_as_dict() == _REORDER_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        pytest.param(
+            {"name": "list_tables", "arguments": {"database_id": 1}, "id": "call-1"},
+            id="extra-key",
+        ),
+        pytest.param(
+            {"name": "list_tables", "arguments": '{"database_id": 1}'},
+            id="arguments-as-text",
+        ),
+    ],
+)
+def test_tool_use_failed_reads_any_valid_generation_with_name_and_arguments(
+    generation: dict[str, Any],
+) -> None:
+    recovered = _try_recover_tool_use_failed(
+        _make_tool_use_failed_error(json.dumps(generation))
+    )
+
+    (part,) = recovered.parts
+    assert isinstance(part, ToolCallPart)
+    assert (part.tool_name, part.args) == (
+        "list_tables",
+        json.dumps(generation["arguments"]),
+    )
+
+
+def test_tool_use_failed_needs_exactly_name_and_arguments_after_a_repair() -> None:
+    recovered = _try_recover_tool_use_failed(
+        _make_tool_use_failed_error(
+            '{"name": "list_tables", "arguments": {"page": {"id": 1}"}, "id": "call-1"'
+        )
+    )
+
+    (part,) = recovered.parts
+    assert isinstance(part, ToolCallPart)
+    assert (part.tool_name, part.args) == ("list_tables", "{}")
+
+
+@pytest.mark.parametrize(
+    "generation, tool_name",
+    [
+        pytest.param(
+            '{"name": "delete_rows", "arguments": {"table_id": 12, "row_ids": [1, 2',
+            "delete_rows",
+            id="cut-after-a-number",
+        ),
+        pytest.param(
+            _CUT_IN_A_NUMBER_AFTER_A_STRAY_QUOTE,
+            "update_rows_in_table_12",
+            id="cut-in-a-number-after-a-stray-quote",
+        ),
+    ],
+)
+def test_tool_use_failed_does_not_complete_a_cut_off_generation(
+    generation: str, tool_name: str
+) -> None:
+    recovered = _try_recover_tool_use_failed(_make_tool_use_failed_error(generation))
+
+    (part,) = recovered.parts
+    assert isinstance(part, ToolCallPart)
+    assert (part.tool_name, part.args) == (tool_name, "{}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        pytest.param(
+            ModelRequestParameters(
+                function_tools=[ToolDefinition(name="update_element")]
+            ),
+            id="function-tool",
+        ),
+        pytest.param(
+            ModelRequestParameters(
+                output_tools=[ToolDefinition(name="update_element")]
+            ),
+            id="output-tool",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "texts",
+    [
+        pytest.param([_PRINTED_REORDER], id="one-part"),
+        pytest.param([_PRINTED_REORDER[:50], _PRINTED_REORDER[50:]], id="two-parts"),
+    ],
+)
+async def test_request_turns_a_tool_call_printed_as_text_into_a_tool_call(
+    parameters: ModelRequestParameters, texts: list[str]
+) -> None:
+    response = ModelResponse(
+        parts=[TextPart(text) for text in texts],
+        usage=RequestUsage(input_tokens=11, output_tokens=7),
+        model_name="openai/gpt-oss-120b",
+        provider_name="groq",
+        provider_details={"timestamp": "2026-10-07"},
+        finish_reason="error",
+    )
+    inner = MagicMock()
+    inner.request = AsyncMock(return_value=response)
+
+    result = await _make_retrying(inner).request([], None, parameters)
+
+    (part,) = result.parts
+    assert isinstance(part, ToolCallPart)
+    assert (part.tool_name, part.args) == ("update_element", _REORDER_ARGUMENTS)
+    assert result == replace(response, parts=[part])
+    assert inner.request.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(
+            ModelResponse(
+                parts=[TextPart('{"name": "delete_element", "arguments": {"id": 1}}')],
+                finish_reason="error",
+            ),
+            id="unknown-tool",
+        ),
+        pytest.param(
+            ModelResponse(
+                parts=[
+                    TextPart('{"name": "update_element", "arguments": {"page_id": 21}')
+                ],
+                finish_reason="error",
+            ),
+            id="cut-off-call",
+        ),
+        pytest.param(
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        '{"name": "update_element", "arguments": {"element": '
+                        '{"element_id": 1555, "add_table_columns": [{"name": '
+                        '"Editar"}]"}, "page_id": 21'
+                    )
+                ],
+                finish_reason="error",
+            ),
+            id="cut-in-a-number-after-a-stray-quote",
+        ),
+        pytest.param(
+            ModelResponse(
+                parts=[TextPart("The Email column now comes after Website.")],
+                finish_reason="error",
+            ),
+            id="text-answer",
+        ),
+        pytest.param(
+            ModelResponse(parts=[TextPart(_PRINTED_REORDER)], finish_reason="stop"),
+            id="no-error",
+        ),
+        pytest.param(
+            ModelResponse(
+                parts=[ThinkingPart("Move it."), TextPart(_PRINTED_REORDER)],
+                finish_reason="error",
+            ),
+            id="not-only-text",
+        ),
+    ],
+)
+async def test_request_returns_other_responses_unchanged(
+    response: ModelResponse,
+) -> None:
+    inner = MagicMock()
+    inner.request = AsyncMock(return_value=response)
+
+    result = await _make_retrying(inner).request(
+        [],
+        None,
+        ModelRequestParameters(function_tools=[ToolDefinition(name="update_element")]),
+    )
+
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_groq_tool_call_printed_as_text_becomes_a_tool_call() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Failed to parse tool call arguments as JSON",
+                    "type": "invalid_request_error",
+                    "code": "tool_use_failed",
+                    "failed_generation": _PRINTED_REORDER,
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        groq = GroqModel(
+            "openai/gpt-oss-120b",
+            provider=GroqProvider(api_key="test-only", http_client=client),
+        )
+        response = await RetryingModel(groq).request(
+            [ModelRequest(parts=[UserPromptPart("Move Email after Website.")])],
+            None,
+            ModelRequestParameters(
+                function_tools=[ToolDefinition(name="update_element")]
+            ),
+        )
+
+    (part,) = response.parts
+    assert isinstance(part, ToolCallPart)
+    assert (part.tool_name, part.args) == ("update_element", _REORDER_ARGUMENTS)
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution & model dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestResolveCredentials:
+    """Tests for _resolve_credentials env-var precedence."""
+
+    def test_provider_specific_key_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "groq-key")
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+
+        creds = _resolve_credentials("groq")
+        assert creds["api_key"] == "groq-key"
+
+    def test_falls_back_to_udspy_api_key(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+
+        creds = _resolve_credentials("groq")
+        assert creds["api_key"] == "udspy-key"
+
+    @pytest.mark.parametrize(
+        "provider", ["google", "google-gla", "google-cloud", "google-vertex"]
+    )
+    def test_google_key_takes_precedence_over_udspy(self, monkeypatch, provider):
+        """Without an explicit entry a stale UDSPY_LM_API_KEY (e.g. a Groq key)
+        would be handed to Google instead of GOOGLE_API_KEY."""
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+
+        assert _resolve_credentials(provider)["api_key"] == "google-key"
+
+    def test_provider_specific_base_url_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://custom.openai.com")
+        monkeypatch.setenv("UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL", "https://udspy.com")
+
+        creds = _resolve_credentials("openai")
+        assert creds["base_url"] == "https://custom.openai.com"
+
+    def test_falls_back_to_udspy_base_url(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.setenv("UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL", "https://udspy.com")
+
+        creds = _resolve_credentials("openai")
+        assert creds["base_url"] == "https://udspy.com"
+
+    def test_returns_none_when_nothing_set(self, monkeypatch):
+        for var in (
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "UDSPY_LM_API_KEY",
+            "UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        creds = _resolve_credentials("openai")
+        assert creds["api_key"] is None
+        assert creds["base_url"] is None
+
+    def test_unknown_provider_still_gets_udspy_fallback(self, monkeypatch):
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+
+        creds = _resolve_credentials("some_unknown_provider")
+        assert creds["api_key"] == "udspy-key"
+
+    def test_never_mutates_os_environ(self, monkeypatch):
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+        monkeypatch.setenv("UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL", "https://udspy.com")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+        snapshot = dict(os.environ)
+
+        _resolve_credentials("openai")
+        _resolve_credentials("groq")
+        _resolve_credentials("anthropic")
+
+        assert dict(os.environ) == snapshot
+
+
+class TestResolveModel:
+    """Tests for _resolve_model provider dispatch."""
+
+    def test_openai_prefix(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        model = _resolve_model("openai:gpt-4o")
+        assert isinstance(model, OpenAIChatModel)
+
+    def test_groq_prefix(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        from pydantic_ai.models.groq import GroqModel
+
+        model = _resolve_model("groq:llama-3")
+        assert isinstance(model, GroqModel)
+
+    def test_bare_model_defaults_to_openai(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        model = _resolve_model("gpt-4o")
+        assert isinstance(model, OpenAIChatModel)
+
+    def test_ollama_uses_default_base_url(self, monkeypatch):
+        monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+        monkeypatch.delenv("UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL", raising=False)
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        model = _resolve_model("ollama:llama2")
+        assert isinstance(model, OpenAIChatModel)
+
+    def test_never_mutates_os_environ(self, monkeypatch):
+        monkeypatch.setenv("UDSPY_LM_API_KEY", "udspy-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        snapshot = dict(os.environ)
+        _resolve_model("openai:gpt-4o")
+        assert dict(os.environ) == snapshot
+
+    def test_google_cloud_prefix_still_routes_through_the_vertex_factory(
+        self, monkeypatch
+    ):
+        """resolve_assistant_model() normalises "google-vertex" to "google-cloud";
+        _resolve_model must keep routing it to Baserow's own
+        _make_google_vertex factory (with its per-call httpx client) rather
+        than falling through to pydantic-ai's infer_model."""
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google_cloud import GoogleCloudProvider
+
+        model = _resolve_model("google-cloud:gemini-2.0-flash")
+        assert isinstance(model, GoogleModel)
+        assert isinstance(model._provider, GoogleCloudProvider)
+
+    def test_legacy_google_vertex_prefix_still_resolves(self, monkeypatch):
+        """A model string that was never re-normalised by resolve_assistant_model()
+        (e.g. one saved before this fix) must keep working."""
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google_cloud import GoogleCloudProvider
+
+        model = _resolve_model("google-vertex:gemini-2.0-flash")
+        assert isinstance(model, GoogleModel)
+        assert isinstance(model._provider, GoogleCloudProvider)
+
+    def test_google_gla_and_google_prefixes_resolve_to_the_same_factory(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google import GoogleProvider
+
+        for prefix in ("google-gla", "google"):
+            model = _resolve_model(f"{prefix}:gemini-2.0-flash")
+            assert isinstance(model, GoogleModel)
+            assert isinstance(model._provider, GoogleProvider)
+
+    @pytest.mark.parametrize("prefix", ["google", "google-cloud"])
+    def test_google_client_deadline_clears_the_api_minimum(self, monkeypatch, prefix):
+        """Each Google model gets a safe provider-owned HTTP client."""
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        model = _resolve_model(f"{prefix}:gemini-2.0-flash")
+        second_model = _resolve_model(f"{prefix}:gemini-2.0-flash")
+        api_client = model._provider.client._api_client
+        http_options = api_client._http_options
+
+        assert http_options.timeout >= 10_000
+        assert model._provider._own_http_client is api_client._async_httpx_client
+        assert (
+            api_client._async_httpx_client
+            is not second_model._provider.client._api_client._async_httpx_client
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+async def test_groq_gpt_oss_preserves_reasoning_in_native_history(monkeypatch, name):
+    from copy import deepcopy
+
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ThinkingPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    model = _resolve_model(f"groq:{name}")
+    messages = [
+        ModelRequest(parts=[UserPromptPart("Find the table.")]),
+        ModelResponse(
+            parts=[
+                ThinkingPart("First find the table."),
+                TextPart("Checking <think> literally."),
+                ThinkingPart("Then inspect its fields."),
+                ToolCallPart("list_tables", {}, tool_call_id="lookup-1"),
+            ]
+        ),
+        ModelRequest(parts=[ToolReturnPart("list_tables", [], "lookup-1")]),
+        ModelResponse(parts=[TextPart("No tables found.")]),
+        ModelRequest(parts=[UserPromptPart("Thanks.")]),
+    ]
+    original = deepcopy(messages)
+
+    mapped = await model._map_messages(messages, ModelRequestParameters())
+
+    assert mapped[1] == {
+        "role": "assistant",
+        "content": "Checking <think> literally.",
+        "reasoning": "First find the table.\n\nThen inspect its fields.",
+        "tool_calls": [
+            {
+                "id": "lookup-1",
+                "type": "function",
+                "function": {"name": "list_tables", "arguments": "{}"},
+            }
+        ],
+    }
+    assert mapped[2]["tool_call_id"] == "lookup-1"
+    assert mapped[3] == {"role": "assistant", "content": "No tables found."}
+    assert messages == original
+
+
+@pytest.mark.asyncio
+async def test_groq_other_models_keep_the_sdk_history_mapping(monkeypatch):
+    from pydantic_ai.messages import ModelResponse, ThinkingPart
+    from pydantic_ai.models.groq import GroqModel
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    model = _resolve_model("groq:qwen/qwen3-32b")
+    assert type(model) is GroqModel
+    mapped = await model._map_messages(
+        [ModelResponse(parts=[ThinkingPart("Find the table.")])],
+        ModelRequestParameters(),
+    )
+    assert mapped == [
+        {"role": "assistant", "content": "<think>\nFind the table.\n</think>"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_groq_gpt_oss_keeps_reasoning_only_responses(monkeypatch):
+    from pydantic_ai.messages import ModelResponse, ThinkingPart
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    model = _resolve_model("groq:openai/gpt-oss-120b")
+    mapped = await model._map_messages(
+        [ModelResponse(parts=[ThinkingPart("Find the table.")])],
+        ModelRequestParameters(),
+    )
+    assert mapped == [{"role": "assistant", "reasoning": "Find the table."}]

@@ -1,0 +1,873 @@
+from abc import ABC, abstractmethod
+from dataclasses import fields
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar
+
+from django.contrib.auth.models import AbstractUser
+from django.core.exceptions import ValidationError
+from django.db import transaction
+
+from loguru import logger
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ValidationError as DRFValidationError
+
+from baserow.core.formula import resolve_formula
+from baserow.core.formula.exceptions import (
+    InvalidFormulaContext,
+    InvalidFormulaContextContent,
+)
+from baserow.core.formula.parser.exceptions import BaserowFormulaException
+from baserow.core.formula.registries import formula_runtime_function_registry
+from baserow.core.formula.validator import ensure_integer
+from baserow.core.integrations.mixins import IntegrationConsumerMixin
+from baserow.core.models import Workspace
+from baserow.core.registries import ImportExportConfig
+from baserow.core.registry import (
+    APIUrlsInstanceMixin,
+    APIUrlsRegistryMixin,
+    CustomFieldsInstanceMixin,
+    CustomFieldsRegistryMixin,
+    EasyImportExportMixin,
+    Instance,
+    InstanceWithFormulaMixin,
+    ModelInstanceMixin,
+    ModelRegistryMixin,
+    PublicCustomFieldsInstanceMixin,
+    Registry,
+)
+from baserow.core.services.dispatch_context import DispatchContext
+from baserow.core.services.types import DispatchResult, FormulaToResolve
+
+from .exceptions import (
+    DispatchException,
+    InvalidContextContentDispatchException,
+    InvalidContextDispatchException,
+    ServiceImproperlyConfiguredDispatchException,
+    ServiceTypeDoesNotExist,
+    TriggerServiceNotDispatchable,
+    UnexpectedDispatchException,
+)
+from .models import Service
+from .types import ServiceDictSubClass, ServiceSubClass
+
+
+class DispatchTypes(str, Enum):
+    # A `ServiceType` which performs an action.
+    ACTION = "action"
+    # A `ServiceType` which fetches data.
+    DATA = "data"
+    # A `ServiceType` which responds to events.
+    EVENT = "event"
+
+
+class ServiceType(
+    IntegrationConsumerMixin,
+    APIUrlsInstanceMixin,
+    InstanceWithFormulaMixin,
+    EasyImportExportMixin[ServiceSubClass],
+    ModelInstanceMixin[ServiceSubClass],
+    PublicCustomFieldsInstanceMixin,
+    CustomFieldsInstanceMixin,
+    Instance,
+    ABC,
+):
+    """
+    A service type describe a specific service of an external integration.
+    """
+
+    SerializedDict: Type[ServiceDictSubClass]
+    parent_property_name = "integration"
+    id_mapping_name = "services"
+
+    default_serializer_field_names = ["sample_data"]
+
+    def export_serialized(
+        self,
+        instance: ServiceSubClass,
+        import_export_config: Optional[ImportExportConfig] = None,
+        files_zip=None,
+        storage=None,
+        cache=None,
+    ) -> Dict[str, Any]:
+        """Redact sensitive values, retaining named rows for reconfiguration."""
+
+        serialized = {
+            key: self.serialize_property(
+                instance,
+                key,
+                import_export_config=import_export_config,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+            for key in self.get_property_names()
+        }
+        if getattr(import_export_config, "exclude_sensitive_data", False):
+            for prop_name in self.sensitive_fields:
+                if prop_name not in serialized:
+                    continue
+                value = serialized[prop_name]
+                serialized[prop_name] = (
+                    [
+                        {**row, "value": None} if isinstance(row, dict) else row
+                        for row in value
+                    ]
+                    if isinstance(value, list)
+                    else None
+                )
+        return serialized
+
+    # Does this service return a list of record?
+    returns_list = False
+
+    # Whether dispatching this service sends to an endpoint it is configured
+    # with, such as HTTP, email, Slack or an AI provider. A file reader that
+    # downloads something it is not itself configured with is not one of
+    # these. Such a dispatch sends outside the savepoint when no transaction
+    # is already open, so a slow endpoint does not hold one.
+    is_external = False
+
+    # What parent object is responsible for dispatching this `ServiceType`?
+    # It could be via a `DataSource`, in which case `DATA` should be
+    # chosen, or via a `WorkflowAction`, in which case `ACTION`
+    # should be chosen. Multiple dispatch types can be selected if the service is
+    # used across modules.
+    dispatch_types: List[DispatchTypes] = []
+
+    # By default all service data should be hidden. The serializer mixins are
+    # excluded as well because the filterable and sortable mixins add the service
+    # `filters`, `filter_groups` and `sortings` in `to_representation`, regardless
+    # of the field names.
+    public_serializer_field_names = []
+    public_serializer_field_overrides = {}
+    public_serializer_mixins = []
+
+    def is_deactivated(self, workspace: Workspace) -> bool:
+        """Return whether this service type is unavailable in the workspace."""
+
+        return False
+
+    def raise_if_deactivated(self, workspace: Workspace) -> None:
+        """Reject use of a deactivated service type when called by its consumer."""
+
+        if self.is_deactivated(workspace):
+            raise PermissionDenied("This service type is deactivated.")
+
+    def can_be_dispatched_as(self, dispatch_type: DispatchTypes) -> bool:
+        """
+        Returns whether this service can be dispatched as the given dispatch type.
+
+        :param dispatch_type: The dispatch type to check.
+        :return: If the service can be dispatched as the given type.
+        """
+
+        return dispatch_type in self.dispatch_types
+
+    def max_dispatch_seconds(self, service: Service) -> int:
+        """
+        The longest a dispatch of this service can take before it gives up. A
+        caller holding a lock over the dispatch needs it, since a lock that
+        expires while the service is still waiting stops protecting anything.
+
+        :param service: The service about to be dispatched.
+        :return: The number of seconds, 0 when the service does not wait on
+            anything outside this installation.
+        """
+
+        return 0
+
+    def get_integration_type(self):
+        from baserow.core.integrations.registries import integration_type_registry
+
+        if self.integration_type:
+            return integration_type_registry.get(self.integration_type)
+
+        return None
+
+    def get_id_property(self, service: Service) -> str:
+        """
+        Returns the property name that contains the unique `ID` of a row for this
+        service.
+
+        :param service: the instance of the service.
+        :return: a string identifying the ID property name.
+        """
+
+        # Sane default
+        return "id"
+
+    def get_name_property(self, service: Service) -> Optional[str]:
+        """
+        We need the name of the records for some elements (like the record selector).
+        This method returns it depending on the service.
+
+        :param service: the instance of the service.
+        :return: a string identifying the name property name.
+        """
+
+        return None
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: Optional[ServiceSubClass] = None,
+    ) -> Dict[str, Any]:
+        """
+        The prepare_values hook gives the possibility to change the provided values
+        that just before they are going to be used to create or update the instance. For
+        example if an ID is provided, it can be converted to a model instance. Or to
+        convert a certain date string to a date object. It's also an opportunity to add
+        specific validations.
+
+        :param values: The provided values.
+        :param user: The user on whose behalf the change is made.
+        :param instance: The current instance if it exists.
+        :return: The updated values.
+        """
+
+        return self.prepare_integration_values(values)
+
+    def export_prepared_values(self, instance: Service):
+        """
+        Returns a serializable dict of prepared values for the service attributes.
+        This method is the counterpart of `prepare_values`. It is called
+        by undo/redo ActionHandler to store the values in a way that could be
+        restored later.
+
+        :param instance: The service instance to export values for.
+        :return: A dict of prepared values.
+        """
+
+        values = {key: getattr(instance, key) for key in self.allowed_fields}
+        return values
+
+    def after_create(self, instance: ServiceSubClass, values: Dict):
+        """
+        This hook is called right after the service has been created.
+
+        :param instance: The created service instance.
+        :param values: The values that were passed when creating the service
+            metadata.
+        """
+
+    def after_update(
+        self,
+        instance: ServiceSubClass,
+        values: Dict,
+        changes: Dict[str, Tuple],
+    ):
+        """
+        This hook is called right after the service has been updated.
+
+        :param instance: The updated service instance.
+        :param values: The values that were passed when creating the service
+            metadata.
+        :param changes: A dictionary containing all changes which were made to the
+            service prior to `after_update` being called.
+        """
+
+    def before_delete(self, instance: ServiceSubClass):
+        """
+        This hook is called just before the service will be deleted.
+
+        :param instance: The to be deleted service instance.
+        """
+
+    def get_context_data(self, service: ServiceSubClass):
+        """
+        Return the context data for this service.
+
+        This can be overridden by child classes to provide extra context data,
+        to complement this service results.
+        """
+
+        return None
+
+    def get_public_context_data(
+        self, service: ServiceSubClass, allowed_fields: Optional[List[str]] = None
+    ):
+        """
+        Return the context data of this service for anonymous visitors, for
+        example of a publicly shared dashboard or a published application. It
+        defaults to the regular context data, service types whose context data
+        includes something visitors must not see, like the configuration of a
+        field, override it.
+
+        :param service: The service we want the public context data for.
+        :param allowed_fields: The properties which are allowed to be included.
+        """
+
+        return self.get_context_data(service, allowed_fields=allowed_fields)
+
+    def get_sample_data(
+        self, service: ServiceSubClass, dispatch_context: DispatchContext
+    ) -> Optional[Dict[Any, Any]]:
+        """Return the usable sample data for this service, if any."""
+
+        sample_data = service.sample_data
+
+        # A failed simulated dispatch stores an `{"_error": ...}` sentinel so
+        # the frontend can display the failure. It doesn't hold `DispatchResult`
+        # fields, so it can't be replayed and counts as no sample data.
+        if sample_data is not None and "_error" in sample_data:
+            return None
+
+        return sample_data
+
+    def get_context_data_schema(self, service: ServiceSubClass):
+        """Return the schema for the context data."""
+
+        return None
+
+    def requires_integration(self, service: ServiceSubClass) -> bool:
+        """
+        Whether this service needs an integration to be dispatched.
+
+        :param service: The service in question.
+        """
+
+        return self.integration_type is not None
+
+    def formulas_to_resolve(self, service: ServiceSubClass) -> list[FormulaToResolve]:
+        return []
+
+    def should_resolve_service_formula(
+        self,
+        service: ServiceSubClass,
+        formula: FormulaToResolve,
+        resolved_values: Dict[str, Any],
+    ) -> bool:
+        """
+        Return whether the formula should be resolved given earlier resolved values.
+
+        Formulas are evaluated in the order returned by `formulas_to_resolve`, so a
+        service type can use this hook to skip a later formula based on an earlier
+        result.
+        """
+
+        return True
+
+    def _get_validation_details(self, error):
+        detail = error.detail
+
+        if isinstance(detail, str):
+            return detail
+        elif isinstance(detail, list):
+            return str(detail[0]) if detail else ""
+        elif isinstance(detail, dict):
+            for field, errors in detail.items():
+                if isinstance(errors, list) and errors:
+                    return str(errors[0])
+                else:
+                    return str(errors)
+        return str(detail)
+
+    def resolve_service_formulas(
+        self,
+        service: ServiceSubClass,
+        dispatch_context: DispatchContext,
+    ) -> Dict[str, Any]:
+        """
+        Responsible for resolving any formulas in the service's fields, and then
+        performing a validation step prior to `ServiceType.dispatch_data` is executed.
+
+        :param service: The service instance we want to use.
+        :param dispatch_context: The runtime_formula_context instance used to
+            resolve formulas (if any).
+        :return: Any
+        """
+
+        resolved_values = {}
+        for formula in self.formulas_to_resolve(service):
+            if not self.should_resolve_service_formula(
+                service, formula, resolved_values
+            ):
+                continue
+
+            key, formula_ctx, ensurer, label = formula
+            try:
+                resolved_values[key] = ensurer(
+                    resolve_formula(
+                        formula_ctx,
+                        formula_runtime_function_registry,
+                        dispatch_context.clone(),
+                    )
+                )
+            except InvalidFormulaContext as e:
+                raise InvalidContextDispatchException(str(e)) from e
+            except InvalidFormulaContextContent as e:
+                message = f"Value error for {label}: {str(e)}"
+                raise InvalidContextContentDispatchException(message) from e
+            except ValidationError as e:
+                message = f"Value error for {label}: {e.message}"
+                raise InvalidContextContentDispatchException(message) from e
+            except BaserowFormulaException as e:
+                message = f"Error in formula for {label}: {str(e)}"
+                raise ServiceImproperlyConfiguredDispatchException(message) from e
+            except DispatchException:
+                raise
+            except Exception as e:
+                logger.exception(f"Unexpected error for {label}")
+                message = f"Unknown error in formula for {label}: {str(e)}"
+                raise UnexpectedDispatchException(message) from e
+
+        return resolved_values
+
+    def prepare_value_path(self, service: Service, path: List[str]):
+        """
+        Allow to change the path inside a service before it's used.
+        """
+
+        return path
+
+    def dispatch_transform(
+        self,
+        data: Any,
+    ) -> DispatchResult:
+        """
+        Responsible for taking the `dispatch_data` result and transforming its value
+        for API consumer's consumption.
+
+        :param data: The `dispatch_data` result.
+        :return: The transformed `dispatch_transform` result.
+        """
+
+    def dispatch_data(
+        self,
+        service: ServiceSubClass,
+        resolved_values: Dict[str, Any],
+        dispatch_context: DispatchContext,
+    ) -> Any:
+        """
+        Responsible for executing the service's principle task.
+
+        :param service: The service instance to dispatch with.
+        :param resolved_values: If the service has any formulas, this dictionary will
+            contain their resolved values.
+        :param dispatch_context: The context used for the dispatch.
+        :return: The service `dispatch_data` result if any.
+        """
+
+    def _dispatch_and_transform(
+        self,
+        service: ServiceSubClass,
+        resolved_values: Dict[str, Any],
+        dispatch_context: DispatchContext,
+    ) -> DispatchResult:
+        """
+        Runs `dispatch_data` and `dispatch_transform` together. `dispatch`
+        calls this from either side of its savepoint, so the pairing is
+        written once rather than once per side.
+        """
+
+        data = self.dispatch_data(service, resolved_values, dispatch_context)
+        return self.dispatch_transform(data)
+
+    def before_dispatch(
+        self,
+        service: ServiceSubClass,
+        dispatch_context: DispatchContext,
+    ) -> None:
+        """Hook called immediately before a service executes."""
+
+    def after_dispatch(
+        self,
+        service: ServiceSubClass,
+        dispatch_result: DispatchResult,
+        dispatch_context: DispatchContext,
+    ) -> DispatchResult:
+        """Finalizes a dispatch after its database savepoint has committed."""
+
+        return dispatch_result
+
+    def requires_autocommit(self, service: ServiceSubClass) -> bool:
+        """
+        Returns whether dispatch must run without an enclosing transaction.
+
+        This is needed by services that commit work before waiting for another
+        process to observe it.
+        """
+
+        return False
+
+    def dispatch(
+        self,
+        service: ServiceSubClass,
+        dispatch_context: DispatchContext,
+    ) -> DispatchResult:
+        """
+        Responsible for calling `dispatch_data` and `dispatch_transform` to execute
+        the service's task, and generating the dispatch's response, respectively.
+
+        :param service: The service instance to dispatch with.
+        :param dispatch_context: The context used for the dispatch.
+        :return: The service dispatch result if any.
+        """
+
+        # If simulated, try to return existing sample data
+        if (
+            dispatch_context.use_sample_data
+            and (
+                dispatch_context.update_sample_data_for is None
+                or service not in dispatch_context.update_sample_data_for
+            )
+            and (sample_data := self.get_sample_data(service, dispatch_context))
+            is not None
+        ):
+            return DispatchResult(**sample_data)
+
+        self.before_dispatch(service, dispatch_context)
+
+        # Formula resolution always runs inside this savepoint. `dispatch_data`
+        # and `dispatch_transform` run inside it too, unless the service is
+        # external and the dispatch context says its caller sends outside a
+        # transaction, in which case they run after the savepoint instead. A
+        # database error inside must not break the caller's transaction
+        # (#5621), so only this savepoint rolls back and the caller (and the
+        # sample data error save below) can still issue queries. An external
+        # call that runs outside must not hold a transaction open for its
+        # network wait; a context whose caller already wraps dispatch in a
+        # transaction of its own opts out, since leaving the savepoint there
+        # gains nothing. Sending outside commits formula resolution before the
+        # request goes out, so it relies on the data providers of such a
+        # context only reading: one that wrote would keep its writes when the
+        # request fails.
+        sends_outside = (
+            self.is_external
+            and dispatch_context.sends_external_calls_outside_transaction
+        )
+        try:
+            with transaction.atomic():
+                resolved_values = self.resolve_service_formulas(
+                    service, dispatch_context
+                )
+                if not sends_outside:
+                    serialized_data = self._dispatch_and_transform(
+                        service, resolved_values, dispatch_context
+                    )
+            if sends_outside:
+                serialized_data = self._dispatch_and_transform(
+                    service, resolved_values, dispatch_context
+                )
+        except Exception as e:
+            if dispatch_context.use_sample_data and (
+                dispatch_context.update_sample_data_for is None
+                or service in dispatch_context.update_sample_data_for
+            ):
+                service.sample_data = {"_error": str(e)}
+                service.save()
+            raise
+        else:
+            serialized_data = self.after_dispatch(
+                service, serialized_data, dispatch_context
+            )
+            if dispatch_context.use_sample_data and (
+                dispatch_context.update_sample_data_for is None
+                or service in dispatch_context.update_sample_data_for
+            ):
+                sample_data = {}
+                for field in fields(serialized_data):
+                    if field.metadata.get("exclude_from_sample_data"):
+                        continue
+                    value = getattr(serialized_data, field.name)
+                    sample_data[field.name] = value
+
+                # The save gets a savepoint of its own, for the same reason as
+                # the dispatch above: should the database reject the sample
+                # data (PostgreSQL refuses a NUL character in a json column,
+                # for one), the caller's transaction must stay usable so it can
+                # record the failure, and the sentinel is stored the same way
+                # it is for a failed dispatch.
+                service.sample_data = sample_data
+                try:
+                    with transaction.atomic():
+                        service.save()
+                except Exception as e:
+                    service.sample_data = {"_error": str(e)}
+                    service.save()
+                    raise
+            return serialized_data
+
+    def remove_unused_field_names(
+        self,
+        row: Dict[str, Any],
+        field_names: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Given a row dictionary, return a version of it that only contains keys
+        existing in the field_names list.
+        """
+
+        return {key: value for key, value in row.items() if key in field_names}
+
+    def sanitize_result(self, service, result, allowed_field_names):
+        """
+        Remove the non public fields from the result.
+        """
+
+        # A no-body result (e.g. a 204 from a deletion) has nothing to sanitize.
+        if result is None:
+            return None
+
+        if self.returns_list:
+            return {
+                **result,
+                "results": [
+                    self.remove_unused_field_names(row, allowed_field_names)
+                    for row in result["results"]
+                ],
+            }
+        else:
+            return self.remove_unused_field_names(result, allowed_field_names)
+
+    def get_schema_name(self, service: Service) -> str:
+        """
+        The default schema name added to the `title` in a JSON Schema object.
+
+        :param service: The service we want to generate a schema `title` with.
+        :return: A string.
+        """
+
+        return f"Service{service.id}Schema"
+
+    def generate_schema(
+        self, service: Service, allowed_fields: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Responsible for generating the full JSON Schema response. Must be
+        overridden by child classes so that the can return their service's
+        schema.
+
+        :param service: The service we want to generate a schema for.
+        :param allowed_fields: A list of fields that are allowed to be included in the
+            schema.
+        :return: None, or a dictionary representing the schema.
+        """
+
+        return None
+
+    def generate_public_schema(
+        self, service: Service, allowed_fields: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        The JSON Schema of this service for anonymous visitors, for example of a
+        publicly shared dashboard or a published application. It defaults to the
+        regular schema, service types whose schema embeds something visitors must
+        not see override it.
+
+        :param service: The service we want to generate the public schema for.
+        :param allowed_fields: A list of fields that are allowed to be included in the
+            schema.
+        :return: None, or a dictionary representing the schema.
+        """
+
+        return self.generate_schema(service, allowed_fields=allowed_fields)
+
+    def enhance_queryset(self, queryset):
+        """
+        Allow to enhance the queryset when querying the service mainly to improve
+        performances.
+        """
+
+        return queryset
+
+    def import_path(self, path, id_mapping, **kwargs):
+        """
+        Allows to hook into the path import resolution.
+
+        If not implemented, returns the path as it is.
+        """
+
+        return path
+
+    def import_context_path(
+        self, path: List[str], id_mapping: Dict[int, int], **kwargs
+    ):
+        """
+        Allows to hook into the context path import resolution.
+
+        If not implemented, returns the path as it is.
+        """
+
+        return path
+
+    def import_serialized(
+        self,
+        parent: Any,
+        serialized_values: Dict[str, Any],
+        id_mapping: Dict[str, Dict[int, int]],
+        import_formula: Callable[[str, Dict[str, Any]], str] = None,
+        **kwargs,
+    ):
+        created_instance = super().import_serialized(
+            parent,
+            serialized_values,
+            id_mapping,
+            import_formula=import_formula,
+            **kwargs,
+        )
+
+        if import_formula is not None:
+            updated_models = self.import_formulas(
+                created_instance, id_mapping, import_formula, **kwargs
+            )
+
+            [m.save() for m in updated_models]
+
+        return created_instance
+
+    def extract_properties(
+        self, service: Service, path: List[str], **kwargs
+    ) -> List[str]:
+        if path:
+            return [path[0]]
+
+        return []
+
+    def import_property_name(
+        self, property_name: str, id_mapping: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Allows to hook into the property name import resolution.
+
+        If not implemented, returns the property name as it is.
+        """
+
+        return property_name
+
+    def get_edges(self, service: Service) -> Dict[str, Dict[str, str]]:
+        return {"": {"label": ""}}
+
+
+ServiceTypeSubClass = TypeVar("ServiceTypeSubClass", bound=ServiceType)
+
+
+class ListServiceTypeMixin:
+    """A mixin for services that return lists."""
+
+    returns_list = True
+
+    def prepare_record_ids(self, record_ids: List[Any]) -> List[int]:
+        """
+        Convert record selector values into the type used by this service as row IDs.
+        Regular Baserow row services use integer row IDs. Services with synthetic or
+        external row identifiers can override this hook.
+        """
+
+        try:
+            prepared_record_ids = [
+                ensure_integer(record_id) for record_id in record_ids
+            ]
+        except ValidationError as exc:
+            raise DRFValidationError(
+                {"record_ids": ["The provided record ids are not valid."]}
+            ) from exc
+
+        return prepared_record_ids
+
+    def get_record_names(
+        self,
+        service: Service,
+        record_ids: List[int],
+        dispatch_context: DispatchContext,
+    ) -> Dict[str, str]:
+        """
+        Return the record name associated with each one of the provided record ids.
+
+        By default, the record id itself is used as the display name. Services
+        that can resolve richer names, like local Baserow row services, can
+        override this.
+
+        :param service: The available service to use.
+        :param record_ids: The list containing the record identifiers.
+        :param dispatch_context: The context used for the dispatch.
+        :return: A dictionary mapping each record to its name.
+        """
+        return {record_id: str(record_id) for record_id in record_ids}
+
+    @abstractmethod
+    def get_max_result_limit(self, service: Service):
+        """
+        The maximum number of records this service is able to return.
+        Is the maximum is `None`, then it's unlimited.
+        """
+
+    @abstractmethod
+    def get_default_result_limit(self, service: Service):
+        """
+        The default number of records this service will return,
+        unless instructed otherwise by a user.
+        """
+
+
+class TriggerServiceTypeMixin(ABC):
+    # The callable function which should be called when the event occurs.
+    on_event: Callable = lambda *args: None
+
+    # The service is always dispatched by an event.
+    dispatch_types = [DispatchTypes.EVENT]
+
+    def can_be_immediately_dispatched(self, service: Service):
+        """
+        Whether this trigger can be dispatched immediately without waiting for an
+        external event.
+
+        The given service can be a base `Service` instance instead of the
+        specific one, so implementations must not rely on fields of the specific
+        model and should ideally return a constant.
+        """
+
+        return False
+
+    def dispatch_data(
+        self,
+        service: Service,
+        resolved_values: Dict[str, Any],
+        dispatch_context: DispatchContext,
+    ):
+        # By default a trigger uses the data from the dispatch context event_payload
+        if dispatch_context.event_payload is not None:
+            return dispatch_context.event_payload
+
+        raise TriggerServiceNotDispatchable()
+
+    def dispatch_transform(self, data):
+        return DispatchResult(data=data)
+
+    def start_listening(self, on_event: Callable) -> None:
+        """
+        Triggers, a type of service which respond to internal and external events and
+        trigger their own dispatch, need the ability to "start" listening to their
+        events. This method ensure that we only begin listening when we need to.
+
+        :param on_event: A callable function which should be called when
+            the internal or external event occurs.
+        """
+
+        self.on_event = on_event
+
+    def stop_listening(self) -> None:
+        """
+        Triggers, a type of service which respond to internal and external events and
+        trigger their own dispatch, need the ability to "stop" listening to their
+        events. This method ensure that we can stop listening when we need to.
+        :return:
+        """
+
+
+class ServiceTypeRegistry(
+    APIUrlsRegistryMixin,
+    ModelRegistryMixin[ServiceSubClass, ServiceTypeSubClass],
+    Registry[ServiceTypeSubClass],
+    CustomFieldsRegistryMixin,
+):
+    """
+    Contains the registered service types.
+    """
+
+    name = "integration_service"
+    does_not_exist_exception_class = ServiceTypeDoesNotExist
+
+
+service_type_registry: ServiceTypeRegistry = ServiceTypeRegistry()

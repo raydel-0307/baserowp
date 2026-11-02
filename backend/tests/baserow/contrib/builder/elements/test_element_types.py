@@ -1,0 +1,2055 @@
+import json
+import uuid
+from collections import defaultdict
+from io import BytesIO
+from tempfile import tempdir
+from unittest.mock import MagicMock, Mock
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from django.conf import settings
+from django.core.files.storage import FileSystemStorage
+from django.http import HttpRequest
+
+import pytest
+import zipstream
+from rest_framework.exceptions import ValidationError
+
+from baserow.api.exceptions import RequestBodyValidationException
+from baserow.contrib.builder.data_sources.builder_dispatch_context import (
+    BuilderDispatchContext,
+)
+from baserow.contrib.builder.elements.element_types import (
+    ButtonElementType,
+    CheckboxElementType,
+    ChoiceElementType,
+    ColumnElementType,
+    DateTimePickerElementType,
+    FormContainerElementType,
+    HeadingElementType,
+    IFrameElementType,
+    ImageElementType,
+    InputTextElementType,
+    LinkElementType,
+    RatingInputElementType,
+    RecordSelectorElementType,
+    TextElementType,
+    collection_element_types,
+)
+from baserow.contrib.builder.elements.exceptions import ElementImproperlyConfigured
+from baserow.contrib.builder.elements.handler import ElementHandler
+from baserow.contrib.builder.elements.models import (
+    CheckboxElement,
+    ChoiceElement,
+    ChoiceElementOption,
+    DateTimePickerElement,
+    Element,
+    HeadingElement,
+    InputTextElement,
+    LinkElement,
+    RatingInputElement,
+    RecordSelectorElement,
+)
+from baserow.contrib.builder.elements.registries import (
+    ElementType,
+    element_type_registry,
+)
+from baserow.contrib.builder.elements.service import ElementService
+from baserow.contrib.builder.pages.handler import PageHandler
+from baserow.contrib.builder.pages.service import PageService
+from baserow.contrib.database.fields.handler import FieldHandler
+from baserow.core.formula.types import (
+    BASEROW_FORMULA_FORMAT_MARKDOWN,
+    BASEROW_FORMULA_FORMAT_PLAIN,
+    BaserowFormulaObject,
+)
+from baserow.core.graph.types import GraphPointPosition
+from baserow.core.handler import CoreHandler
+from baserow.core.registries import ImportExportConfig
+from baserow.core.services.exceptions import (
+    ServiceImproperlyConfiguredDispatchException,
+)
+from baserow.core.storage import ExportZipFile
+from baserow.core.user_files.handler import UserFileHandler
+from baserow.core.user_sources.registries import DEFAULT_USER_ROLE_PREFIX
+from baserow.core.utils import MirrorDict
+
+
+def pytest_generate_tests(metafunc):
+    if "element_type" in metafunc.fixturenames:
+        metafunc.parametrize(
+            "element_type",
+            [pytest.param(e, id=e.type) for e in element_type_registry.get_all()],
+        )
+
+
+@pytest.mark.django_db
+def test_export_element(data_fixture, element_type: ElementType):
+    page = data_fixture.create_builder_page()
+    pytest_params = element_type.get_pytest_params(data_fixture)
+    element = element_type.model_class.objects.create(page=page, **pytest_params)
+    page.get_graph().insert(element, *page.get_graph().get_last_position())
+
+    exported = element_type.export_serialized(element)
+
+    assert exported["id"] == element.id
+    assert exported["type"] == element_type.type
+
+    for key, value in pytest_params.items():
+        assert exported[key] == value
+
+
+@pytest.mark.django_db
+def test_import_element(data_fixture, element_type: ElementType):
+    page = data_fixture.create_builder_page()
+    pytest_params = element_type.get_pytest_params(data_fixture)
+
+    serialized = {
+        "id": 9999,
+        "type": element_type.type,
+        "roles": [],
+        "role_type": Element.ROLE_TYPES.ALLOW_ALL,
+    }
+    serialized.update(element_type.get_pytest_params(data_fixture))
+
+    id_mapping = defaultdict(lambda: MirrorDict())
+    element = element_type.import_serialized(page, serialized, id_mapping)
+
+    assert element.id != 9999
+    assert isinstance(element, element_type.model_class)
+
+    for key, value in pytest_params.items():
+        assert getattr(element, key) == value
+
+
+@pytest.mark.django_db
+def test_link_element_path_parameter_does_not_exist(data_fixture):
+    builder = data_fixture.create_builder_application()
+    page = data_fixture.create_builder_page(builder=builder)
+    page_with_params = data_fixture.create_builder_page(
+        builder=builder,
+        path="/test/:id",
+        path_params=[{"name": "id", "type": "numeric"}],
+    )
+
+    link_element = data_fixture.create_builder_link_element(
+        page=page,
+        navigation_type=LinkElement.NAVIGATION_TYPES.PAGE,
+        navigate_to_page_id=page_with_params.id,
+    )
+
+    with pytest.raises(ValidationError):
+        ElementHandler().update_element(
+            link_element, page_parameters=[{"name": "invalid", "value": "something"}]
+        )
+
+
+@pytest.mark.django_db
+def test_link_element_path_parameter_does_not_exist_new_page(data_fixture):
+    builder = data_fixture.create_builder_application()
+    page = data_fixture.create_builder_page(builder=builder)
+    page_with_params = data_fixture.create_builder_page(
+        builder=builder,
+        path="/test/:id",
+        path_params=[{"name": "id", "type": "numeric"}],
+    )
+
+    link_element = data_fixture.create_builder_link_element(
+        page=page,
+    )
+
+    with pytest.raises(ValidationError):
+        ElementHandler().update_element(
+            link_element,
+            navigation_type=LinkElement.NAVIGATION_TYPES.PAGE,
+            navigate_to_page_id=page_with_params.id,
+            page_parameters=[{"name": "invalid", "value": "something"}],
+        )
+
+
+@pytest.mark.django_db
+def test_link_collection_field_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source(
+        page=page
+    )
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source(
+        page=page
+    )
+
+    element = data_fixture.create_builder_table_element(
+        page=page,
+        fields=[
+            {
+                "name": "test1",
+                "type": "link",
+                "config": {
+                    "link_name": f"get('data_source.{data_source_1.id}.field_1')",
+                    "navigate_to_url": f"get('data_source.{data_source_1.id}.field_1')",
+                    "navigation_type": "",
+                    "navigate_to_page_id": "",
+                    "page_parameters": [
+                        {
+                            "name": "fooPageParam",
+                            "value": f"get('data_source.{data_source_1.id}.field_1')",
+                        },
+                    ],
+                    "query_parameters": [
+                        {
+                            "name": "fooQueryParam",
+                            "value": f"get('data_source.{data_source_1.id}.field_2')",
+                        },
+                    ],
+                    "target": "",
+                    "variant": LinkElement.VARIANTS.BUTTON,
+                },
+            },
+        ],
+    )
+
+    element_type = element.get_type()
+    serialized = element_type.export_serialized(element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {
+        "builder_data_sources": {
+            data_source_1.id: data_source_2.id,
+            element.data_source_id: element.data_source_id,
+        }
+    }
+
+    imported_element = ElementHandler().import_element(page, serialized, id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    expected_query_formula = f"get('data_source.{data_source_2.id}.field_2')"
+    imported_field = imported_element.fields.all()[0]
+    assert imported_field.config["link_name"]["formula"] == expected_formula
+    assert imported_field.config["navigate_to_url"]["formula"] == expected_formula
+    assert (
+        imported_field.config["page_parameters"][0]["value"]["formula"]
+        == expected_formula
+    )
+    assert (
+        imported_field.config["query_parameters"][0]["value"]["formula"]
+        == expected_query_formula
+    )
+
+
+@pytest.mark.django_db
+def test_link_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_element = data_fixture.create_builder_link_element(
+        page=page,
+        navigate_to_url=f"get('data_source.{data_source_1.id}.field_1')",
+        value=f"get('data_source.{data_source_1.id}.field_1')",
+        page_parameters=[
+            {
+                "name": "fooPageParam",
+                "value": f"get('data_source.{data_source_1.id}.field_1')",
+            },
+        ],
+        query_parameters=[
+            {
+                "name": "fooQueryParam",
+                "value": f"get('data_source.{data_source_1.id}.field_2')",
+            },
+        ],
+    )
+    serialized = LinkElementType().export_serialized(exported_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    expected_query_formula = f"get('data_source.{data_source_2.id}.field_2')"
+    assert imported_element.navigate_to_url["formula"] == expected_formula
+    assert imported_element.value["formula"] == expected_formula
+    assert imported_element.page_parameters[0]["value"]["formula"] == expected_formula
+    assert (
+        imported_element.query_parameters[0]["value"]["formula"]
+        == expected_query_formula
+    )
+
+
+@pytest.mark.django_db
+def test_form_container_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_element = data_fixture.create_builder_form_container_element(
+        page=page,
+        submit_button_label=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = FormContainerElementType().export_serialized(exported_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.submit_button_label["formula"] == expected_formula
+
+
+@pytest.mark.parametrize(
+    "allowed_element_type",
+    [
+        element_type.type
+        for element_type in element_type_registry.get_all()
+        if element_type.type != FormContainerElementType.type
+        and not element_type.is_multi_page_element
+    ],
+)
+def test_form_container_child_types_allowed(allowed_element_type):
+    assert allowed_element_type in [
+        e.type for e in FormContainerElementType().child_types_allowed
+    ]
+
+
+@pytest.mark.django_db
+def test_text_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_text_element = data_fixture.create_builder_text_element(
+        page=page,
+        value=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = TextElementType().export_serialized(exported_text_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.value["formula"] == expected_formula
+
+
+@pytest.mark.django_db
+def test_input_text_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_input_text_element = data_fixture.create_builder_input_text_element(
+        page=page,
+        label=f"get('data_source.{data_source_1.id}.field_1')",
+        default_value=f"get('data_source.{data_source_1.id}.field_1')",
+        placeholder=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = InputTextElementType().export_serialized(exported_input_text_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.label["formula"] == expected_formula
+    assert imported_element.default_value["formula"] == expected_formula
+    assert imported_element.placeholder["formula"] == expected_formula
+
+
+@pytest.mark.django_db
+def test_image_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_image_element = data_fixture.create_builder_image_element(
+        page=page,
+        image_url=f"get('data_source.{data_source_1.id}.field_1')",
+        alt_text=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = ImageElementType().export_serialized(exported_image_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.image_url["formula"] == expected_formula
+    assert imported_element.alt_text["formula"] == expected_formula
+
+
+@pytest.mark.django_db
+def test_button_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_image_element = data_fixture.create_builder_button_element(
+        page=page,
+        value=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = ButtonElementType().export_serialized(exported_image_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.value["formula"] == expected_formula
+
+
+def test_rating_input_element_type_is_valid_with_valid_value():
+    # Setup
+    element_type = element_type_registry.get("rating_input")
+    element = MagicMock(spec=RatingInputElement)
+    element.required = False
+    element.max_value = 5
+    dispatch_context = MagicMock()
+
+    # Test with valid values
+    assert element_type.is_valid(element, 0, dispatch_context) == 0
+    assert element_type.is_valid(element, 3, dispatch_context) == 3
+    assert element_type.is_valid(element, 5, dispatch_context) == 5
+
+
+def test_rating_input_element_type_is_valid_with_required_element():
+    # Setup
+    element_type = element_type_registry.get("rating_input")
+    element = MagicMock(spec=RatingInputElement)
+    element.required = True
+    element.max_value = 5
+    dispatch_context = MagicMock()
+
+    # Test with valid value
+    assert element_type.is_valid(element, 3, dispatch_context) == 3
+
+    # Test with None value (should raise exception)
+    with pytest.raises(ValueError) as excinfo:
+        element_type.is_valid(element, None, dispatch_context)
+    assert "The value is required" in str(excinfo.value)
+
+
+def test_rating_input_element_type_is_valid_with_out_of_range_values():
+    # Setup
+    element_type = element_type_registry.get("rating_input")
+    element = MagicMock(spec=RatingInputElement)
+    element.required = False
+    element.max_value = 5
+    dispatch_context = MagicMock()
+
+    # Test with values outside the valid range
+    for invalid_value in [-1, 6, 10]:
+        with pytest.raises(ValueError) as excinfo:
+            element_type.is_valid(element, invalid_value, dispatch_context)
+        assert "The value is required" in str(excinfo.value)
+
+
+def test_rating_input_element_type_is_valid_edge_cases():
+    # Setup
+    element_type = element_type_registry.get("rating_input")
+    element = MagicMock(spec=RatingInputElement)
+    element.required = False
+    element.max_value = 5
+    dispatch_context = MagicMock()
+
+    # Test with None value for non-required element
+    # This should pass since the element is not required
+    assert element_type.is_valid(element, None, dispatch_context) is None
+
+    # Test with boundary values
+    assert element_type.is_valid(element, 0, dispatch_context) == 0
+    assert element_type.is_valid(element, 5, dispatch_context) == 5
+
+
+@pytest.mark.django_db
+def test_choice_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_choice_element = data_fixture.create_builder_choice_element(
+        page=page,
+        label=f"get('data_source.{data_source_1.id}.field_1')",
+        default_value=f"get('data_source.{data_source_1.id}.field_1')",
+        placeholder=f"get('data_source.{data_source_1.id}.field_1')",
+        formula_name=f"get('data_source.{data_source_1.id}.field_1')",
+        formula_value=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = ChoiceElementType().export_serialized(exported_choice_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.label["formula"] == expected_formula
+    assert imported_element.default_value["formula"] == expected_formula
+    assert imported_element.placeholder["formula"] == expected_formula
+    assert imported_element.formula_name["formula"] == expected_formula
+    assert imported_element.formula_value["formula"] == expected_formula
+
+
+# The email vectors below are shared with the frontend specs
+# `web-frontend/test/unit/core/utils/string.spec.js` (`isValidStrictEmail`) and
+# `web-frontend/test/unit/builder/elementTypes.spec.js` so the two validators stay
+# pinned to each other. Keep the lists identical on both sides.
+STRICT_EMAILS_ACCEPTED_BY_BOTH_SIDES = [
+    "foo@bar.com",
+    "FOO@BAR.COM",
+    "first.last+tag@sub.domain.co.uk",
+    "first_part_underscores_ok@hyphens-ok.com",
+    "user@localhost",
+    "user@пример.рф",
+    "test@example.xn--p1ai",
+    "x@xn--80ak6aa92e.com",
+    "a@b.cd",
+    "test@" + "a" * 63 + ".com",
+]
+STRICT_EMAILS_REJECTED_BY_BOTH_SIDES = [
+    "aaa@aa",
+    "dzd@vz",
+    "a@b",
+    "a@b.c",
+    "foobar.com",
+    "a@",
+    "@b",
+    "a@@b",
+    "a @b.com",
+    ".a@b.com",
+    "a..b@c.com",
+    "a@-b.com",
+    "a@b-.com",
+    "a@b..com",
+    "a@b.com.",
+    "коля@пример.рф",
+    "Dörte@Sörensen.example.com",
+    "test@" + "a" * 64 + ".com",
+    # 321 characters, over Django's 320 limit.
+    "a" * 315 + "@b.com",
+]
+# Accepted by Django's `validate_email` but deliberately not by the frontend
+# helper: IP literal domains and quoted-string local parts.
+STRICT_EMAILS_ACCEPTED_BY_BACKEND_ONLY = [
+    "wierd@[1.1.1.1]",
+    '"john..doe"@example.com',
+]
+# Accepted by Django's `validate_email` but rejected by the database email field
+# regex (`EmailFieldType.regex`). The frontend element rejects them inline because
+# the value usually ends up in an email field; see `elementTypes.spec.js`.
+STRICT_EMAILS_REJECTED_BY_EMAIL_FIELD_ONLY = [
+    "o'brien@example.com",
+    "100%@example.com",
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "required,type,value,result",
+    [
+        (True, "integer", "", ValueError),
+        (True, "integer", 0, 0),
+        (True, "integer", 42, 42),
+        (True, "integer", -42, -42),
+        (True, "integer", 3.14, 3.14),
+        (True, "integer", "4.2", 4.2),
+        (True, "integer", "4,2", TypeError),
+        (True, "integer", "42", 42),
+        (True, "integer", "horse", TypeError),
+        (False, "integer", "", ""),
+        (False, "integer", None, None),
+        (True, "email", "", ValueError),
+        *[
+            (True, "email", email, email)
+            for email in STRICT_EMAILS_ACCEPTED_BY_BOTH_SIDES
+            + STRICT_EMAILS_ACCEPTED_BY_BACKEND_ONLY
+            + STRICT_EMAILS_REJECTED_BY_EMAIL_FIELD_ONLY
+        ],
+        *[
+            (True, "email", email, ValueError)
+            for email in STRICT_EMAILS_REJECTED_BY_BOTH_SIDES
+        ],
+        (False, "email", "", ""),
+        (True, "any", "", ValueError),
+        (True, "any", 42, 42),
+        (True, "any", "42", "42"),
+        (True, "any", "horse", "horse"),
+        (False, "any", "", ""),
+    ],
+)
+def test_input_text_element_is_valid(data_fixture, required, type, value, result):
+    if result not in [TypeError, ValueError]:
+        assert (
+            InputTextElementType().is_valid(
+                InputTextElement(validation_type=type, required=required),
+                value,
+                {},
+            )
+            == result
+        ), repr(f"{value} != {result}")
+    else:
+        with pytest.raises(result):
+            InputTextElementType().is_valid(
+                InputTextElement(validation_type=type, required=required),
+                value,
+                {},
+            )
+
+
+@pytest.mark.django_db
+def test_choice_element_import_serialized(data_fixture):
+    parent = data_fixture.create_builder_page()
+    choice_element = data_fixture.create_builder_choice_element(
+        page=parent, label="'test'"
+    )
+    ChoiceElementOption.objects.create(
+        choice=choice_element, value="hello", name="there"
+    )
+    serialized_values = ChoiceElementType().export_serialized(choice_element)
+    id_mapping = {}
+
+    choice_element_imported = ChoiceElementType().import_serialized(
+        parent, serialized_values, id_mapping
+    )
+
+    assert choice_element.id != choice_element_imported.id
+    assert choice_element.label == choice_element_imported.label
+
+    options = choice_element_imported.choiceelementoption_set.all()
+
+    assert ChoiceElementOption.objects.count() == 2
+    assert len(options) == 1
+    assert options[0].value == "hello"
+    assert options[0].name == "there"
+    assert options[0].choice_id == choice_element_imported.id
+
+
+@pytest.mark.django_db
+def test_choice_element_is_valid(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    choice = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        page=page,
+    )
+    choice.choiceelementoption_set.create(value="uk", name="United Kingdom")
+    choice.choiceelementoption_set.create(value="it", name="Italy")
+
+    choice.required = True
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "", {})
+
+    assert ChoiceElementType().is_valid(choice, "uk", {}) == "uk"
+
+    choice.multiple = True
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, [], {})
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, [""], {})
+
+    assert ChoiceElementType().is_valid(choice, ["uk"], {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, "uk", {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it"], {}) == ["uk", "it"]
+    assert ChoiceElementType().is_valid(choice, "uk,it", {}) == ["uk", "it"]
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, ["uk", "it", "pt"], {})
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "uk,it,pt", {})
+
+    choice.multiple = False
+    choice.required = False
+
+    assert ChoiceElementType().is_valid(choice, "", {}) == ""
+    assert ChoiceElementType().is_valid(choice, "uk", {}) == "uk"
+
+    choice.multiple = True
+
+    assert ChoiceElementType().is_valid(choice, [], {}) == []
+    assert ChoiceElementType().is_valid(choice, "", {}) == []
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, [""], {})
+
+    assert ChoiceElementType().is_valid(choice, ["uk"], {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it"], {}) == ["uk", "it"]
+    assert ChoiceElementType().is_valid(choice, "uk,it", {}) == ["uk", "it"]
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, ["uk", "it", "pt"], {})
+
+    choice.choiceelementoption_set.create(value="", name="Blank")
+    choice.multiple = False
+    choice.required = True
+
+    assert ChoiceElementType().is_valid(choice, "", {}) == ""
+
+    choice.multiple = True
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, [], {})
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "", {})
+
+    assert ChoiceElementType().is_valid(choice, [""], {}) == [""]
+    assert ChoiceElementType().is_valid(choice, ["uk"], {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, "uk", {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it"], {}) == ["uk", "it"]
+    assert ChoiceElementType().is_valid(choice, "uk,it", {}) == ["uk", "it"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it", ""], {}) == [
+        "uk",
+        "it",
+        "",
+    ]
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, ["uk", "it", "", "pt"], {})
+
+    choice.multiple = False
+    choice.required = False
+
+    assert ChoiceElementType().is_valid(choice, "uk", {}) == "uk"
+
+    choice.multiple = True
+
+    assert ChoiceElementType().is_valid(choice, [], {}) == []
+    assert ChoiceElementType().is_valid(choice, [""], {}) == [""]
+    assert ChoiceElementType().is_valid(choice, ["uk"], {}) == ["uk"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it"], {}) == ["uk", "it"]
+    assert ChoiceElementType().is_valid(choice, ["uk", "it", ""], {}) == [
+        "uk",
+        "it",
+        "",
+    ]
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, ["uk", "it", "", "pt"], {})
+
+
+@pytest.mark.django_db
+def test_choice_element_is_valid_formula_data_source(data_fixture):
+    user = data_fixture.create_user()
+    table, fields, rows = data_fixture.build_table(
+        user=user,
+        columns=[("Name", "text")],
+        rows=[["BMW"], ["Audi"], ["Seat"], ["Volvo"]],
+    )
+    builder = data_fixture.create_builder_application(
+        user=user, workspace=table.database.workspace
+    )
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=builder
+    )
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+        integration=integration,
+        table=table,
+    )
+    choice = ElementService().create_element(
+        page=page,
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        option_type=ChoiceElement.OPTION_TYPE.FORMULAS,
+        formula_value=f"get('data_source.{data_source.id}.*.{fields[0].db_column}')",
+    )
+
+    # Call is_valid with an option that is not present in the list raises an exception
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(),
+        page,
+        offset=0,
+        count=20,
+        only_expose_public_allowed_properties=False,
+    )
+
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "Invalid", dispatch_context)
+
+    # Call is_valid with a valid option simply returns its value
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(),
+        page,
+        offset=0,
+        count=20,
+        only_expose_public_allowed_properties=False,
+    )
+
+    assert ChoiceElementType().is_valid(choice, "BMW", dispatch_context) == "BMW"
+
+
+@pytest.mark.django_db
+def test_choice_element_is_valid_formula_context(data_fixture):
+    user = data_fixture.create_user()
+    table, fields, rows = data_fixture.build_table(user=user, columns=[], rows=[])
+    field_handler = FieldHandler()
+    field = field_handler.create_field(
+        user=user,
+        table=table,
+        type_name="single_select",
+        name="Country",
+        select_options=[
+            {"value": "Germany", "color": "white"},
+            {"value": "Spain", "color": "red"},
+            {"value": "Sweden", "color": "yellow"},
+        ],
+    )
+    builder = data_fixture.create_builder_application(user=user)
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=builder
+    )
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+        integration=integration,
+        table=table,
+    )
+    choice = ElementService().create_element(
+        page=page,
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        option_type=ChoiceElement.OPTION_TYPE.FORMULAS,
+        formula_value=f"get('data_source_context.{data_source.id}.{field.db_column}.*.value')",
+    )
+
+    # Call is_valid with an option that is not present in the list raises an exception
+    dispatch_context = BuilderDispatchContext(HttpRequest(), page, offset=0, count=20)
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "Invalid", dispatch_context)
+
+    # Call is_valid with a valid option simply returns its value
+    assert (
+        ChoiceElementType().is_valid(choice, "Germany", dispatch_context) == "Germany"
+    )
+
+
+@pytest.mark.django_db
+def test_page_with_element_using_form_data_has_dependencies_import_first(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    form_container = data_fixture.create_builder_form_container_element(page=page)
+    form_input = data_fixture.create_builder_input_text_element(
+        page=page, reference_element=form_container
+    )
+    data_fixture.create_builder_heading_element(
+        page=page, value=f"get('form_data.{form_input.id}')"
+    )
+
+    page_clone = PageService().duplicate_page(user, page)
+
+    form_input_clone = InputTextElement.objects.get(page=page_clone)
+    heading_clone = HeadingElement.objects.get(page=page_clone)
+    assert heading_clone.value["formula"] == f"get('form_data.{form_input_clone.id}')"
+
+
+@pytest.mark.django_db
+def test_checkbox_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    exported_input_element = data_fixture.create_builder_checkbox_element(
+        page=page,
+        label=f"get('data_source.{data_source_1.id}.field_1')",
+        default_value=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = CheckboxElementType().export_serialized(exported_input_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.label["formula"] == expected_formula
+    assert imported_element.default_value["formula"] == expected_formula
+
+
+@pytest.mark.django_db
+def test_checkbox_text_element_is_valid(data_fixture):
+    with pytest.raises(ValueError):
+        CheckboxElementType().is_valid(CheckboxElement(required=True), False, {})
+
+    with pytest.raises(ValueError):
+        CheckboxElementType().is_valid(CheckboxElement(required=True), 0, {})
+
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=True), True, {}) is True
+    )
+
+    assert CheckboxElementType().is_valid(CheckboxElement(required=True), 1, {}) is True
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=True), "true", {})
+        is True
+    )
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=False), False, {})
+        is False
+    )
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=False), "false", {})
+        is False
+    )
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=False), 0, {}) is False
+    )
+    assert (
+        CheckboxElementType().is_valid(CheckboxElement(required=False), True, {})
+        is True
+    )
+
+
+@pytest.mark.django_db
+def test_iframe_element_import_export_formula(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source()
+
+    exported_element = data_fixture.create_builder_iframe_element(
+        page=page,
+        url=f"get('data_source.{data_source_1.id}.field_1')",
+        embed=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+    serialized = IFrameElementType().export_serialized(exported_element)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    # rather than in element_type.import_serialized.
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.url["formula"] == expected_formula
+    assert imported_element.embed["formula"] == expected_formula
+
+
+@pytest.mark.django_db
+def test_iframe_element_import_export_same_origin_permission(data_fixture):
+    page = data_fixture.create_builder_page()
+    exported_element = data_fixture.create_builder_iframe_element(
+        page=page,
+        allow_same_origin=True,
+    )
+
+    serialized = IFrameElementType().export_serialized(exported_element)
+    assert serialized["allow_same_origin"] is True
+
+    [imported_element] = PageHandler().import_elements(page, [serialized], {})
+    assert imported_element.allow_same_origin is True
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "storage",
+    [None, FileSystemStorage(location=str(tempdir), base_url="http://localhost")],
+)
+def test_image_element_import_export(data_fixture, fake, storage):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    data_source_1 = data_fixture.create_builder_local_baserow_get_row_data_source(
+        page=page
+    )
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source(
+        page=page
+    )
+
+    zip_buffer = BytesIO()
+    image_file = UserFileHandler().upload_user_file(
+        user, "test.jpg", BytesIO(fake.image()), storage=storage
+    )
+
+    element_to_export = data_fixture.create_builder_image_element(
+        page=page,
+        image_source_type="upload",
+        image_file=image_file,
+        image_url=f"get('data_source.{data_source_1.id}.field_1')",
+    )
+
+    zip_file = ExportZipFile(
+        compress_level=settings.BASEROW_DEFAULT_ZIP_COMPRESS_LEVEL,
+        compress_type=zipstream.ZIP_DEFLATED,
+    )
+
+    serialized = ImageElementType().export_serialized(
+        element_to_export, files_zip=zip_file, storage=storage
+    )
+
+    for chunk in zip_file:
+        zip_buffer.write(chunk)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+
+    # Let check if the file is actually imported from the zip_file
+    image_file.delete()
+
+    with ZipFile(zip_buffer, "r", ZIP_DEFLATED, False) as files_zip:
+        [imported_element] = PageHandler().import_elements(
+            page, [serialized], id_mapping, files_zip=files_zip, storage=storage
+        )
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.image_url["formula"] == expected_formula
+    assert (
+        imported_element.image_file_id is not None
+        and imported_element.image_file_id != element_to_export.image_file_id
+    )
+
+
+@pytest.mark.django_db
+def test_choice_element_import_export(data_fixture):
+    page = data_fixture.create_builder_page()
+    data_source_2 = data_fixture.create_builder_local_baserow_get_row_data_source(
+        page=page
+    )
+
+    exported_element = data_fixture.create_builder_choice_element(
+        page=page,
+        label=f"get('data_source.42.field_1')",
+        default_value=f"get('data_source.42.field_1')",
+        placeholder=f"get('data_source.42.field_1')",
+        multiple=True,
+    )
+    serialized = ChoiceElementType().export_serialized(exported_element)
+
+    # Just check that the serialization works properly
+    json.dumps(serialized)
+
+    # After applying the ID mapping the imported formula should have updated
+    # the data source IDs
+    id_mapping = {"builder_data_sources": {42: data_source_2.id}}
+
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    expected_formula = f"get('data_source.{data_source_2.id}.field_1')"
+    assert imported_element.label["formula"] == expected_formula
+    assert imported_element.default_value["formula"] == expected_formula
+    assert imported_element.placeholder["formula"] == expected_formula
+
+    assert imported_element.multiple is True
+
+
+@pytest.mark.django_db
+def test_choice_element_import_old_format(data_fixture):
+    page = data_fixture.create_builder_page()
+    element_type = ChoiceElementType()
+
+    serialized = {
+        "id": 1,
+        "order": "1.00000000000000000000",
+        "type": "dropdown",  # Element type is the old one
+        "parent_element_id": None,
+        "place_in_container": None,
+        "visibility": "all",
+        "style_border_top_color": "border",
+        "style_border_top_size": 0,
+        "style_padding_top": 10,
+        "style_border_bottom_color": "border",
+        "style_border_bottom_size": 0,
+        "style_padding_bottom": 10,
+        "style_border_left_color": "border",
+        "style_border_left_size": 0,
+        "style_padding_left": 20,
+        "style_border_right_color": "border",
+        "style_border_right_size": 0,
+        "style_padding_right": 20,
+        "style_background": "none",
+        "style_background_color": "#ffffffff",
+        "style_width": "normal",
+        "label": "'label'",
+        "required": False,
+        "placeholder": "'test'",
+        "default_value": "'default'",
+        "options": [
+            {"value": "Option 1", "name": "option1"},
+            {"value": "Option 2", "name": "option2"},
+        ],
+        "roles": [],
+        "role_type": Element.ROLE_TYPES.ALLOW_ALL,
+        # multiple property is missing
+        # show_as_dropdown property is  missing
+    }
+
+    imported_element = element_type.import_serialized(page, serialized, {})
+
+    assert isinstance(imported_element.specific, ChoiceElement)
+    assert imported_element.multiple is False
+    assert imported_element.show_as_dropdown is True
+    assert len(imported_element.choiceelementoption_set.all()) == 2
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "initial_roles,valid_roles,cleaned_roles",
+    [
+        (
+            ["invalid_role_a"],
+            [],
+            # "invalid_role_a" is not a valid role, so we expect an empty list
+            [],
+        ),
+        (
+            ["invalid_role_a"],
+            ["foo_role"],
+            # "invalid_role_a" doesn't match valid roles in ["foo_role"], so
+            # we expect an empty list
+            [],
+        ),
+        (
+            ["invalid_role_a", "foo_role"],
+            ["foo_role"],
+            # "foo_role" is the only valid role, so we expect that
+            # "invalid_role_a" is removed and only "foo_role" is returned
+            ["foo_role"],
+        ),
+        (
+            ["foo_role", "bar_role"],
+            ["foo_role", "bar_role"],
+            # Both "foo_role" and "bar_role" are valid, so we expect both
+            # roles to be returned.
+            ["foo_role", "bar_role"],
+        ),
+    ],
+)
+def test_sanitize_element_roles_removes_invalid_roles(
+    initial_roles,
+    valid_roles,
+    cleaned_roles,
+):
+    """
+    Ensure that sanitize_element_roles() removes invalid roles if they exist
+    in the element's roles list.
+
+    This can happen if the role has since been deleted or renamed.
+    """
+
+    element_type = HeadingElementType()
+
+    result = element_type.sanitize_element_roles(
+        initial_roles,
+        valid_roles,
+        {},
+    )
+
+    assert result == cleaned_roles
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "user_source_ids,initial_roles,valid_roles,cleaned_roles",
+    [
+        (
+            (100, 7777),
+            [f"{DEFAULT_USER_ROLE_PREFIX}100"],
+            [f"{DEFAULT_USER_ROLE_PREFIX}100", f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+            # Preserve explicit roles even if they match an old default role.
+            [f"{DEFAULT_USER_ROLE_PREFIX}100"],
+        ),
+        (
+            (100, 7777),
+            [],
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+            # existing roles is empty, so despite there existing a Default User
+            # Role, it shouldn't be returned.
+            [],
+        ),
+        (
+            (100, 7777),
+            ["invalid_role_a"],
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+            # "invalid_role_a" is not a valid role, so we expect an empty list.
+            [],
+        ),
+        (
+            (100, 7777),
+            ["invalid_role_a", f"{DEFAULT_USER_ROLE_PREFIX}100", "invalid_role_b"],
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+            # We expect only the default user role to be returned
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+        ),
+        (
+            (100, 7777),
+            [f"{DEFAULT_USER_ROLE_PREFIX}100"],
+            [],
+            # Although the initial roles contains a Default User Role, it is
+            # not valid, so we expect an empty list.
+            [],
+        ),
+        (
+            (100, 7777),
+            [f"{DEFAULT_USER_ROLE_PREFIX}100", f"{DEFAULT_USER_ROLE_PREFIX}900"],
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+            # the 900 id is missing in the datasource map so we don't keep that one.
+            [f"{DEFAULT_USER_ROLE_PREFIX}7777"],
+        ),
+    ],
+)
+def test_sanitize_element_roles_fixes_default_user_role(
+    user_source_ids,
+    initial_roles,
+    valid_roles,
+    cleaned_roles,
+):
+    """
+    Ensure that sanitize_element_roles() fixes the default user role.
+
+    The Default User Role is based on the User Source ID. Since the User Source
+    is newly created during an import, the Default User Role must also be
+    updated.
+    """
+
+    user_sources_mapping = {user_source_ids[0]: user_source_ids[1]}
+    element_type = HeadingElementType()
+
+    result = element_type.sanitize_element_roles(
+        initial_roles,
+        valid_roles,
+        user_sources_mapping,
+    )
+
+    assert result == cleaned_roles
+
+
+@pytest.mark.parametrize("collection_element_type", collection_element_types())
+def test_collection_element_type_publicly_searchable_sortable_filterable(
+    collection_element_type,
+):
+    expected_results = {
+        "repeat": {
+            "is_publicly_sortable": True,
+            "is_publicly_searchable": True,
+            "is_publicly_filterable": True,
+        },
+        "graph": {
+            "is_publicly_sortable": False,
+            "is_publicly_searchable": False,
+            "is_publicly_filterable": False,
+        },
+        "table": {
+            "is_publicly_sortable": True,
+            "is_publicly_searchable": True,
+            "is_publicly_filterable": True,
+        },
+        "record_selector": {
+            "is_publicly_sortable": False,
+            "is_publicly_searchable": True,
+            "is_publicly_filterable": False,
+        },
+    }
+    expected_result = expected_results.get(collection_element_type.type)
+    if not expected_result:
+        # A new collection element type has been implemented and
+        # needs to be added to the expected results.
+        pytest.fail(
+            f"Missing expected result for collection element type {collection_element_type.type}"
+        )
+    assert (
+        collection_element_type.is_publicly_sortable
+        == expected_result["is_publicly_sortable"]
+    )
+    assert (
+        collection_element_type.is_publicly_searchable
+        == expected_result["is_publicly_searchable"]
+    )
+    assert (
+        collection_element_type.is_publicly_filterable
+        == expected_result["is_publicly_filterable"]
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("collection_element_type", collection_element_types())
+def test_collection_element_type_after_update(collection_element_type, data_fixture):
+    user = data_fixture.create_user()
+    builder = data_fixture.create_builder_application(user=user)
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    element = ElementHandler().create_element(collection_element_type, page=page)
+    page.get_graph().insert(element, *page.get_graph().get_last_position())
+    element.property_options.create(schema_property="field_123")
+
+    # The `after_update` method drops all property options, and creates
+    # only what is provided into the method in its `values`.
+    collection_element_type.after_update(
+        element, {"property_options": [{"schema_property": "field_456"}]}, {}
+    )
+    assert element.property_options.count() == 1
+    assert element.property_options.filter(schema_property="field_456").exists()
+
+    # The `after_update` method drops all property options if the data source
+    # has changed.
+    collection_element_type.after_update(element, {}, {"data_source": (Mock(), Mock())})
+    assert element.property_options.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("collection_element_type", collection_element_types())
+def test_collection_element_type_prepare_value_for_db(
+    collection_element_type, data_fixture
+):
+    user = data_fixture.create_user()
+    builder = data_fixture.create_builder_application(user=user)
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    different_page = data_fixture.create_builder_page(user=user, builder=builder)
+    element = data_fixture.create_builder_element(
+        collection_element_type.__class__, page=page
+    )
+
+    multiple_rows = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+    )
+    single_row = data_fixture.create_builder_local_baserow_get_row_data_source(
+        user=user, page=page
+    )
+
+    multiple_rows_different_page = (
+        data_fixture.create_builder_local_baserow_list_rows_data_source(
+            user=user,
+            page=different_page,
+        )
+    )
+
+    data_source_no_service = data_fixture.create_builder_data_source(page=page)
+
+    # The data source must belong to the same page as `page`.
+    with pytest.raises(RequestBodyValidationException):
+        assert collection_element_type.prepare_value_for_db(
+            {"page": page, "data_source_id": multiple_rows_different_page.id}, element
+        )
+
+    # Schema property is not allowed when the data source returns multiple rows.
+    with pytest.raises(ValidationError) as exc:
+        assert collection_element_type.prepare_value_for_db(
+            {"schema_property": "field_123", "data_source_id": multiple_rows.id},
+            element,
+        )
+    assert (
+        exc.value.args[0] == "Data sources which return multiple rows cannot "
+        "be used in conjunction with the schema property."
+    )
+
+    # The data source has no service to use.
+    with pytest.raises(ValidationError) as exc:
+        assert collection_element_type.prepare_value_for_db(
+            {"data_source_id": data_source_no_service.id},
+            element,
+        )
+    assert (
+        exc.value.args[0] == f"Data source {data_source_no_service.id} is "
+        "partially configured and not ready for use."
+    )
+
+    # Prepare for db a multiple rows data source.
+    assert collection_element_type.prepare_value_for_db(
+        {"page": page, "data_source_id": multiple_rows.id}, element
+    ) == {"data_source": multiple_rows, "page": page}
+
+    # Prepare for db a single row data source.
+    assert collection_element_type.prepare_value_for_db(
+        {"page": page, "data_source_id": single_row.id, "schema_property": "field_123"},
+        element,
+    ) == {"data_source": single_row, "page": page, "schema_property": "field_123"}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "choices,expected_choices,invalid_choices",
+    [
+        (
+            [
+                {"name": "foo_name1", "value": "foo_value1"},
+                {"name": "bar_name1", "value": "bar_value1"},
+            ],
+            # Since the "value" exists for all options, return the values.
+            ["foo_value1", "bar_value1"],
+            # Since the "value" exists, the "name" isn't used and thus are
+            # invalid options.
+            ["foo_name1", "bar_name1"],
+        ),
+        (
+            [
+                {"name": "foo_name2", "value": None},
+                {"name": "bar_name2", "value": None},
+            ],
+            # Since the "value" doesn't exist, return the "name".
+            ["foo_name2", "bar_name2"],
+            # Since the "value" doesn't exist, the "name" is used. Any other
+            # values are invalid options.
+            ["foo_value2", "bar_value2"],
+        ),
+        (
+            [
+                {"name": "foo_name3", "value": ""},
+                {"name": "bar_name3", "value": ""},
+            ],
+            # An empty string is a valid value
+            [""],
+            # Since the "value" is an empty string and is valid, it is used.
+            # Any other values are invalid options.
+            ["foo_name3", "bar_name3"],
+        ),
+        (
+            [
+                {"name": "foo_name", "value": "foo_value"},
+                {"name": "bar_name", "value": ""},
+                {"name": "baz_name", "value": None},
+            ],
+            # The valid list of values
+            ["foo_value", "", "baz_name"],
+            # The invalid list of values
+            ["foo_name", "bar_name"],
+        ),
+    ],
+)
+def test_choice_element_validation_none_vs_empty(
+    data_fixture, choices, expected_choices, invalid_choices
+):
+    """
+    Test that None and empty string are handled correctly by the
+    ChoiceElementType's is_valid() method.
+    """
+
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    choice = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        page=page,
+    )
+
+    for item in choices:
+        choice.choiceelementoption_set.create(name=item["name"], value=item["value"])
+
+    for value in expected_choices:
+        assert ChoiceElementType().is_valid(choice, value, {}) is value
+
+    for value in invalid_choices:
+        with pytest.raises(ValueError):
+            ChoiceElementType().is_valid(choice, value, {})
+
+
+@pytest.mark.django_db
+def test_choice_element_integer_option_values(data_fixture):
+    """
+    Ensure that the row ID key (in addition to the Primary DB field) can be used
+    as a valid Option Value when referring to a linked table.
+    """
+
+    user = data_fixture.create_user()
+    table, fields, rows = data_fixture.build_table(
+        user=user,
+        columns=[
+            ("Food", "text"),
+            ("Ingredient", "text"),
+        ],
+        rows=[
+            ["Palak Paneer", "Cottage Cheese"],
+            ["Gobi Manchurian", "Cauliflower"],
+        ],
+    )
+    builder = data_fixture.create_builder_application(
+        user=user, workspace=table.database.workspace
+    )
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=builder
+    )
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+        integration=integration,
+        table=table,
+    )
+    choice = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        page=page,
+        option_type=ChoiceElement.OPTION_TYPE.FORMULAS,
+        formula_name=f"get('data_source.{data_source.id}.*.field_{fields[0].id}')",
+        formula_value=f"get('data_source.{data_source.id}.*.id')",
+    )
+
+    expected_choices = [row.id for row in rows]
+
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(),
+        page,
+        offset=0,
+        count=20,
+        only_expose_public_allowed_properties=False,
+    )
+
+    for value in expected_choices:
+        dispatch_context.reset_call_stack()
+        assert ChoiceElementType().is_valid(choice, value, dispatch_context) is value
+
+
+@pytest.mark.parametrize(
+    "allowed_element_type",
+    [
+        element_type.type
+        for element_type in element_type_registry.get_all()
+        if element_type.type != ColumnElementType.type
+        and not element_type.is_multi_page_element
+    ],
+)
+def test_column_container_child_types_allowed(allowed_element_type):
+    assert allowed_element_type in [
+        e.type for e in ColumnElementType().child_types_allowed
+    ]
+
+
+@pytest.mark.django_db
+def test_record_element_is_valid(data_fixture):
+    user = data_fixture.create_user()
+
+    # There must exist one database with a primary column for the record name
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(name="Name", table=table, primary=True)
+
+    model = table.get_model(attribute_names=True)
+    row_ids = [
+        model.objects.create(name="BMW").id,
+        model.objects.create(name="Audi").id,
+        model.objects.create(name="2Cv").id,
+        model.objects.create(name="Tesla").id,
+    ]
+
+    builder = data_fixture.create_builder_application(
+        user=user, workspace=table.database.workspace
+    )
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=builder
+    )
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+        integration=integration,
+        table=table,
+    )
+
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(), page, only_expose_public_allowed_properties=False
+    )
+
+    # Record selector with no data sources is invalid
+    with pytest.raises(ElementImproperlyConfigured):
+        element = RecordSelectorElement()
+        RecordSelectorElementType().is_valid(element, "", dispatch_context)
+
+    # Record selector that is required should not accept empty values
+    with pytest.raises(ValueError):
+        element = RecordSelectorElement(data_source=data_source, required=True)
+        RecordSelectorElementType().is_valid(element, "", dispatch_context)
+
+    # Record selector that is required should accept only valid values
+    element = RecordSelectorElement(data_source=data_source, required=True)
+    for row_id in row_ids:
+        assert (
+            RecordSelectorElementType().is_valid(element, row_id, dispatch_context)
+            == row_id
+        )
+    with pytest.raises(ValueError):
+        RecordSelectorElementType().is_valid(element, "-1", dispatch_context)
+
+    # Record selector that is not required should accept empty values
+    element = RecordSelectorElement(data_source=data_source, required=False)
+    assert RecordSelectorElementType().is_valid(element, "", dispatch_context) == ""
+
+    # Record selector that is not required should accept only valid values
+    element = RecordSelectorElement(data_source=data_source, required=False)
+    for row_id in row_ids:
+        assert (
+            RecordSelectorElementType().is_valid(element, row_id, dispatch_context)
+            == row_id
+        )
+    with pytest.raises(ValueError):
+        RecordSelectorElementType().is_valid(element, "-1", dispatch_context)
+
+    # Record selector that is multiple and required should not accept empty values
+    with pytest.raises(ValueError):
+        element = RecordSelectorElement(
+            data_source=data_source, required=True, multiple=True
+        )
+        RecordSelectorElementType().is_valid(element, "", dispatch_context)
+
+    # Record selector that is multiple should not accept invalid values
+    with pytest.raises(TypeError):
+        element = RecordSelectorElement(
+            data_source=data_source, required=False, multiple=True
+        )
+        RecordSelectorElementType().is_valid(element, ["invalid", ""], dispatch_context)
+
+    # Record selector that is multiple and required should accept only valid values
+    element = RecordSelectorElement(
+        data_source=data_source, required=True, multiple=True
+    )
+    assert (
+        RecordSelectorElementType().is_valid(element, row_ids, dispatch_context)
+        == row_ids
+    )
+    with pytest.raises(ValueError):
+        RecordSelectorElementType().is_valid(element, [], dispatch_context)
+
+    # Record selector that is multiple and not required should accept empty values
+    element = RecordSelectorElement(
+        data_source=data_source, required=False, multiple=True
+    )
+    assert RecordSelectorElementType().is_valid(element, "", dispatch_context) == ""
+
+    # Record selector that is multiple and not required should accept only valid values
+    element = RecordSelectorElement(
+        data_source=data_source, required=False, multiple=True
+    )
+    assert (
+        RecordSelectorElementType().is_valid(element, row_ids, dispatch_context)
+        == row_ids
+    )
+    with pytest.raises(ValueError):
+        RecordSelectorElementType().is_valid(element, "-1", dispatch_context)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_repeat_element_import_export(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    builder = data_fixture.create_builder_application(workspace=workspace)
+    database = data_fixture.create_database_application(workspace=workspace)
+
+    table = data_fixture.create_database_table(database=database)
+    multiple_select_field = data_fixture.create_multiple_select_field(
+        table=table, name="option_field", order=1, primary=True
+    )
+    data_fixture.create_select_option(
+        field=multiple_select_field, value="A", color="blue", order=0
+    )
+
+    page = data_fixture.create_builder_page(builder=builder)
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        page=page
+    )
+
+    outer_repeat = data_fixture.create_builder_repeat_element(
+        data_source=data_source, page=page
+    )
+    data_fixture.create_builder_repeat_element(
+        page=page,
+        data_source=None,
+        reference_element=outer_repeat,
+        position=GraphPointPosition.CHILD,
+        schema_property=multiple_select_field.db_column,
+    )
+
+    config = ImportExportConfig(include_permission_data=False)
+    exported_applications = CoreHandler().export_workspace_applications(
+        workspace, BytesIO(), config
+    )
+
+    # Ensure the values are json serializable
+    try:
+        json.dumps(exported_applications)
+    except Exception as e:
+        pytest.fail(f"Exported applications are not json serializable: {e}")
+
+    imported_applications, _ = CoreHandler().import_applications_to_workspace(
+        workspace, exported_applications, BytesIO(), config, None
+    )
+    imported_database, imported_builder = imported_applications
+
+    # Pluck out the imported database records.
+    imported_table = imported_database.table_set.get()
+    imported_field = imported_table.field_set.get()
+
+    # Pluck out the imported builder records.
+    imported_page = imported_builder.visible_pages.all()[0]
+    [imported_root_element, imported_nested_element] = imported_page.element_set.all()
+    assert imported_page.graph == {
+        "0": imported_root_element.id,
+        str(imported_root_element.id): {"children": {"": [imported_nested_element.id]}},
+        str(imported_nested_element.id): {},
+    }
+
+    imported_data_source = imported_page.datasource_set.get()
+    assert imported_root_element.specific.data_source_id == imported_data_source.id
+    assert imported_nested_element.specific.schema_property == imported_field.db_column
+
+
+@pytest.mark.parametrize(
+    "required,date_format,include_time,time_format,value,expected",
+    [
+        (False, "ISO", False, "24", None, "None"),
+        (True, "ISO", False, "24", None, ValueError),
+        (True, "ISO", False, "24", "2024-04-25T00:00:00.000Z", "2024-04-25"),
+        (True, "ISO", True, "24", "2024-04-25T14:30:00.000Z", "2024-04-25 14:30"),
+        (True, "EU", False, "24", "2024-04-25T00:00:00.000Z", "25/04/2024"),
+        (True, "US", False, "24", "2024-04-25T00:00:00.000Z", "04/25/2024"),
+        (True, "EU", True, "12", "2024-04-25T14:30:00.000Z", "25/04/2024 02:30 PM"),
+        (True, "US", True, "12", "2024-04-25T14:30:00.000Z", "04/25/2024 02:30 PM"),
+    ],
+)
+def test_datetime_picker_element_is_valid(
+    required, date_format, include_time, time_format, value, expected
+):
+    element_type = DateTimePickerElementType()
+    element = DateTimePickerElement(
+        required=required,
+        date_format=date_format,
+        include_time=include_time,
+        time_format=time_format,
+    )
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            element_type.is_valid(element, value, {})
+    else:
+        assert str(element_type.is_valid(element, value, {})) == expected
+
+
+def test_element_type_has_display_name(element_type):
+    from django.utils.translation import gettext_lazy as _
+
+    assert element_type.display_name != _("Unnamed node"), (
+        f"{type(element_type).__name__}.display_name is still the default 'Unnamed node'"
+    )
+
+
+@pytest.mark.django_db
+def test_element_type_get_event_names(data_fixture):
+    page = data_fixture.create_builder_page()
+    heading = data_fixture.create_builder_heading_element(page=page)
+    button = data_fixture.create_builder_button_element(page=page)
+    form = data_fixture.create_builder_form_container_element(page=page)
+    table = data_fixture.create_builder_table_element(
+        page=page,
+        fields=[
+            {"name": "Text", "type": "text", "config": {"value": "'a'"}},
+            {"name": "Button", "type": "button", "config": {"label": "'b'"}},
+        ],
+    )
+    button_field = table.fields.get(name="Button")
+    button_item_uid, link_item_uid = uuid.uuid4(), uuid.uuid4()
+    menu = data_fixture.create_builder_menu_element_items(
+        page=page,
+        menu_items=[
+            {
+                "variant": "button",
+                "type": "button",
+                "uid": button_item_uid,
+                "name": "Button",
+            },
+            {"variant": "link", "type": "link", "uid": link_item_uid, "name": "Link"},
+        ],
+    )
+
+    def get_event_names(element):
+        element_type = element_type_registry.get_by_model(element.specific_class)
+        return element_type.get_event_names(element)
+
+    assert get_event_names(heading) == []
+    assert get_event_names(button) == ["click"]
+    assert get_event_names(form) == ["submit"]
+    assert get_event_names(table) == [f"{button_field.uid}_click"]
+    assert get_event_names(menu) == [f"{button_item_uid}_click"]
+
+
+@pytest.mark.parametrize(
+    "formula_element_type,field_name",
+    [
+        (InputTextElementType, "label"),
+        (CheckboxElementType, "label"),
+        (ChoiceElementType, "label"),
+        (ChoiceElementType, "formula_name"),
+        (DateTimePickerElementType, "label"),
+        (RatingInputElementType, "label"),
+        (RecordSelectorElementType, "label"),
+    ],
+)
+def test_element_type_rendered_formula_allows_markdown_format(
+    formula_element_type, field_name
+):
+    """
+    The formulas whose resolved value is rendered as text on the page accept a
+    markdown `format`, and say so in the API docs.
+    """
+
+    field = formula_element_type().serializer_field_overrides[field_name]
+
+    assert field.allowed_formats == [
+        BASEROW_FORMULA_FORMAT_PLAIN,
+        BASEROW_FORMULA_FORMAT_MARKDOWN,
+    ]
+    assert field.help_text.endswith("Accepted `format` values: plain, markdown.")
+
+
+@pytest.mark.parametrize(
+    "formula_element_type,field_name",
+    [
+        (InputTextElementType, "default_value"),
+        (CheckboxElementType, "default_value"),
+        (ChoiceElementType, "formula_value"),
+        (RecordSelectorElementType, "default_value"),
+    ],
+)
+def test_element_type_unrendered_formula_stays_plain_only(
+    formula_element_type, field_name
+):
+    """
+    The formulas that are never rendered as text (values) keep accepting the
+    plain format only.
+    """
+
+    field = formula_element_type().serializer_field_overrides[field_name]
+
+    assert field.allowed_formats == [BASEROW_FORMULA_FORMAT_PLAIN]
+
+
+@pytest.mark.django_db
+def test_input_text_element_import_export_keeps_label_format(data_fixture):
+    page = data_fixture.create_builder_page()
+    label = BaserowFormulaObject.create(
+        formula="'**Name**'", format=BASEROW_FORMULA_FORMAT_MARKDOWN
+    )
+    exported_input_text_element = data_fixture.create_builder_input_text_element(
+        page=page, label=label
+    )
+
+    serialized = InputTextElementType().export_serialized(exported_input_text_element)
+    assert serialized["label"] == label
+
+    id_mapping = {"builder_data_sources": {}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    assert imported_element.label == label
+
+
+@pytest.mark.django_db
+def test_choice_element_import_export_keeps_formula_name_format(data_fixture):
+    page = data_fixture.create_builder_page()
+    formula_name = BaserowFormulaObject.create(
+        formula="'**A**,**B**'", format=BASEROW_FORMULA_FORMAT_MARKDOWN
+    )
+    exported_choice_element = data_fixture.create_builder_choice_element(
+        page=page, formula_name=formula_name
+    )
+
+    serialized = ChoiceElementType().export_serialized(exported_choice_element)
+    assert serialized["formula_name"] == formula_name
+
+    id_mapping = {"builder_data_sources": {}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+
+    assert imported_element.formula_name == formula_name
+
+
+@pytest.mark.django_db
+def test_choice_element_is_valid_formula_options_with_markdown_name(data_fixture):
+    """
+    A choice element whose options come from formulas validates the submitted
+    value against the resolved `formula_value` only. A markdown `formula_name`
+    doesn't change which values are accepted, and the rendered names are never
+    valid values themselves.
+    """
+
+    user = data_fixture.create_user()
+    table, fields, rows = data_fixture.build_table(
+        user=user,
+        columns=[("Name", "text"), ("Description", "text")],
+        rows=[["BMW", "**German**"], ["Volvo", "**Swedish**"]],
+    )
+    builder = data_fixture.create_builder_application(
+        user=user, workspace=table.database.workspace
+    )
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=builder
+    )
+    page = data_fixture.create_builder_page(user=user, builder=builder)
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        user=user,
+        page=page,
+        integration=integration,
+        table=table,
+    )
+    choice = ElementService().create_element(
+        page=page,
+        user=user,
+        element_type=element_type_registry.get("choice"),
+        option_type=ChoiceElement.OPTION_TYPE.FORMULAS,
+        formula_name=BaserowFormulaObject.create(
+            formula=f"get('data_source.{data_source.id}.*.{fields[1].db_column}')",
+            format=BASEROW_FORMULA_FORMAT_MARKDOWN,
+        ),
+        formula_value=f"get('data_source.{data_source.id}.*.{fields[0].db_column}')",
+    )
+    choice.refresh_from_db()
+    assert choice.formula_name["format"] == BASEROW_FORMULA_FORMAT_MARKDOWN
+
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(),
+        page,
+        offset=0,
+        count=20,
+        only_expose_public_allowed_properties=False,
+    )
+
+    # A resolved value is accepted as is.
+    assert ChoiceElementType().is_valid(choice, "BMW", dispatch_context) == "BMW"
+
+    # A resolved (markdown) name is not a value.
+    dispatch_context.reset_call_stack()
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "**German**", dispatch_context)
+
+    dispatch_context.reset_call_stack()
+    with pytest.raises(ValueError):
+        ChoiceElementType().is_valid(choice, "Invalid", dispatch_context)
+
+
+@pytest.mark.django_db
+def test_choice_element_import_export_formula_options_keeps_formula_name_format(
+    data_fixture,
+):
+    """
+    Exporting a choice element whose options come from formulas keeps the
+    markdown `format` of its `formula_name`, and importing it rewrites the data
+    source id inside both option formulas without touching the format.
+    """
+
+    page = data_fixture.create_builder_page()
+    data_source_1 = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        page=page
+    )
+    data_source_2 = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        page=page
+    )
+    exported_element = data_fixture.create_builder_choice_element(
+        page=page,
+        option_type=ChoiceElement.OPTION_TYPE.FORMULAS,
+        formula_name=BaserowFormulaObject.create(
+            formula=f"get('data_source.{data_source_1.id}.*.field_1')",
+            format=BASEROW_FORMULA_FORMAT_MARKDOWN,
+        ),
+        formula_value=f"get('data_source.{data_source_1.id}.*.id')",
+    )
+    serialized = ChoiceElementType().export_serialized(exported_element)
+
+    # Just check that the serialization works properly
+    json.dumps(serialized)
+    assert serialized["option_type"] == ChoiceElement.OPTION_TYPE.FORMULAS
+    assert serialized["formula_name"] == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source_1.id}.*.field_1')",
+        format=BASEROW_FORMULA_FORMAT_MARKDOWN,
+    )
+    assert serialized["formula_value"] == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source_1.id}.*.id')"
+    )
+
+    # After applying the ID mapping the imported formulas should have updated
+    # the data source IDs, and the name formula should still be markdown.
+    id_mapping = {"builder_data_sources": {data_source_1.id: data_source_2.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+    imported_element.refresh_from_db()
+
+    assert imported_element.option_type == ChoiceElement.OPTION_TYPE.FORMULAS
+    assert imported_element.formula_name == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source_2.id}.*.field_1')",
+        format=BASEROW_FORMULA_FORMAT_MARKDOWN,
+    )
+    assert imported_element.formula_value == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source_2.id}.*.id')"
+    )
+    assert "format" not in imported_element.formula_value
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "legacy_formula_name,legacy_formula_value",
+    [
+        pytest.param(
+            "get('data_source.42.*.field_1')",
+            "get('data_source.42.*.id')",
+            id="v1-string",
+        ),
+        pytest.param(
+            {
+                "formula": "get('data_source.42.*.field_1')",
+                "mode": "simple",
+                "version": "0.1",
+            },
+            {
+                "formula": "get('data_source.42.*.id')",
+                "mode": "simple",
+                "version": "0.1",
+            },
+            id="v2-object-without-format",
+        ),
+    ],
+)
+def test_choice_element_import_legacy_formula_options(
+    data_fixture, legacy_formula_name, legacy_formula_value
+):
+    """
+    Exports made before formulas carried a `format` store the option formulas
+    of a choice element as bare strings (v1) or as objects without a `format`
+    key (v2). Both import as plain formulas with their data source id rewritten.
+    """
+
+    page = data_fixture.create_builder_page()
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        page=page
+    )
+    serialized = ChoiceElementType().export_serialized(
+        data_fixture.create_builder_choice_element(page=page)
+    )
+    serialized.update(
+        {
+            "option_type": ChoiceElement.OPTION_TYPE.FORMULAS,
+            "formula_name": legacy_formula_name,
+            "formula_value": legacy_formula_value,
+        }
+    )
+
+    id_mapping = {"builder_data_sources": {42: data_source.id}}
+    [imported_element] = PageHandler().import_elements(page, [serialized], id_mapping)
+    imported_element.refresh_from_db()
+
+    assert imported_element.option_type == ChoiceElement.OPTION_TYPE.FORMULAS
+    assert imported_element.formula_name == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source.id}.*.field_1')"
+    )
+    assert "format" not in imported_element.formula_name
+    assert imported_element.formula_value == BaserowFormulaObject.create(
+        formula=f"get('data_source.{data_source.id}.*.id')"
+    )
+    assert "format" not in imported_element.formula_value
+
+
+@pytest.mark.django_db
+def test_record_element_is_valid_refuses_integration_of_another_application(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    other_user = data_fixture.create_user()
+    other_builder = data_fixture.create_builder_application(user=other_user)
+    integration = data_fixture.create_local_baserow_integration(
+        application=other_builder, authorized_user=other_user
+    )
+    table = data_fixture.create_database_table(user=other_user)
+    data_fixture.create_text_field(name="Name", table=table, primary=True)
+    row = table.get_model(attribute_names=True).objects.create(name="Secret")
+    data_source = data_fixture.create_builder_local_baserow_list_rows_data_source(
+        page=page, integration=integration, table=table
+    )
+    dispatch_context = BuilderDispatchContext(
+        HttpRequest(), page, only_expose_public_allowed_properties=False
+    )
+
+    element = RecordSelectorElement(data_source=data_source)
+    with pytest.raises(ServiceImproperlyConfiguredDispatchException) as exc:
+        RecordSelectorElementType().is_valid(element, str(row.id), dispatch_context)
+    assert str(exc.value) == (
+        "The integration used by this service belongs to another application."
+    )

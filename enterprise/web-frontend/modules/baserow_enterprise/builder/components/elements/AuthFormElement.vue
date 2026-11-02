@@ -1,0 +1,203 @@
+<template>
+  <div v-if="hasAtLeastOneLoginOption" :style="fullStyle">
+    <Error :error="error"></Error>
+    <template v-for="appAuthType in appAuthProviderTypes">
+      <div
+        v-if="hasAtLeastOneProvider(appAuthType)"
+        :key="appAuthType.type"
+        class="auth-form-element__provider"
+      >
+        <component
+          :is="appAuthType.component"
+          :user-source="selectedUserSource"
+          :auth-provider-type="appAuthType"
+          :auth-providers="appAuthProviderPerTypes[appAuthType.type]"
+          :login-button-label="resolvedLoginButtonLabel"
+          :before-login="beforeLogin"
+          :after-login="afterLogin"
+          :read-only="isEditMode"
+          :authenticate="authenticateWithCredentials"
+        />
+      </div>
+    </template>
+  </div>
+  <p v-else>
+    {{ $t('authFormElement.selectOrConfigureUserSourceFirst') }}
+  </p>
+</template>
+
+<script>
+import form from '@baserow/modules/core/mixins/form'
+import error from '@baserow/modules/core/mixins/error'
+import element from '@baserow/modules/builder/mixins/element'
+import {
+  consumeLoginError,
+  getLoginError,
+} from '@baserow/modules/builder/utils/auth'
+import { ensureString } from '@baserow/modules/core/utils/validator'
+import { mapActions } from 'vuex'
+
+export default {
+  name: 'AuthFormElement',
+  mixins: [element, form, error],
+  inject: ['elementPage', 'builder', 'mode'],
+  props: {
+    /**
+     * @type {Object}
+     * @property {number} user_source_id - The id of the user_source.
+     * @property {string} login_button_label - The formula for the label of the login
+     *   button
+     */
+    element: {
+      type: Object,
+      required: true,
+    },
+  },
+  data() {
+    return {}
+  },
+  computed: {
+    isAuthenticated() {
+      return this.$store.getters['userSourceUser/isAuthenticated'](this.builder)
+    },
+    isEditMode() {
+      return this.mode === 'editing'
+    },
+    fullStyle() {
+      return {
+        ...this.getStyleOverride('input'),
+        ...this.getStyleOverride('login_button'),
+      }
+    },
+    selectedUserSource() {
+      return this.$store.getters['userSource/getUserSourceById'](
+        this.builder,
+        this.element.user_source_id
+      )
+    },
+    selectedUserSourceType() {
+      if (!this.selectedUserSource) {
+        return null
+      }
+      return this.$registry.get('userSource', this.selectedUserSource.type)
+    },
+    authProviders() {
+      return this.selectedUserSource?.auth_providers || []
+    },
+    appAuthProviderTypes() {
+      return this.$registry.getOrderedList('appAuthProvider')
+    },
+    appAuthProviderPerTypes() {
+      return Object.fromEntries(
+        this.appAuthProviderTypes.map((authType) => {
+          return [
+            authType.type,
+            this.authProviders.filter(({ type }) => type === authType.type),
+          ]
+        })
+      )
+    },
+    loginOptions() {
+      if (!this.selectedUserSourceType) {
+        return {}
+      }
+      return this.selectedUserSourceType.getLoginOptions(
+        this.selectedUserSource
+      )
+    },
+    hasAtLeastOneLoginOption() {
+      return Object.keys(this.loginOptions).length > 0
+    },
+    resolvedLoginButtonLabel() {
+      return (
+        ensureString(this.resolveFormula(this.element.login_button_label)) ||
+        this.$t('action.login')
+      )
+    },
+  },
+  created() {
+    this.showLoginErrorFromQueryParams()
+  },
+  mounted() {
+    if (!this.isEditMode && this.selectedUserSource) {
+      consumeLoginError(this.$registry, [this.selectedUserSource])
+    }
+  },
+  watch: {
+    userSource: {
+      handler(newValue) {
+        if (this.element.user_source_id) {
+          const found = newValue.find(
+            ({ id }) => id === this.element.user_source_id
+          )
+          if (!found) {
+            // If the user_source has been removed we need to update the element
+            this.actionForceUpdateElement({
+              builder: this.builder,
+              page: this.elementPage,
+              element: this.element,
+              values: { user_source_id: null },
+            })
+          }
+        }
+      },
+    },
+  },
+  methods: {
+    ...mapActions({
+      actionForceUpdateElement: 'element/forceUpdate',
+      userLogoff: 'userSourceUser/logoff',
+      userAuthenticate: 'userSourceUser/authenticate',
+    }),
+    hasAtLeastOneProvider(authProviderType) {
+      return (
+        this.appAuthProviderPerTypes[authProviderType.getType()]?.length > 0
+      )
+    },
+    /**
+     * When an SSO login fails, the provider redirects back here with an error code
+     * in a query parameter. Surface it inline near the auth form (like the
+     * email/password flow) instead of letting it become a full page error. Consuming
+     * the parameter here also tells `PublicPageContent` that the error has been
+     * displayed, so it doesn't show its fallback toast on top of it.
+     */
+    showLoginErrorFromQueryParams() {
+      if (this.isEditMode || !this.selectedUserSource) {
+        return
+      }
+      const origin = import.meta.client
+        ? window.location.origin
+        : 'http://builder.internal'
+      const error = getLoginError(
+        this.$registry,
+        [this.selectedUserSource],
+        new URL(this.$route.fullPath, origin)
+      )
+      if (error) {
+        this.showError(this.$t('loginError.title'), error.message)
+      }
+    },
+    async beforeLogin() {
+      if (this.isAuthenticated) {
+        await this.userLogoff({
+          application: this.builder,
+        })
+        await this.$nextTick()
+      }
+    },
+    async authenticateWithCredentials(credentials) {
+      await this.userAuthenticate({
+        application: this.builder,
+        userSource: this.selectedUserSource,
+        credentials,
+        setCookie: this.mode !== 'editing',
+      })
+    },
+    async afterLogin() {
+      await this.fireEvent(
+        this.elementType.getEventByName(this.element, 'after_login')
+      )
+    },
+  },
+}
+</script>

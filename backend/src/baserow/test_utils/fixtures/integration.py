@@ -1,0 +1,61 @@
+from baserow.contrib.integrations.core.models import SMTPIntegration
+from baserow.contrib.integrations.local_baserow.models import LocalBaserowIntegration
+from baserow.contrib.integrations.slack.models import SlackBotIntegration
+from baserow.core.integrations.registries import integration_type_registry
+
+
+class IntegrationFixtures:
+    def create_local_baserow_integration(self, **kwargs):
+        authorized_agent = kwargs.pop("authorized_agent", None)
+        authorized_user = kwargs.pop("authorized_user", None)
+        if authorized_agent is not None:
+            kwargs["authorized_subject_type"] = "core.Agent"
+            kwargs["authorized_subject_id"] = authorized_agent.id
+        else:
+            if authorized_user is None:
+                if not kwargs.get("user", None):
+                    kwargs["user"] = self.create_user()
+
+                authorized_user = kwargs["user"]
+            kwargs["authorized_subject_type"] = "auth.User"
+            kwargs["authorized_subject_id"] = authorized_user.id
+
+        integration = self.create_integration(LocalBaserowIntegration, **kwargs)
+        return integration
+
+    def create_smtp_integration(self, **kwargs):
+        if "host" not in kwargs:
+            kwargs["host"] = "smtp.example.com"
+        if "port" not in kwargs:
+            kwargs["port"] = 587
+        if "use_tls" not in kwargs:
+            kwargs["use_tls"] = True
+
+        integration = self.create_integration(SMTPIntegration, **kwargs)
+        return integration
+
+    def create_slack_bot_integration(self, **kwargs):
+        if "token" not in kwargs:
+            kwargs["token"] = "xoxb-test-token"  # nosec B105
+
+        integration = self.create_integration(SlackBotIntegration, **kwargs)
+        return integration
+
+    def create_integration_with_first_type(self, **kwargs):
+        first_type = list(integration_type_registry.get_all())[0]
+        return self.create_integration(first_type.model_class, **kwargs)
+
+    def create_integration(self, model_class, user=None, application=None, **kwargs):
+        if not application:
+            if user is None:
+                user = self.create_user()
+
+            application_args = kwargs.pop("application_args", {})
+            application = self.create_builder_application(user=user, **application_args)
+
+        if "order" not in kwargs:
+            kwargs["order"] = model_class.get_last_order(application)
+
+        integration = model_class.objects.create(application=application, **kwargs)
+
+        return integration

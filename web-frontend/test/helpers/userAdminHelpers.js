@@ -1,0 +1,256 @@
+import EditUserContext from '@baserow/modules/core/components/admin/users/contexts/EditUserContext'
+import ChangeUserPasswordModal from '@baserow/modules/core/components/admin/users/modals/ChangeUserPasswordModal'
+import ChangePasswordForm from '@baserow/modules/core/components/admin/users/forms/ChangePasswordForm'
+import EditUserModal from '@baserow/modules/core/components/admin/users/modals/EditUserModal'
+import UserForm from '@baserow/modules/core/components/admin/users/forms/UserForm'
+import CrudTableSearch from '@baserow/modules/core/components/crudTable/CrudTableSearch'
+import DeleteUserModal from '@baserow/modules/core/components/admin/users/modals/DeleteUserModal'
+import { expect } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
+
+export default class UserAdminUserHelpers {
+  constructor(userAdminComponent) {
+    this.c = userAdminComponent
+  }
+
+  findCells(numCellsExpected = 8) {
+    const cells = this.c.findAll('tbody .data-table__table-cell-content')
+    expect(cells.length).toBe(numCellsExpected)
+    return cells
+  }
+
+  findUsernameColumnCellsText() {
+    const cells = this.c.findAll('tbody .data-table__table-cell-content')
+    const usernameCells = []
+    const numRows = cells.length / 8
+    for (let i = 0; i < numRows; i++) {
+      usernameCells.push(
+        cells
+          .at(i * 8 + 0)
+          .find('.user-admin-username__name')
+          .text()
+      )
+    }
+    return usernameCells
+  }
+
+  getRow(cells, rowNumber) {
+    const offset = rowNumber * 8
+    return {
+      usernameCell: cells.at(offset),
+      nameCell: cells.at(offset + 1),
+      workspacesCell: cells.at(offset + 2),
+      lastLoginCell: cells.at(offset + 3),
+      signedUpCell: cells.at(offset + 4),
+      isActiveCell: cells.at(offset + 5),
+      twoFactorAuthCell: cells.at(offset + 6),
+      moreCell: cells.at(offset + 7),
+    }
+  }
+
+  getSingleRowUsernameText() {
+    const cells = this.findCells()
+    const { usernameCell } = this.getRow(cells, 0)
+    return usernameCell.text()
+  }
+
+  getUsernameInitials(usernameCell) {
+    const initials = usernameCell.get('.user-admin-username__avatar')
+    return initials.text()
+  }
+
+  usernameCellIsForStaffMember(usernameCell) {
+    return usernameCell.find('.user-admin-username__icon').exists()
+  }
+
+  getWorkspaces(workspacesCell) {
+    return workspacesCell.findAll('.expand-overflow-list__item')
+  }
+
+  workspaceCellShowsThisUserIsWorkspaceAdmin(workspaceCell) {
+    return workspaceCell.find('.user-admin-group__icon').exists()
+  }
+
+  async openFirstUserActionsMenu() {
+    await this.c.get('.data-table__more').trigger('click')
+    return this.c.findComponent(EditUserContext)
+  }
+
+  async clickDeleteUser(editUserContext) {
+    editUserContext.vm.$refs.deleteUserModal.show()
+    await flushPromises()
+  }
+
+  async clickDeactivateUser(editUserContext) {
+    await editUserContext.find('.iconoir-cancel').trigger('click')
+  }
+
+  async clickActivateUser(editUserContext) {
+    await editUserContext.find('.iconoir-check').trigger('click')
+  }
+
+  async clickEditUser(editUserContext) {
+    editUserContext.vm.$refs.editUserModal.show()
+    await flushPromises()
+  }
+
+  async clickChangeUserPassword(editUserContext) {
+    editUserContext.vm.$refs.changePasswordModal.show()
+    await flushPromises()
+  }
+
+  async attemptToChangePasswordReturningModalError(password, repeatPassword) {
+    const changePasswordModal = await this.changePassword(
+      password,
+      repeatPassword
+    )
+
+    const wrapper = changePasswordModal.findComponent(ChangePasswordForm)
+    return wrapper.vm.v$.values.$errors
+  }
+
+  getModalFieldErrorText(modal) {
+    // return modalMounted
+    //   .find('.control__messages--error')
+    //   .text()
+    //   .replace(/\n/gm, '')
+    //   .replace(/\s\s+/g, ' ')
+  }
+
+  async changePassword(password, repeatPassword) {
+    const editUserContext = await this.openFirstUserActionsMenu()
+
+    await this.clickChangeUserPassword(editUserContext)
+    await flushPromises()
+
+    const changePasswordModal = this.c.findComponent(ChangeUserPasswordModal)
+
+    const passwordInputs = changePasswordModal.findAll('input')
+
+    passwordInputs.at(0).element.value = password
+    await passwordInputs.at(0).trigger('input')
+    passwordInputs.at(1).element.value = repeatPassword
+    await passwordInputs.at(1).trigger('input')
+
+    await changePasswordModal.find('form').trigger('submit')
+
+    return changePasswordModal
+  }
+
+  getErrorText(component) {
+    return component.findComponent(Error).find('.alert__message').text()
+  }
+
+  changeFullName(newFullName, options = {}) {
+    return this.changeUserEditField(newFullName, 0, options)
+  }
+
+  async getUserEditModalEmailField() {
+    const editUserContext = await this.openFirstUserActionsMenu()
+
+    await this.clickEditUser(editUserContext)
+
+    const editUserModal = this.c.findComponent(EditUserModal)
+    const userEditInputs = editUserModal.findAll('input')
+
+    return userEditInputs.at(1)
+  }
+
+  async changeUserEditField(
+    newValue,
+    inputIndex,
+    { clickSave = true, exit = false } = {}
+  ) {
+    const editUserContext = await this.openFirstUserActionsMenu()
+
+    await this.clickEditUser(editUserContext)
+    await flushPromises()
+
+    const editUserModal = this.c.findComponent(EditUserModal)
+
+    const userEditInputs = editUserModal.findAll('input')
+
+    userEditInputs.at(inputIndex).element.value = newValue
+    await userEditInputs.at(inputIndex).trigger('input')
+
+    if (clickSave) {
+      await editUserModal.find('form').trigger('submit')
+    }
+
+    if (exit) {
+      await editUserModal.find('.modal__close').trigger('click')
+    }
+
+    return editUserModal
+  }
+
+  async changeUserCheckbox(checkboxIndex) {
+    const editUserContext = await this.openFirstUserActionsMenu()
+
+    await this.clickEditUser(editUserContext)
+    await flushPromises()
+
+    const editUserModal = this.c.findComponent(EditUserModal)
+    const userForm = editUserModal.findComponent(UserForm)
+    const checkboxInputs = userForm.findAll('input[type="checkbox"]')
+
+    const input = checkboxInputs[checkboxIndex]
+    input.element.checked = !input.element.checked
+    await input.trigger('change')
+    await flushPromises()
+
+    await editUserModal.find('form').trigger('submit')
+
+    return editUserModal
+  }
+
+  changeEmail(newEmail, options) {
+    return this.changeUserEditField(newEmail, 1, options)
+  }
+
+  toggleIsStaff() {
+    return this.changeUserCheckbox(1)
+  }
+
+  toggleIsActive() {
+    return this.changeUserCheckbox(0)
+  }
+
+  clickNextPage() {
+    return this.c.find('.iconoir-nav-arrow-right').trigger('click')
+  }
+
+  clickPrevPage() {
+    return this.c.find('.iconoir-nav-arrow-left').trigger('click')
+  }
+
+  async typeIntoSearchBox(searchText) {
+    const searchBox = this.c.findComponent(CrudTableSearch)
+    const searchInput = searchBox.find('input')
+    searchInput.element.value = searchText
+    await searchInput.trigger('input')
+    await searchInput.trigger('keyup')
+  }
+
+  clickUsernameHeader() {
+    return this.clickHeaderAt(0)
+  }
+
+  clickFullnameHeader() {
+    return this.clickHeaderAt(1)
+  }
+
+  clickHeaderAt(index) {
+    return this.c
+      .findAll('.data-table__table-cell-head-link')
+      .at(index)
+      .trigger('click')
+  }
+
+  async clickConfirmDeleteUserInModal() {
+    await flushPromises()
+    const deleteModal = this.c.findComponent(DeleteUserModal)
+    await deleteModal.vm.deleteUser()
+    await flushPromises()
+  }
+}

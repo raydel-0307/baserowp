@@ -1,0 +1,229 @@
+import rowModal from '@baserow/modules/database/store/rowModal'
+import { TestApp } from '@baserow/test/helpers/testApp'
+
+describe('rowModal store', () => {
+  let testApp = null
+  let store = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+    //store = testApp.store
+    store = testApp.createStore({
+      modules: {
+        test: {
+          ...rowModal,
+          state: () => ({
+            rows: [],
+          }),
+        },
+      },
+    })
+  })
+
+  afterEach(() => {
+    testApp.afterEach()
+  })
+
+  test('get not existing component id', () => {
+    const values = store.getters['test/get'](-1)
+    expect(values).toMatchObject({
+      id: -1,
+      tableId: -1,
+      exists: false,
+      row: {},
+    })
+  })
+
+  test('open row', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    await store.dispatch('test/open', {
+      componentId: 2,
+      tableId: 20,
+      id: 200,
+      exists: true,
+      row: { id: 200, field_2: 'Test' },
+    })
+    const valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1).toMatchObject({
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    const valuesOfComponent2 = store.getters['test/get'](2)
+    expect(valuesOfComponent2).toMatchObject({
+      tableId: 20,
+      id: 200,
+      exists: true,
+      row: { id: 200, field_2: 'Test' },
+    })
+  })
+
+  test('open rows', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    await store.dispatch('test/open', {
+      componentId: 2,
+      tableId: 20,
+      id: 200,
+      exists: true,
+      row: { id: 200, field_2: 'Test' },
+    })
+    const valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1).toMatchObject({
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    const valuesOfComponent2 = store.getters['test/get'](2)
+    expect(valuesOfComponent2).toMatchObject({
+      tableId: 20,
+      id: 200,
+      exists: true,
+      row: { id: 200, field_2: 'Test' },
+    })
+  })
+
+  test('clear row', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    await store.dispatch('test/clear', {
+      componentId: 1,
+    })
+    const valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1).toMatchObject({
+      id: -1,
+      tableId: -1,
+      exists: false,
+      row: {},
+    })
+    // Clearing a component id that doesn't exist shouldn't fail.
+    await store.dispatch('test/clear', {
+      componentId: 2,
+    })
+  })
+
+  test('row does not exist', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+    await store.dispatch('test/doesNotExist', {
+      componentId: 1,
+    })
+    const valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.exists).toBe(false)
+  })
+
+  test('row exists', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: false,
+      row: { id: 100, field_1: 'Test' },
+    })
+    const row = { id: 100, field_1: 'Test' }
+    await store.dispatch('test/doesExist', {
+      componentId: 1,
+      row,
+    })
+    // Changing this row object should be reflected in the row in the store because
+    // it's the same object.
+    row.field_1 = 'Test 2'
+    const valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.row.field_1).toBe('Test 2')
+  })
+
+  test('rows exist', async () => {
+    await store.dispatch('test/open', {
+      componentId: 1,
+      tableId: 10,
+      id: 100,
+      exists: true,
+      row: { id: 100, field_1: 'Test' },
+    })
+
+    // Even while `exists` is true, the cached row is updated. A realtime event can
+    // remove the row from the grid buffer before the modal watcher has flipped this
+    // flag, and the modal must not miss that transition update.
+    await store.dispatch('test/updated', {
+      tableId: 10,
+      values: { id: 100, field_1: 'Test 2' },
+    })
+    let valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.row.field_1).toBe('Test 2')
+
+    // When `exists` is false, follow-up realtime updates keep updating the row.
+    await store.dispatch('test/doesNotExist', { componentId: 1 })
+    await store.dispatch('test/updated', {
+      tableId: 10,
+      values: { id: 100, field_1: 'Test 3' },
+    })
+    valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.row.field_1).toBe('Test 3')
+
+    // Because the table id doesn't match, we don't expect the value to be updated.
+    await store.dispatch('test/updated', {
+      tableId: 11,
+      values: { id: 100, field_1: 'Test 4' },
+    })
+    valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.row.field_1).toBe('Test 3')
+
+    // Because the row id doesn't match, we don't expect the value to be updated.
+    await store.dispatch('test/updated', {
+      tableId: 10,
+      values: { id: 101, field_1: 'Test 5' },
+    })
+    valuesOfComponent1 = store.getters['test/get'](1)
+    expect(valuesOfComponent1.row.field_1).toBe('Test 3')
+  })
+
+  test('rows hidden by the backend', async () => {
+    const open = (componentId, tableId, id) =>
+      store.dispatch('test/open', {
+        componentId,
+        tableId,
+        id,
+        exists: true,
+        row: { id },
+      })
+    await open(1, 10, 100)
+    await open(2, 10, 101)
+    await open(3, 11, 100)
+
+    await store.dispatch('test/rowsHiddenByBackend', {
+      tableId: 10,
+      rowIds: [100],
+    })
+
+    expect(store.getters['test/get'](1).hiddenByBackend).toBe(true)
+    expect(store.getters['test/get'](2).hiddenByBackend).toBeUndefined()
+    expect(store.getters['test/get'](3).hiddenByBackend).toBeUndefined()
+
+    // Opening another row in the same modal starts without the flag.
+    await open(1, 10, 101)
+    expect(store.getters['test/get'](1).hiddenByBackend).toBeUndefined()
+  })
+})

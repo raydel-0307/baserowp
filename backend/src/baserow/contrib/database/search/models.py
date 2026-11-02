@@ -1,0 +1,131 @@
+from django.contrib.postgres.indexes import GinIndex
+from django.contrib.postgres.search import SearchVectorField
+from django.db import models
+
+from django_cte import CTEManager
+
+
+class PendingSearchValueUpdateTrashManager(CTEManager):
+    def get_queryset(self):
+        return super().get_queryset().filter(models.Q(deletion_workspace_id=None))
+
+
+class AbstractPendingSearchDataUpdate(models.Model):
+    """
+    The queue of a search data updater, with the cells of which the search data must
+    be updated.
+    """
+
+    id = models.BigAutoField(
+        auto_created=True,
+        primary_key=True,
+        serialize=False,
+        verbose_name="ID",
+    )
+    field_id = models.IntegerField(
+        help_text="The ID of the field to update.",
+    )
+    row_id = models.IntegerField(
+        null=True,
+        help_text="The ID of the row to update. If null, all table rows will be updated.",
+    )
+    updated_on = models.DateTimeField(
+        auto_now=True,
+        db_default=models.functions.Now(),
+        help_text="The time this update was last modified.",
+    )
+
+    class Meta:
+        abstract = True
+        # Avoid duplicate entries for the same field and row.
+        unique_together = [("field_id", "row_id")]
+
+
+class PendingSearchValueUpdate(AbstractPendingSearchDataUpdate):
+    """
+    A table to collect pending updates for TSVector values.
+    """
+
+    deletion_workspace_id = models.IntegerField(
+        null=True,
+        help_text=(
+            "The workspace ID used to mark this pending update for deletion "
+            "once its associated table, field or row is permanently removed."
+        ),
+    )
+
+    objects = PendingSearchValueUpdateTrashManager()
+    objects_and_trash = CTEManager()
+
+    class Meta(AbstractPendingSearchDataUpdate.Meta):
+        indexes = [
+            # Speed up deletion of pending updates
+            models.Index(
+                fields=["deletion_workspace_id", "field_id", "row_id"],
+                name="pendingsearchvaluedeletion_idx",
+                condition=models.Q(deletion_workspace_id__isnull=False),
+            ),
+            models.Index(
+                name="pendingsearchvaluedeletion_ord",
+                fields=["-updated_on"],
+            ),
+        ]
+
+
+class AbstractSearchValue(models.Model):
+    """
+    Abstract base model for a table containing TSVector search data,
+    keyed by (row_id, field_id) and holding the TSVector in `value`.
+    """
+
+    id = models.BigAutoField(
+        auto_created=True,
+        primary_key=True,
+        serialize=False,
+        verbose_name="ID",
+    )
+    row_id = models.IntegerField(
+        help_text="The ID of the row this value belongs to.",
+    )
+    field_id = models.IntegerField(
+        help_text="The ID of the field this value belongs to."
+    )
+    updated_on = models.DateTimeField(
+        help_text="The time this value was last updated.",
+    )
+    value = SearchVectorField(
+        help_text="The full-text search vector value to index and use for searching."
+    )
+    objects = CTEManager()
+
+    class Meta:
+        abstract = True
+
+
+def get_search_indexes(workspace_id: int) -> list[models.Index]:
+    """
+    Build Indexes with names related to a table
+    """
+
+    indexes = [
+        GinIndex(
+            fields=("value",),
+            name=f"database_workspace_{workspace_id}_value_tsv_idx",
+        )
+    ]
+    return indexes
+
+
+def get_search_constraints(workspace_id: int) -> list[models.UniqueConstraint]:
+    """
+    Build constraints with names related to a workspace. The name Django generates
+    for `unique_together` is truncated to the same prefix and an 8-character hash
+    for most workspace ids, which isn't unique enough across all workspaces.
+    """
+
+    return [
+        models.UniqueConstraint(
+            fields=("field_id", "row_id"),
+            name=f"database_workspace_{workspace_id}_field_row_uniq",
+        )
+    ]

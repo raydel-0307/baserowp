@@ -1,0 +1,265 @@
+<template>
+  <div>
+    <CrudTable
+      ref="crudTable"
+      class="management-table"
+      v-bind="tableLayout"
+      :service="service"
+      :columns="columns"
+      row-id-key="id"
+      :search-placeholder="$t('teamsTable.search')"
+      :row-expandable="rowExpansion.isExpandable"
+      :expand-column-key="rowExpansion.columnKey"
+      @row-context="onRowContext"
+      @edit-role-context="onEditRoleContext"
+    >
+      <template #row-expansion-toggle="{ row }">
+        {{ rowExpansion.getToggleLabel(row) }}
+      </template>
+      <template #expanded-row="slotProps">
+        <component
+          :is="rowExpansion.component"
+          v-bind="{ ...slotProps, ...rowExpansion.getProps(slotProps.row) }"
+          :workspace="workspace"
+        />
+      </template>
+      <template #title="{ count }">
+        {{
+          $t('teamsTable.title', {
+            teamCount: count,
+            workspaceName: workspace.name,
+          })
+        }}
+      </template>
+      <template #empty>
+        <div class="placeholder">
+          <div class="placeholder__icon">
+            <i class="baserow-icon-team" aria-hidden="true"></i>
+          </div>
+          <h2 class="placeholder__header">
+            {{ $t('teamsTable.emptyTitle') }}
+          </h2>
+          <p class="placeholder__content">
+            {{ $t('teamsTable.emptyDescription') }}
+          </p>
+        </div>
+      </template>
+      <template #primary-action>
+        <Button
+          v-if="
+            $hasPermission(
+              'enterprise.teams.create_team',
+              workspace,
+              workspace.id
+            )
+          "
+          type="primary"
+          size="large"
+          icon="iconoir-plus"
+          @click="$refs.createModal.show()"
+        >
+          {{ $t('teamsTable.createNew') }}
+        </Button>
+      </template>
+      <template #menus="slotProps">
+        <EditTeamContext
+          ref="editTeamContext"
+          :workspace="workspace"
+          :team="focusedTeam"
+          @edit="handleEditTeam"
+          @deleted="slotProps.deleteRow"
+        ></EditTeamContext>
+      </template>
+    </CrudTable>
+    <CreateTeamModal
+      ref="createModal"
+      :workspace="workspace"
+      @created="teamCreated"
+    ></CreateTeamModal>
+    <UpdateTeamModal
+      v-if="focusedTeam"
+      ref="updateModal"
+      :workspace="workspace"
+      :team="focusedTeam"
+      @updated="teamUpdated"
+    ></UpdateTeamModal>
+  </div>
+</template>
+
+<script>
+import { getManagementTableLayout } from '@baserow/modules/core/utils/managementTable'
+import CreateTeamModal from '@baserow_enterprise/components/teams/CreateTeamModal'
+import UpdateTeamModal from '@baserow_enterprise/components/teams/UpdateTeamModal'
+import TeamRoleField from '@baserow_enterprise/components/crudTable/fields/TeamRoleField'
+import SubjectSampleField from '@baserow_enterprise/components/crudTable/fields/SubjectSampleField'
+import CrudTable from '@baserow/modules/core/components/crudTable/CrudTable'
+import TeamService from '@baserow_enterprise/services/team'
+import { mapGetters } from 'vuex'
+import ManagementNameField from '@baserow/modules/core/components/settings/ManagementNameField'
+import CrudTableColumn from '@baserow/modules/core/crudTable/crudTableColumn'
+import MoreField from '@baserow/modules/core/components/crudTable/fields/MoreField'
+import EditTeamContext from '@baserow_enterprise/components/teams/EditTeamContext'
+import { getSubjectRoleAssignmentsRowExpansion } from '@baserow_enterprise/utils/subjectRoleAssignments'
+
+export default {
+  name: 'TeamsTable',
+  components: {
+    CrudTable,
+    EditTeamContext,
+    CreateTeamModal,
+    UpdateTeamModal,
+  },
+  props: {
+    workspace: {
+      type: Object,
+      required: true,
+    },
+  },
+  data() {
+    return {
+      focusedTeam: {},
+      editRoleTeam: {},
+    }
+  },
+  computed: {
+    tableLayout() {
+      const layout = getManagementTableLayout(this.columns, 'default_role')
+      layout.columnWidths.name = '40%'
+      layout.columnWidths.default_role = 'auto'
+      layout.columnWidths.subject_sample = '120px'
+      return layout
+    },
+    rowExpansion() {
+      return getSubjectRoleAssignmentsRowExpansion({
+        subjectType: 'baserow_enterprise.Team',
+        columnKey: 'default_role',
+      })
+    },
+    ...mapGetters({ userId: 'auth/getUserId' }),
+    service() {
+      const service = TeamService(this.$client)
+      const options = {
+        ...service.options,
+        urlParams: { workspaceId: this.workspace.id },
+      }
+      return {
+        ...service,
+        options,
+      }
+    },
+    roles() {
+      return this.workspace._.roles
+    },
+    canViewEditTeamContext() {
+      return (
+        this.$hasPermission(
+          'enterprise.teams.team.update',
+          this.workspace,
+          this.workspace.id
+        ) ||
+        this.$hasPermission(
+          'enterprise.teams.team.delete',
+          this.workspace,
+          this.workspace.id
+        )
+      )
+    },
+    columns() {
+      const teamSubjectType = this.$registry.get(
+        'subject',
+        'baserow_enterprise.Team'
+      )
+      const columns = [
+        new CrudTableColumn(
+          'name',
+          this.$t('teamsTable.nameColumn'),
+          ManagementNameField,
+          true,
+          true,
+          false,
+          {
+            avatarComponent: teamSubjectType.avatarComponent,
+          }
+        ),
+        new CrudTableColumn(
+          'default_role',
+          this.$t('teamsTable.roleColumn'),
+          TeamRoleField,
+          true,
+          false,
+          false,
+          {
+            roles: this.roles,
+            workspaceId: this.workspace.id,
+            scopeType: 'workspace',
+          },
+          '',
+          this.$t('teamsTable.roleHelpText')
+        ),
+        new CrudTableColumn(
+          'subject_sample',
+          this.$t('teamsTable.subjectsColumn'),
+          SubjectSampleField,
+          true
+        ),
+      ]
+
+      // If the user can update or delete teams, then they get an extra column for the context.
+      const canUpdate = this.$hasPermission(
+        'enterprise.teams.team.update',
+        this.workspace,
+        this.workspace.id
+      )
+      const canDelete = this.$hasPermission(
+        'enterprise.teams.team.delete',
+        this.workspace,
+        this.workspace.id
+      )
+      if (canUpdate || canDelete) {
+        columns.push(
+          new CrudTableColumn(null, null, MoreField, false, false, true)
+        )
+      }
+
+      return columns
+    },
+  },
+  methods: {
+    handleEditTeam(team) {
+      this.focusedTeam = team
+      this.$refs.updateModal.show()
+    },
+    onRowContext({ row, event, target }) {
+      if (!this.canViewEditTeamContext) {
+        // The user needs to have update or delete team
+        // permissions to launch the row context.
+        return
+      }
+      event.preventDefault()
+      let horizontal = 'right'
+      if (target === undefined) {
+        target = {
+          left: event.clientX,
+          top: event.clientY,
+        }
+        horizontal = 'left'
+      }
+
+      const action = row.id === this.focusedTeam.id ? 'toggle' : 'show'
+      this.focusedTeam = row
+      this.$refs.editTeamContext[action](target, 'bottom', horizontal, 4)
+    },
+    onEditRoleContext({ row, target }) {
+      const action = row.id === this.editRoleTeam.id ? 'toggle' : 'show'
+      this.editRoleTeam = row
+      this.$refs.editRoleContext[action](target, 'bottom', 'left', 4)
+    },
+    teamCreated(data) {
+      this.$refs.crudTable.rows.push(data)
+    },
+    teamUpdated(data) {
+      this.$refs.crudTable.updateRow(data)
+    },
+  },
+}
+</script>

@@ -1,0 +1,389 @@
+<template>
+  <header class="layout__col-2-1 header header--space-between">
+    <SkeletonBlock
+      v-if="loading"
+      class="header__loading"
+      width="140px"
+      height="12px"
+    ></SkeletonBlock>
+    <ul
+      v-else-if="
+        $hasPermission(
+          'application.update',
+          automation,
+          automation.workspace.id
+        )
+      "
+      class="header__filter"
+    >
+      <li class="header__filter-item">
+        <a
+          data-item-type="settings"
+          class="header__filter-link"
+          @click="openSettingsModal"
+          ><i class="header__filter-icon iconoir-settings"></i>
+          <span class="header__filter-name"
+            >{{ $t('automationHeader.settingsBtn') }}
+          </span>
+        </a>
+      </li>
+      <li class="header__filter-item">
+        <a
+          data-item-type="history"
+          data-highlight="automation-history"
+          class="header__filter-link"
+          :class="{ 'active--primary': activeSidePanel === 'history' }"
+          @click="historyClick()"
+          ><i class="header__filter-icon baserow-icon-history"></i>
+          <span class="header__filter-name">{{
+            $t('automationHeader.historyBtn')
+          }}</span>
+        </a>
+      </li>
+      <li class="header__filter-item">
+        <a
+          data-highlight="automation-docs"
+          class="header__filter-link"
+          target="_blank"
+          href="https://baserow.io/user-docs/workflow-automation"
+          ><i class="header__filter-icon iconoir-help-circle"></i>
+          <span class="header__filter-name">{{
+            $t('automationHeader.docsBtn')
+          }}</span>
+        </a>
+      </li>
+      <li v-if="isDev" class="header__filter-item">
+        <a
+          data-item-type="debug"
+          class="header__filter-link"
+          :class="{
+            'active active--purple': debug,
+          }"
+          @click="debugClick()"
+          ><i class="header__filter-icon iconoir-hammer"></i>
+          <span class="header__filter-name">{{
+            debug ? 'Debug off' : 'Debug on'
+          }}</span>
+        </a>
+      </li>
+      <li
+        v-for="(component, index) in automationHeaderComponents"
+        :key="index"
+        class="header__filter-item"
+      >
+        <component :is="component" :workspace="automation.workspace" />
+      </li>
+    </ul>
+
+    <ApplicationUntrustedContentAlert
+      v-if="!loading"
+      :key="workflow?.id"
+      :content-owner="workflow"
+      :can-trust="
+        Boolean(
+          workflow &&
+          $hasPermission(
+            'automation.workflow.update',
+            workflow,
+            automation.workspace.id
+          )
+        )
+      "
+      :trust-content="trustContent"
+      :message="$t('automationHeader.untrustedContentWarning')"
+    />
+
+    <div
+      v-if="
+        !loading &&
+        $hasPermission(
+          'application.update',
+          automation,
+          automation.workspace.id
+        )
+      "
+      class="header__right"
+    >
+      <span class="header__switch-container">
+        <template v-if="!publishedOn">
+          <Badge color="cyan" rounded size="small">{{
+            $t('automationHeader.switchLabelDraft')
+          }}</Badge>
+        </template>
+        <template v-else>
+          <Badge v-if="isDisabled" color="red" rounded size="small">{{
+            $t('automationHeader.switchLabelDisabled')
+          }}</Badge>
+          <Badge v-else-if="isPaused" color="red" rounded size="small">{{
+            $t('automationHeader.switchLabelPaused')
+          }}</Badge>
+          <Badge v-else color="green" rounded size="small">{{
+            $t('automationHeader.switchLabelLive')
+          }}</Badge>
+        </template>
+        <SwitchInput
+          small
+          data-highlight="automation-workflow-state"
+          :value="statusSwitch"
+          :disabled="isDisabled || !publishedOn"
+          @input="toggleStatusSwitch"
+        ></SwitchInput>
+      </span>
+
+      <div class="header__buttons header__buttons--with-separator">
+        <ClientOnly>
+          <div v-if="publishedOn" class="automation-header__last-published">
+            {{ $t('automationHeader.lastPublished') }}: {{ publishedOn }}
+          </div>
+        </ClientOnly>
+        <Button
+          :icon="testRunEnabled ? 'iconoir-cancel' : 'iconoir-play'"
+          type="secondary"
+          data-highlight="automation-test-run"
+          :disabled="testRunDisabled"
+          @click="toggleTestRun"
+          >{{
+            testRunEnabled
+              ? $t('automationHeader.stopTestRun')
+              : $t('automationHeader.startTestRun')
+          }}
+        </Button>
+        <Button
+          v-tooltip:[publishTooltipOptions]="
+            workflow?.untrusted_content
+              ? $t('untrustedContentReviewModal.publishBlocked')
+              : null
+          "
+          tooltip-position="bottom-left"
+          data-highlight="automation-publish"
+          :loading="isPublishing"
+          :disabled="isPublishing || !canPublishWorkflow"
+          @click="publishWorkflow()"
+        >
+          {{ $t('automationHeader.publishBtn') }}
+        </Button>
+      </div>
+    </div>
+    <WorkflowSettingsModal
+      ref="workflowSettingsModal"
+      :automation="automation"
+      :workflow="workflow"
+    />
+  </header>
+</template>
+
+<script>
+import { useStore } from 'vuex'
+import ApplicationUntrustedContentAlert from '@baserow/modules/core/components/application/ApplicationUntrustedContentAlert'
+import moment from '@baserow/modules/core/moment'
+import { getUserTimeZone } from '@baserow/modules/core/utils/date'
+import { defineComponent, ref, computed, inject } from 'vue'
+import { HistoryEditorSidePanelType } from '@baserow/modules/automation/editorSidePanelTypes'
+import { notifyIf } from '@baserow/modules/core/utils/error'
+import { WORKFLOW_STATES } from '@baserow/modules/automation/components/enums'
+
+import NodeGraphHandler from '@baserow/modules/automation/utils/nodeGraphHandler'
+import WorkflowSettingsModal from '@baserow/modules/automation/components/settings/WorkflowSettingsModal'
+
+export default defineComponent({
+  name: 'AutomationHeader',
+  components: { WorkflowSettingsModal, ApplicationUntrustedContentAlert },
+  props: {
+    automation: {
+      type: Object,
+      required: true,
+    },
+    loading: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+  },
+  emits: ['debug-toggled'],
+  setup(props, { emit }) {
+    const store = useStore()
+    const app = useNuxtApp()
+    const isDev = inject('isDev')
+    const workflow = inject('workflow')
+    const workspace = inject('workspace')
+
+    const debug = ref(false)
+    const isPublishing = ref(false)
+
+    const testRunDisabled = computed(() => {
+      if (!workflow.value?.graph) {
+        return true
+      }
+      return !new NodeGraphHandler(workflow.value).hasNodes()
+    })
+
+    const testRunEnabled = computed(() => {
+      return (
+        moment(workflow.value?.allow_test_run_until).isAfter() ||
+        Number.isInteger(workflow.value?.simulate_until_node_id)
+      )
+    })
+
+    const hasActionNode = computed(() => {
+      if (!workflow.value?.nodes) {
+        return false
+      }
+
+      const _nodes = workflow.value.nodes.filter((node) => {
+        const nodeType = app.$registry.get('node', node.type)
+        const isInError = nodeType.isInError({
+          workflow: workflow.value,
+          service: node.service,
+          workspace: workspace.value,
+          application: props.automation,
+        })
+        return nodeType.isWorkflowAction === true && !isInError
+      })
+
+      return _nodes.length > 0
+    })
+
+    const canPublishWorkflow = computed(() => {
+      return (
+        hasActionNode.value &&
+        !isPublishing.value &&
+        !workflow.value?.untrusted_content
+      )
+    })
+
+    const publishedOn = computed(() => {
+      if (!workflow.value?.published_on || isPublishing.value) {
+        return null
+      }
+
+      return moment
+        .utc(workflow.value.published_on)
+        .tz(getUserTimeZone())
+        .format('MMM D, YYYY HH:mm:ss')
+    })
+
+    const statusSwitch = computed(() => {
+      return workflow.value?.state === WORKFLOW_STATES.LIVE
+    })
+
+    const isPaused = computed(() => {
+      return (
+        publishedOn.value && workflow.value?.state === WORKFLOW_STATES.PAUSED
+      )
+    })
+
+    const isDisabled = computed(() => {
+      return workflow.value?.state === WORKFLOW_STATES.DISABLED
+    })
+
+    const activeSidePanel = computed(() => {
+      return store.getters['automationWorkflow/getActiveSidePanel']
+    })
+
+    const automationHeaderComponents = computed(() => {
+      return Object.values(app.$registry.getAll('plugin')).reduce(
+        (components, plugin) =>
+          components.concat(
+            plugin.getAutomationHeaderComponents(props.automation.workspace)
+          ),
+        []
+      )
+    })
+
+    const toggleTestRun = async () => {
+      try {
+        await store.dispatch('automationWorkflow/testRun', {
+          workflow: workflow.value,
+        })
+      } catch (error) {
+        notifyIf(error, 'automationWorkflow')
+      }
+    }
+
+    const toggleStatusSwitch = async () => {
+      const newValue =
+        workflow.value.state === WORKFLOW_STATES.PAUSED
+          ? WORKFLOW_STATES.LIVE
+          : WORKFLOW_STATES.PAUSED
+
+      try {
+        await store.dispatch('automationWorkflow/update', {
+          automation: props.automation,
+          workflow: workflow.value,
+          values: {
+            state: newValue,
+          },
+        })
+      } catch (error) {
+        notifyIf(error, 'automationWorkflow')
+      }
+    }
+
+    const historyClick = () => {
+      let sidePanelType = HistoryEditorSidePanelType.getType()
+
+      // Clicking the History button should toggle the active state
+      if (activeSidePanel.value === sidePanelType) {
+        sidePanelType = null
+      }
+
+      store.dispatch('automationWorkflow/setActiveSidePanel', sidePanelType)
+    }
+
+    const debugClick = () => {
+      debug.value = !debug.value
+      emit('debug-toggled', debug.value)
+    }
+
+    const publishWorkflow = async () => {
+      isPublishing.value = true
+
+      try {
+        await store.dispatch('automationWorkflow/publishWorkflow', {
+          workflow: workflow.value,
+        })
+      } catch (error) {
+        notifyIf(error, 'automationWorkflow')
+      }
+      isPublishing.value = false
+    }
+
+    const trustContent = () =>
+      store.dispatch('automationWorkflow/update', {
+        automation: props.automation,
+        workflow: workflow.value,
+        values: { untrusted_content: false },
+      })
+
+    const workflowSettingsModal = ref(null)
+    const openSettingsModal = () => {
+      workflowSettingsModal.value.show()
+    }
+
+    return {
+      publishTooltipOptions: { contentClasses: 'tooltip__content--expandable' },
+      trustContent,
+      isDev,
+      debug,
+      workflow,
+      statusSwitch,
+      debugClick,
+      historyClick,
+      toggleTestRun,
+      testRunEnabled,
+      publishWorkflow,
+      toggleStatusSwitch,
+      canPublishWorkflow,
+      publishedOn,
+      isPublishing,
+      isPaused,
+      isDisabled,
+      activeSidePanel,
+      testRunDisabled,
+      openSettingsModal,
+      workflowSettingsModal,
+      automationHeaderComponents,
+    }
+  },
+})
+</script>

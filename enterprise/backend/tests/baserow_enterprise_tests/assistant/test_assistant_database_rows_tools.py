@@ -1,0 +1,953 @@
+import json
+
+import pytest
+from pydantic import ValidationError
+from pydantic_ai import ModelRetry
+
+from baserow.contrib.database.fields.handler import FieldHandler
+from baserow.contrib.database.rows.handler import RowHandler
+from baserow.core.exceptions import PermissionDenied
+from baserow_enterprise.assistant.agents import dynamic_tool_catalog, dynamic_toolset
+from baserow_enterprise.assistant.deps import AgentMode
+from baserow_enterprise.assistant.tools.database import tools as database_tools
+from baserow_enterprise.assistant.tools.database.tools import (
+    create_fields,
+    delete_fields,
+    list_rows,
+    load_row_tools,
+    update_fields,
+)
+from baserow_enterprise.assistant.tools.database.types import (
+    FieldItemCreate,
+    FieldItemUpdate,
+)
+
+from .utils import make_test_ctx
+
+
+@pytest.mark.django_db
+def test_create_rows_rejects_empty_payload_and_accepts_corrected_call(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    name_field = data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+    tool = ctx.deps.dynamic_tools[0]
+    model = table.get_model()
+
+    with pytest.raises(ModelRetry, match="Nothing was changed"):
+        tool.function(rows=[], thought="Create rows")
+
+    assert model.objects.count() == 0
+
+    arguments = tool.function_schema.validator.validate_python(
+        {"rows": [{"Name": "Created after retry"}], "thought": "Create the row"}
+    )
+    result = tool.function(**arguments)
+
+    assert list(model.objects.values_list("id", name_field.db_column)) == [
+        (result["created_row_ids"][0], "Created after retry")
+    ]
+
+
+@pytest.mark.django_db
+def test_create_rows_reports_the_running_total_across_batches(data_fixture):
+    """A requested row count spans batches; the model needs the running total."""
+
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+    tool = ctx.deps.dynamic_tools[0]
+
+    def create(count):
+        arguments = tool.function_schema.validator.validate_python(
+            {"rows": [{"Name": f"Row {i}"} for i in range(count)], "thought": "Add"}
+        )
+        return tool.function(**arguments)
+
+    assert create(2)["total_rows_created"] == 2
+    with pytest.raises(ModelRetry, match="Nothing was changed"):
+        create(0)
+    assert create(3)["total_rows_created"] == 5
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "refresh", ["create_field", "update_field", "delete_field", "reload"]
+)
+def test_create_rows_preserves_running_total_when_tools_are_refreshed(
+    data_fixture, refresh
+):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    notes = data_fixture.create_text_field(table=table, name="Notes")
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+
+    row_values = {"Notes": ""}
+
+    def create(count):
+        tool = ctx.deps.dynamic_tools[0]
+        arguments = tool.function_schema.validator.validate_python(
+            {
+                "rows": [{"Name": f"Row {i}", **row_values} for i in range(count)],
+                "thought": "Add",
+            }
+        )
+        return tool.function(**arguments)
+
+    assert create(20)["total_rows_created"] == 20
+    original_tool = ctx.deps.dynamic_tools[0]
+    if refresh == "create_field":
+        create_fields(
+            ctx,
+            table_id=table.id,
+            fields=[FieldItemCreate(name="Status", type="text")],
+            thought="Add a status field",
+        )
+        row_values["Status"] = "Reviewed"
+    elif refresh == "update_field":
+        update_fields(
+            ctx,
+            fields=[FieldItemUpdate(field_id=notes.id, name="Details")],
+            thought="Rename notes",
+        )
+        row_values = {"Details": ""}
+    elif refresh == "delete_field":
+        delete_fields(ctx, field_ids=[notes.id], thought="Drop notes")
+        row_values = {}
+    else:
+        load_row_tools(ctx, [table.id], ["create"], thought="Reload row creation")
+
+    assert ctx.deps.dynamic_tools[0] is not original_tool
+    result = create(10)
+
+    assert table.get_model().objects.count() == 30
+    assert result["total_rows_created"] == 30
+
+
+@pytest.mark.django_db
+def test_create_rows_running_totals_are_scoped_to_table_and_run(data_fixture):
+    user = data_fixture.create_user()
+    database = data_fixture.create_database_application(user=user)
+    tables = [
+        data_fixture.create_database_table(user=user, database=database)
+        for _ in range(2)
+    ]
+    for table in tables:
+        data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, database.workspace)
+    load_row_tools(ctx, [table.id for table in tables], ["create"], thought="Prepare")
+
+    def create(ctx, table, count):
+        tool = dynamic_toolset(ctx).tools[f"create_rows_in_table_{table.id}"]
+        arguments = tool.function_schema.validator.validate_python(
+            {"rows": [{"Name": f"Row {i}"} for i in range(count)], "thought": "Add"}
+        )
+        return tool.function(**arguments)
+
+    assert create(ctx, tables[0], 2)["total_rows_created"] == 2
+    assert create(ctx, tables[1], 3)["total_rows_created"] == 3
+    create_fields(
+        ctx,
+        table_id=tables[1].id,
+        fields=[FieldItemCreate(name="Notes", type="text")],
+        thought="Change another table's schema",
+    )
+    assert create(ctx, tables[0], 1)["total_rows_created"] == 3
+
+    next_ctx = make_test_ctx(user, database.workspace)
+    load_row_tools(next_ctx, [tables[0].id], ["create"], thought="Prepare next run")
+
+    assert create(next_ctx, tables[0], 4)["total_rows_created"] == 4
+    assert tables[0].get_model().objects.count() == 7
+    assert tables[1].get_model().objects.count() == 3
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("mode", [AgentMode.APPLICATION, AgentMode.AUTOMATION])
+def test_loaded_row_tools_stay_available_after_a_mode_switch(data_fixture, mode):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    ctx.deps.tool_catalog = "- database: list_tables"
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+
+    ctx.deps.mode = mode
+
+    assert f"create_rows_in_table_{table.id}" in dynamic_toolset(ctx).tools
+    assert f"create_rows_in_table_{table.id}" in dynamic_tool_catalog(ctx)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["create", "update"])
+@pytest.mark.parametrize("multiple", [False, True])
+def test_invalid_link_values_do_not_silently_clear_relationships(
+    data_fixture, operation, multiple
+):
+    user = data_fixture.create_user()
+    table, linked_table, link = data_fixture.create_two_linked_tables(user=user)
+    link.link_row_multiple_relationships = multiple
+    link.save()
+    primary = table.get_primary_field()
+    linked_primary = linked_table.get_primary_field()
+    linked_row = RowHandler().create_row(
+        user, linked_table, {linked_primary.db_column: "Existing category"}
+    )
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], [operation], thought="Prepare rows")
+    tool = ctx.deps.dynamic_tools[0]
+    model = table.get_model()
+    valid_link = [linked_row.id] if multiple else linked_row.id
+    invalid_link = (
+        [linked_row.id, "Unknown category"] if multiple else "Unknown category"
+    )
+    rows = [
+        {primary.name: "First", link.name: valid_link},
+        {primary.name: "Second", link.name: invalid_link},
+    ]
+    original_rows = []
+    if operation == "update":
+        for i, values in enumerate(rows):
+            row = RowHandler().create_row(
+                user,
+                table,
+                {primary.db_column: f"Original {i}", link.db_column: [linked_row.id]},
+            )
+            values["id"] = row.id
+            original_rows.append(row)
+
+    arguments = tool.function_schema.validator.validate_python(
+        {"rows": rows, "thought": "Write the rows"}
+    )
+    with pytest.raises(ModelRetry, match="Unknown category"):
+        tool.function(**arguments)
+
+    assert model.objects.count() == len(original_rows)
+    for i, row in enumerate(original_rows):
+        row.refresh_from_db()
+        assert getattr(row, primary.db_column) == f"Original {i}"
+        assert list(getattr(row, link.db_column).values_list("id", flat=True)) == [
+            linked_row.id
+        ]
+
+    rows[1][link.name] = ["Existing category"] if multiple else "Existing category"
+    arguments = tool.function_schema.validator.validate_python(
+        {"rows": rows, "thought": "Use existing linked rows"}
+    )
+    result = tool.function(**arguments)
+    row_ids = result[f"{operation}d_row_ids"]
+    assert len(row_ids) == 2
+    if operation == "create":
+        assert result["total_rows_created"] == 2
+    for row in model.objects.filter(id__in=row_ids):
+        assert list(getattr(row, link.db_column).values_list("id", flat=True)) == [
+            linked_row.id
+        ]
+
+
+@pytest.mark.django_db
+def test_reload_row_tools_uses_new_schema_without_duplicate_tools(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create", "delete"], thought="Prepare rows")
+    old_create, delete = ctx.deps.dynamic_tools
+    arguments = {
+        "rows": [{"Name": "Batch 46", "Status": "Reviewed"}],
+        "thought": "Create a row with its status",
+    }
+
+    with pytest.raises(ValidationError, match="Status"):
+        old_create.function_schema.validator.validate_python(arguments)
+
+    create_fields(
+        ctx,
+        table_id=table.id,
+        fields=[FieldItemCreate(name="Status", type="text")],
+        thought="Add a status field",
+    )
+    load_row_tools(ctx, [table.id], ["create"], thought="Refresh row creation")
+    toolset = dynamic_toolset(ctx)
+    create = toolset.tools[f"create_rows_in_table_{table.id}"]
+
+    assert len(toolset.tools) == 2
+    assert toolset.tools[delete.name] is delete
+    assert create is not old_create
+    result = create.function(
+        **create.function_schema.validator.validate_python(arguments)
+    )
+
+    status_field = table.field_set.get(name="Status")
+    assert list(
+        table.get_model().objects.values_list("id", status_field.db_column)
+    ) == [(result["created_row_ids"][0], "Reviewed")]
+
+
+@pytest.mark.django_db
+def test_create_fields_refreshes_loaded_row_tools(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create", "delete"], thought="Prepare rows")
+    stale_create, delete = ctx.deps.dynamic_tools
+
+    create_fields(
+        ctx,
+        table_id=table.id,
+        fields=[FieldItemCreate(name="Status", type="text")],
+        thought="Add a status field",
+    )
+
+    create, unchanged_delete = ctx.deps.dynamic_tools
+    assert create is not stale_create
+    assert unchanged_delete is delete
+    result = create.function(
+        **create.function_schema.validator.validate_python(
+            {
+                "rows": [{"Name": "Batch 46", "Status": "Reviewed"}],
+                "thought": "Create a row with its status",
+            }
+        )
+    )
+
+    status_field = table.field_set.get(name="Status")
+    assert list(
+        table.get_model().objects.values_list("id", status_field.db_column)
+    ) == [(result["created_row_ids"][0], "Reviewed")]
+
+
+@pytest.mark.django_db
+def test_update_fields_refreshes_loaded_row_tools(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    field = data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["update"], thought="Prepare updates")
+
+    update_fields(
+        ctx,
+        fields=[FieldItemUpdate(field_id=field.id, name="Title")],
+        thought="Rename the field",
+    )
+
+    update = ctx.deps.dynamic_tools[0]
+    with pytest.raises(ValidationError, match="Name"):
+        update.function_schema.validator.validate_python(
+            {"rows": [{"id": 1, "Name": "Renamed"}], "thought": "Update the row"}
+        )
+    assert update.function_schema.validator.validate_python(
+        {"rows": [{"id": 1, "Title": "Renamed"}], "thought": "Update the row"}
+    )
+
+
+@pytest.mark.django_db
+def test_delete_fields_refreshes_loaded_row_tools(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    notes = data_fixture.create_long_text_field(table=table, name="Notes")
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare rows")
+
+    delete_fields(ctx, field_ids=[notes.id], thought="Drop the notes field")
+
+    create = ctx.deps.dynamic_tools[0]
+    with pytest.raises(ValidationError, match="Notes"):
+        create.function_schema.validator.validate_python(
+            {
+                "rows": [{"Name": "Batch 46", "Notes": "Gone"}],
+                "thought": "Create a row",
+            }
+        )
+
+
+@pytest.mark.django_db
+def test_create_fields_refreshes_row_tools_of_the_linked_table(data_fixture):
+    user = data_fixture.create_user()
+    database = data_fixture.create_database_application(user=user)
+    table_a = data_fixture.create_database_table(user=user, database=database)
+    table_b = data_fixture.create_database_table(user=user, database=database)
+    data_fixture.create_text_field(table=table_a, name="Name", primary=True)
+    data_fixture.create_text_field(table=table_b, name="Title", primary=True)
+    ctx = make_test_ctx(user, database.workspace)
+    load_row_tools(ctx, [table_b.id], ["create"], thought="Prepare rows in B")
+
+    create_fields(
+        ctx,
+        table_id=table_a.id,
+        fields=[
+            FieldItemCreate(name="B rows", type="link_row", linked_table=table_b.id)
+        ],
+        thought="Link A to B",
+    )
+
+    reverse_field = table_b.field_set.exclude(primary=True).get()
+    create_b = ctx.deps.dynamic_tools[0]
+    assert create_b.function_schema.validator.validate_python(
+        {
+            "rows": [{"Title": "Row B", reverse_field.name: []}],
+            "thought": "Create a row in B",
+        }
+    )
+
+
+@pytest.mark.django_db
+def test_field_change_survives_a_failing_row_tool_refresh(data_fixture, monkeypatch):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    ctx = make_test_ctx(user, table.database.workspace)
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare rows")
+    stale_create = ctx.deps.dynamic_tools[0]
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("cannot build row tools")
+
+    monkeypatch.setattr(database_tools, "_build_row_tools", _raise)
+    result = create_fields(
+        ctx,
+        table_id=table.id,
+        fields=[FieldItemCreate(name="Status", type="text")],
+        thought="Add a status field",
+    )
+
+    assert result["created_fields"][0]["name"] == "Status"
+    assert table.field_set.filter(name="Status").exists()
+    assert ctx.deps.dynamic_tools[0] is stale_create
+
+
+def _create_simple_database_with_linked_tables_and_rows(data_fixture):
+    user = data_fixture.create_user()
+    table_a, table_b, link_a_to_b = data_fixture.create_two_linked_tables(user=user)
+    workspace = table_a.database.workspace
+    primary_field_table_a = table_a.get_primary_field().specific
+    primary_field_table_b = table_b.get_primary_field().specific
+    text_field = data_fixture.create_text_field(
+        user=user, table=table_a, name="Text field"
+    )
+    long_text_field = data_fixture.create_long_text_field(
+        user=user, table=table_a, name="Long text field"
+    )
+    number_field = data_fixture.create_number_field(
+        user=user,
+        table=table_a,
+        name="Number field",
+        number_decimal_places=3,
+    )
+    date_field = data_fixture.create_date_field(
+        user=user, table=table_a, name="Date field"
+    )
+    datetime_field = data_fixture.create_date_field(
+        user=user, table=table_a, name="Datetime field", date_include_time=True
+    )
+    single_select_field = data_fixture.create_single_select_field(
+        user=user, table=table_a, name="Single select"
+    )
+    data_fixture.create_select_option(value="Option 1", field=single_select_field)
+    data_fixture.create_select_option(value="Option 2", field=single_select_field)
+
+    multiple_select_field = data_fixture.create_multiple_select_field(
+        user=user, table=table_a, name="Multiple select"
+    )
+    data_fixture.create_select_option(value="Option A", field=multiple_select_field)
+    data_fixture.create_select_option(value="Option B", field=multiple_select_field)
+    data_fixture.create_select_option(value="Option C", field=multiple_select_field)
+    single_link_to_b_field = data_fixture.create_link_row_field(
+        user=user,
+        table=table_a,
+        link_row_table=table_b,
+        name="Single link to B",
+        link_row_multiple_relationships=False,
+    )
+
+    table_b_rows = (
+        RowHandler()
+        .force_create_rows(
+            user,
+            table_b,
+            [
+                {primary_field_table_b.db_column: "Row B1"},
+                {primary_field_table_b.db_column: "Row B2"},
+                {primary_field_table_b.db_column: "Row B3"},
+            ],
+        )
+        .created_rows
+    )
+
+    table_a_rows = (
+        RowHandler()
+        .force_create_rows(
+            user,
+            table_a,
+            [
+                {
+                    primary_field_table_a.db_column: "Row A1",
+                    text_field.db_column: "Text A1",
+                    long_text_field.db_column: "Long text A1",
+                    number_field.db_column: 10.123,
+                    date_field.db_column: "2023-01-01",
+                    datetime_field.db_column: "2023-01-01 10:00:00",
+                    single_select_field.db_column: "Option 1",
+                    multiple_select_field.db_column: ["Option A", "Option B"],
+                    single_link_to_b_field.db_column: [table_b_rows[0].id],
+                    link_a_to_b.db_column: [table_b_rows[0].id, table_b_rows[1].id],
+                },
+                {
+                    primary_field_table_a.db_column: "Row A2",
+                    text_field.db_column: "Text A2",
+                    long_text_field.db_column: "Long text A2",
+                    number_field.db_column: 20.456,
+                    date_field.db_column: "2023-02-01",
+                    datetime_field.db_column: "2023-02-01 11:00:00",
+                    single_select_field.db_column: "Option 2",
+                    multiple_select_field.db_column: ["Option B", "Option C"],
+                    single_link_to_b_field.db_column: [table_b_rows[1].id],
+                    link_a_to_b.db_column: [table_b_rows[1].id, table_b_rows[2].id],
+                },
+                {},
+            ],
+        )
+        .created_rows
+    )
+
+    return {
+        "user": user,
+        "workspace": workspace,
+        "table_a": table_a,
+        "table_b": table_b,
+        "table_a_fields": {
+            "link_a_to_b": link_a_to_b,
+            "text_field": text_field,
+            "long_text_field": long_text_field,
+            "number_field": number_field,
+            "date_field": date_field,
+            "datetime_field": datetime_field,
+            "single_select_field": single_select_field,
+            "multiple_select_field": multiple_select_field,
+            "single_link_to_b_field": single_link_to_b_field,
+        },
+        "table_a_rows": table_a_rows,
+        "table_b_rows": table_b_rows,
+    }
+
+
+@pytest.mark.django_db
+def test_list_rows(data_fixture):
+    res = _create_simple_database_with_linked_tables_and_rows(data_fixture)
+
+    user = res["user"]
+    workspace = res["workspace"]
+    table = res["table_a"]
+
+    ctx = make_test_ctx(user, workspace)
+
+    result = list_rows(
+        ctx, table_id=table.id, offset=0, limit=50, field_ids=None, thought="test"
+    )
+    rows = result["rows"]
+    assert len(rows) == 3
+    assert rows[0] == {
+        "primary": "Row A1",
+        "Long text field": "Long text A1",
+        "Number field": 10.123,
+        "Date field": "2023-01-01",
+        "Datetime field": "2023-01-01T10:00",
+        "Single link to B": "Row B1",
+        "Multiple select": ["Option A", "Option B"],
+        "Text field": "Text A1",
+        "Single select": "Option 1",
+        "link": ["Row B1", "Row B2"],
+        "id": 1,
+    }
+    assert rows[1] == {
+        "primary": "Row A2",
+        "Long text field": "Long text A2",
+        "Number field": 20.456,
+        "Date field": "2023-02-01",
+        "Datetime field": "2023-02-01T11:00",
+        "Single link to B": "Row B2",
+        "Multiple select": ["Option B", "Option C"],
+        "Text field": "Text A2",
+        "Single select": "Option 2",
+        "link": ["Row B2", "Row B3"],
+        "id": 2,
+    }
+    assert rows[2] == {
+        "primary": "",
+        "Long text field": "",
+        "Number field": None,
+        "Date field": None,
+        "Datetime field": None,
+        "Single link to B": None,
+        "Multiple select": [],
+        "Text field": "",
+        "Single select": None,
+        "link": [],
+        "id": 3,
+    }
+
+    # List a single field
+    result = list_rows(
+        ctx,
+        table_id=table.id,
+        offset=0,
+        limit=50,
+        field_ids=[table.get_primary_field().id],
+        thought="test",
+    )
+    rows = result["rows"]
+    assert len(rows) == 3
+    assert rows[0] == {
+        "primary": "Row A1",
+        "id": 1,
+    }
+    assert rows[1] == {
+        "primary": "Row A2",
+        "id": 2,
+    }
+    assert rows[2] == {
+        "primary": "",
+        "id": 3,
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_create_rows(data_fixture):
+    res = _create_simple_database_with_linked_tables_and_rows(data_fixture)
+
+    user = res["user"]
+    workspace = res["workspace"]
+    table = res["table_a"]
+
+    ctx = make_test_ctx(user, workspace)
+
+    observation = load_row_tools(ctx, [table.id], ["create"], thought="test")
+    assert isinstance(observation, str)
+    assert f"create_rows_in_table_{table.id}" in observation
+
+    # Tools should be stored in ctx.deps.dynamic_tools
+    dynamic_tools = ctx.deps.dynamic_tools
+    assert len(dynamic_tools) == 1
+
+    create_tool = dynamic_tools[0]
+    assert create_tool.name == f"create_rows_in_table_{table.id}"
+
+    table_model = table.get_model()
+    assert table_model.objects.count() == 3
+
+    row_1 = {
+        "primary": "Row A3",
+        "Text field": "Text A3",
+        "Long text field": "Long text A3",
+        "Number field": 30.789,
+        "Date field": "2023-03-01",
+        "Datetime field": "2023-03-01T12:00",
+        "Single select": "Option 1",
+        "Multiple select": ["Option A", "Option C"],
+        "Single link to B": "Row B3",
+        "link": ["Row B1"],
+    }
+    row_2 = {
+        "primary": "",
+        "Text field": "",
+        "Long text field": "",
+        "Number field": None,
+        "Date field": None,
+        "Datetime field": None,
+        "Single select": None,
+        "Multiple select": [],
+        "Single link to B": None,
+        "link": [],
+    }
+    # Validate dicts through the tool's schema (as pydantic-ai would),
+    # then call the underlying function.
+    validated_args = create_tool.function_schema.validator.validate_python(
+        {"rows": [row_1, row_2], "thought": "test"}
+    )
+    result = create_tool.function(**validated_args)
+    created_row_ids = result["created_row_ids"]
+    assert len(created_row_ids) == 2
+    assert created_row_ids == [4, 5]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_dynamic_row_tool_returns_permission_denied_result(data_fixture, monkeypatch):
+    resources = _create_simple_database_with_linked_tables_and_rows(data_fixture)
+    table = resources["table_a"]
+    ctx = make_test_ctx(resources["user"], resources["workspace"])
+    load_row_tools(ctx, [table.id], ["create"], thought="test")
+    create_tool = ctx.deps.dynamic_tools[0]
+
+    def deny(*args, **kwargs):
+        raise PermissionDenied()
+
+    monkeypatch.setattr(
+        "baserow_enterprise.assistant.tools.database.tools.CreateRowsActionType.do",
+        deny,
+    )
+    arguments = create_tool.function_schema.validator.validate_python(
+        {
+            "rows": [
+                {
+                    "primary": "Blocked",
+                    "Text field": "",
+                    "Long text field": "",
+                    "Number field": None,
+                    "Date field": None,
+                    "Datetime field": None,
+                    "Single select": None,
+                    "Multiple select": [],
+                    "Single link to B": None,
+                    "link": [],
+                }
+            ],
+            "thought": "test",
+        }
+    )
+
+    result = create_tool.function(**arguments)
+
+    assert result["error"] == (
+        f"create_rows_in_table_{table.id} stopped because permission was denied."
+    )
+    assert "Do not retry or claim" in result["next_steps"]
+    assert ctx.deps.resource_changes.created_row_counts == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_rows(data_fixture):
+    res = _create_simple_database_with_linked_tables_and_rows(data_fixture)
+
+    user = res["user"]
+    workspace = res["workspace"]
+    table = res["table_a"]
+
+    ctx = make_test_ctx(user, workspace)
+
+    observation = load_row_tools(ctx, [table.id], ["update"], thought="test")
+    assert isinstance(observation, str)
+
+    dynamic_tools = ctx.deps.dynamic_tools
+    assert len(dynamic_tools) == 1
+
+    update_tool = dynamic_tools[0]
+    assert update_tool.name == f"update_rows_in_table_{table.id}"
+
+    table_model = table.get_model()
+    assert table_model.objects.count() == 3
+
+    # Update row 1 — only pass fields to change, omit the rest
+    row_1_updates = {
+        "id": 1,
+        "primary": "Updated Row A1",
+        "Text field": "Updated Text A1",
+        "Number field": 99.999,
+        "Single select": "Option 2",
+        "link": ["Row B3"],
+        "Single link to B": "Row B2",
+    }
+    # Update row 2 — only pass fields to change
+    row_2_updates = {
+        "id": 2,
+        "Long text field": "Updated Long text A2",
+        "Date field": "2024-12-31",
+        "Multiple select": ["Option A"],
+    }
+
+    validated_args = update_tool.function_schema.validator.validate_python(
+        {"rows": [row_1_updates, row_2_updates], "thought": "test"}
+    )
+    result = update_tool.function(**validated_args)
+    updated_row_ids = result["updated_row_ids"]
+    assert len(updated_row_ids) == 2
+    assert updated_row_ids == [1, 2]
+
+    # Verify the rows were updated correctly
+    row_1, row_2 = list_rows(
+        ctx, table_id=table.id, offset=0, limit=2, field_ids=None, thought="test"
+    )["rows"]
+    assert row_1 == {
+        "primary": "Updated Row A1",
+        "Long text field": "Long text A1",
+        "Number field": 99.999,
+        "Date field": "2023-01-01",
+        "Datetime field": "2023-01-01T10:00",
+        "Single link to B": "Row B2",
+        "Multiple select": ["Option A", "Option B"],
+        "Text field": "Updated Text A1",
+        "Single select": "Option 2",
+        "link": ["Row B3"],
+        "id": 1,
+    }
+    assert row_2 == {
+        "primary": "Row A2",
+        "Long text field": "Updated Long text A2",
+        "Number field": 20.456,
+        "Date field": "2024-12-31",
+        "Datetime field": "2023-02-01T11:00",
+        "Single link to B": "Row B2",
+        "Multiple select": ["Option A"],
+        "Text field": "Text A2",
+        "Single select": "Option 2",
+        "link": ["Row B2", "Row B3"],
+        "id": 2,
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_delete_rows(data_fixture):
+    res = _create_simple_database_with_linked_tables_and_rows(data_fixture)
+
+    user = res["user"]
+    workspace = res["workspace"]
+    table = res["table_a"]
+
+    ctx = make_test_ctx(user, workspace)
+
+    observation = load_row_tools(ctx, [table.id], ["delete"], thought="test")
+    assert isinstance(observation, str)
+
+    dynamic_tools = ctx.deps.dynamic_tools
+    assert len(dynamic_tools) == 1
+
+    delete_tool = dynamic_tools[0]
+    assert delete_tool.name == f"delete_rows_in_table_{table.id}"
+
+    table_model = table.get_model()
+    assert table_model.objects.count() == 3
+
+    # Delete rows with ids 1 and 3
+    result = delete_tool.function(row_ids=[1, 3], thought="test")
+    assert result["deleted_row_ids"] == [1, 3]
+
+    # Verify rows were deleted
+    assert table_model.objects.count() == 1
+    assert list(table_model.objects.values_list("id", flat=True)) == [2]
+
+
+def _linked_rows_with_and_without_a_primary_value(
+    data_fixture, user, table, primary_type
+):
+    """Return the ids of a linked row with a primary value and one without."""
+
+    if primary_type == "lookup":
+        data_fixture.create_text_field(table=table, primary=True)
+        colors = data_fixture.create_database_table(database=table.database)
+        color_name = data_fixture.create_text_field(table=colors, primary=True)
+        red = RowHandler().create_row(user, colors, {color_name.db_column: "Red"})
+        color = FieldHandler().create_field(
+            user, table, "link_row", name="Color", link_row_table=colors
+        )
+        lookup = FieldHandler().create_field(
+            user,
+            table,
+            "lookup",
+            name="Color name",
+            through_field_id=color.id,
+            target_field_id=color_name.id,
+        )
+        FieldHandler().change_primary_field(user, table, lookup)
+        filled = RowHandler().create_row(user, table, {color.db_column: [red.id]})
+        blank = RowHandler().create_row(user, table, {})
+        return filled.id, blank.id
+
+    if primary_type == "button":
+        data_fixture.create_formula_field(
+            table=table, primary=True, formula="button('https://baserow.io', 'Go')"
+        )
+        # A constant formula always has a value, so there is no blank row.
+        return RowHandler().create_row(user, table, {}).id, None
+
+    if primary_type == "uuid":
+        field = data_fixture.create_uuid_field(table=table, primary=True)
+        # A UUID field always has a value, so there is no blank row.
+        return RowHandler().create_row(user, table, {}).id, None
+
+    field, value = {
+        "text": (lambda: data_fixture.create_text_field, "SKU-1"),
+        "number": (lambda: data_fixture.create_number_field, 42),
+        "decimal": (lambda: data_fixture.create_number_field, "4.20"),
+        "date": (lambda: data_fixture.create_date_field, "2026-01-02"),
+    }[primary_type]
+    extra = {"number_decimal_places": 2} if primary_type == "decimal" else {}
+    field = field()(table=table, primary=True, **extra)
+    filled = RowHandler().create_row(user, table, {field.db_column: value})
+    blank = RowHandler().create_row(user, table, {})
+    return filled.id, blank.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "primary_type",
+    ["text", "number", "decimal", "date", "uuid", "lookup", "button"],
+)
+def test_row_tools_read_links_to_a_table_with_any_primary_field_type(
+    data_fixture, primary_type
+):
+    user = data_fixture.create_user()
+    database = data_fixture.create_database_application(user=user)
+    linked_table = data_fixture.create_database_table(database=database)
+    filled, blank = _linked_rows_with_and_without_a_primary_value(
+        data_fixture, user, linked_table, primary_type
+    )
+    table = data_fixture.create_database_table(database=database)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    link = data_fixture.create_link_row_field(
+        table=table, link_row_table=linked_table, name="Linked"
+    )
+    RowHandler().create_row(user, table, {link.db_column: [filled]})
+    ctx = make_test_ctx(user, database.workspace)
+
+    result = list_rows(
+        ctx, table_id=table.id, offset=0, limit=20, field_ids=None, thought="Read"
+    )
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+
+    assert result["total"] == 1
+    assert len(result["rows"][0]["Linked"]) == 1
+    link_description = json.dumps(ctx.deps.dynamic_tools[0].function_schema.json_schema)
+    assert f"id:{filled}," in link_description
+    if blank is not None:
+        assert f"id:{blank}," not in link_description
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("primary_type", ["eu_date", "single_select"])
+def test_link_examples_show_values_the_link_field_accepts(data_fixture, primary_type):
+    user = data_fixture.create_user()
+    database = data_fixture.create_database_application(user=user)
+    linked_table = data_fixture.create_database_table(database=database)
+    if primary_type == "eu_date":
+        primary = data_fixture.create_date_field(
+            table=linked_table, primary=True, date_format="EU"
+        )
+        value, expected = "2026-01-02", "02/01/2026"
+    else:
+        primary = data_fixture.create_single_select_field(
+            table=linked_table, primary=True
+        )
+        value = data_fixture.create_select_option(field=primary, value="Alpha").id
+        expected = "Alpha"
+    linked_row = RowHandler().create_row(user, linked_table, {primary.db_column: value})
+    table = data_fixture.create_database_table(database=database)
+    data_fixture.create_text_field(table=table, name="Name", primary=True)
+    link = data_fixture.create_link_row_field(
+        table=table, link_row_table=linked_table, name="Linked"
+    )
+    ctx = make_test_ctx(user, database.workspace)
+
+    load_row_tools(ctx, [table.id], ["create"], thought="Prepare row creation")
+
+    link_description = json.dumps(ctx.deps.dynamic_tools[0].function_schema.json_schema)
+    assert f"value: `{expected}`" in link_description
+    row = RowHandler().create_row(user, table, {link.db_column: [expected]})
+    assert list(getattr(row, link.db_column).values_list("id", flat=True)) == [
+        linked_row.id
+    ]

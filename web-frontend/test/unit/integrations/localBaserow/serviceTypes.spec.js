@@ -1,0 +1,474 @@
+import {
+  LocalBaserowListRowsServiceType,
+  LocalBaserowGetRowServiceType,
+  LocalBaserowTableServiceType,
+  LocalBaserowCreateRowServiceType,
+  LocalBaserowDeleteRowServiceType,
+  LocalBaserowFieldsUpdatedTriggerServiceType,
+} from '@baserow/modules/integrations/localBaserow/serviceTypes'
+import { TestApp } from '@baserow/test/helpers/testApp'
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
+
+// Read rather than imported: the i18n loader turns an imported locale file
+// into compiled message ASTs, which the copy below can't be read off of.
+const en = JSON.parse(
+  readFileSync(
+    resolve(process.cwd(), 'modules/integrations/locales/en.json'),
+    'utf8'
+  )
+)
+
+describe('Local baserow service types', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(() => {
+    testApp.afterEach()
+  })
+
+  test('Get service should prepareValuePath', () => {
+    const fakeApp = {}
+    const serviceType = new LocalBaserowGetRowServiceType(fakeApp)
+
+    const service = {
+      schema: {
+        properties: { id: { title: 'Id' }, field_42: { title: 'Field 42' } },
+      },
+    }
+
+    expect(serviceType.prepareValuePath(service, [])).toEqual([])
+    expect(serviceType.prepareValuePath(service, [0])).toEqual([0])
+    expect(serviceType.prepareValuePath(service, ['id'])).toEqual(['id'])
+    expect(serviceType.prepareValuePath(service, ['field_42'])).toEqual([
+      'Field 42',
+    ])
+    expect(
+      serviceType.prepareValuePath(service, ['field_42', 'value'])
+    ).toEqual(['Field 42', 'value'])
+  })
+
+  test('List service should prepareValuePath', () => {
+    const fakeApp = {}
+    const serviceType = new LocalBaserowListRowsServiceType(fakeApp)
+
+    const service = {
+      schema: {
+        items: {
+          properties: { id: { title: 'Id' }, field_42: { title: 'Field 42' } },
+        },
+      },
+    }
+
+    expect(serviceType.prepareValuePath(service, [])).toEqual([])
+    expect(serviceType.prepareValuePath(service, [0])).toEqual([0])
+    expect(serviceType.prepareValuePath(service, ['id'])).toEqual(['id'])
+    expect(serviceType.prepareValuePath(service, ['field_42'])).toEqual([
+      'Field 42',
+    ])
+    expect(
+      serviceType.prepareValuePath(service, ['field_42', 'value'])
+    ).toEqual(['Field 42', 'value'])
+  })
+
+  test('List service preserves specialized default Table columns', () => {
+    const serviceType = new LocalBaserowListRowsServiceType({})
+    const types = {
+      boolean: 'boolean',
+      rating: 'number',
+      url: 'string',
+      file: 'array',
+      created_by: 'object',
+      last_modified_by: 'object',
+      single_select: 'object',
+      multiple_select: 'array',
+      multiple_collaborators: 'array',
+      formula: 'string',
+    }
+    const properties = Object.fromEntries(
+      Object.entries(types).map(([originalType, type], index) => [
+        `field_${index}`,
+        { type, original_type: originalType, title: originalType },
+      ])
+    )
+    properties.id = { type: 'number', title: 'Id' }
+    expect(
+      serviceType.getDefaultCollectionFields({
+        schema: { items: { properties } },
+      })
+    ).toMatchSnapshot()
+    expect(serviceType.getDefaultCollectionFields({ schema: null })).toEqual([])
+  })
+
+  test('List service should resolve correctly in builder data provider', () => {
+    const dataProvider = testApp
+      .getRegistry()
+      .get('builderDataProvider', 'data_source')
+
+    const service = {
+      id: 1,
+      type: 'local_baserow_list_rows',
+      schema: {
+        items: {
+          properties: { id: { title: 'Id' }, field_42: { title: 'Field 42' } },
+        },
+      },
+    }
+
+    dataProvider.getDataSourceContent = vi.fn(() => [
+      { id: 1, 'Field 42': 'Field 42 content row 1' },
+      { id: 2, 'Field 42': 'Field 42 content row 2' },
+    ])
+
+    const page = { id: 2, dataSources: [service] }
+
+    const applicationContext = {
+      builder: {
+        pages: [{ id: 1, shared: true, dataSources: [] }, page],
+      },
+      page,
+    }
+
+    expect(dataProvider.getDataChunk(applicationContext, ['1'])).toEqual([
+      { id: 1, 'Field 42': 'Field 42 content row 1' },
+      { id: 2, 'Field 42': 'Field 42 content row 2' },
+    ])
+    expect(dataProvider.getDataChunk(applicationContext, ['1', '0'])).toEqual({
+      id: 1,
+      'Field 42': 'Field 42 content row 1',
+    })
+    expect(dataProvider.getDataChunk(applicationContext, ['1', '1'])).toEqual({
+      id: 2,
+      'Field 42': 'Field 42 content row 2',
+    })
+    expect(
+      dataProvider.getDataChunk(applicationContext, ['1', '1', 'id'])
+    ).toEqual(2)
+    expect(
+      dataProvider.getDataChunk(applicationContext, ['1', '1', 'field_42'])
+    ).toEqual('Field 42 content row 2')
+    expect(
+      dataProvider.getDataChunk(applicationContext, ['1', '*', 'field_42'])
+    ).toEqual(['Field 42 content row 1', 'Field 42 content row 2'])
+  })
+
+  test('Get service should resolve correctly in builder data provider', () => {
+    const dataProvider = testApp
+      .getRegistry()
+      .get('builderDataProvider', 'data_source')
+
+    const service = {
+      id: 1,
+      type: 'local_baserow_get_row',
+      schema: {
+        properties: { id: { title: 'Id' }, field_42: { title: 'Field 42' } },
+      },
+    }
+
+    dataProvider.getDataSourceContent = vi.fn(() => ({
+      id: 1,
+      'Field 42': 'Field 42 content',
+    }))
+
+    const page = { id: 2, dataSources: [service] }
+
+    const applicationContext = {
+      builder: {
+        pages: [{ id: 1, shared: true, dataSources: [] }, page],
+      },
+      page,
+    }
+
+    expect(dataProvider.getDataChunk(applicationContext, ['1'])).toEqual({
+      id: 1,
+      'Field 42': 'Field 42 content',
+    })
+    expect(dataProvider.getDataChunk(applicationContext, ['1', 'id'])).toEqual(
+      1
+    )
+    expect(
+      dataProvider.getDataChunk(applicationContext, ['1', 'field_42'])
+    ).toEqual('Field 42 content')
+  })
+
+  test('LocalBaserowTableServiceType supportedTables returns all tables it is given.', () => {
+    const fakeApp = {}
+    const serviceType = new LocalBaserowTableServiceType(fakeApp)
+
+    const tables = [
+      {
+        id: 1,
+        name: 'Table 1',
+        is_data_sync: false,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 2,
+        name: 'Table 2',
+        is_data_sync: true,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 3,
+        name: 'Table 3',
+        is_data_sync: true,
+        is_two_way_data_sync: true,
+      },
+    ]
+
+    const result = serviceType.supportedTables(tables)
+    expect(result).toEqual(tables)
+    expect(result.length).toBe(3)
+  })
+
+  test('LocalBaserowCreateRowServiceType supportedTables returns non data-synced tables or two-way data-synced tables.', () => {
+    const fakeApp = {}
+    const serviceType = new LocalBaserowCreateRowServiceType(fakeApp)
+
+    const tables = [
+      {
+        id: 1,
+        name: 'Table 1',
+        is_data_sync: false,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 2,
+        name: 'Table 2',
+        is_data_sync: true,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 3,
+        name: 'Table 3',
+        is_data_sync: true,
+        is_two_way_data_sync: true,
+      },
+    ]
+
+    const result = serviceType.supportedTables(tables)
+    expect(result).toEqual([
+      {
+        id: 1,
+        name: 'Table 1',
+        is_data_sync: false,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 3,
+        name: 'Table 3',
+        is_data_sync: true,
+        is_two_way_data_sync: true,
+      },
+    ])
+    expect(result.length).toBe(2)
+  })
+
+  test('LocalBaserowDeleteRowServiceType supportedTables returns non data-synced tables or two-way data-synced tables', () => {
+    const fakeApp = {}
+    const serviceType = new LocalBaserowDeleteRowServiceType(fakeApp)
+
+    const tables = [
+      {
+        id: 1,
+        name: 'Table 1',
+        is_data_sync: false,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 2,
+        name: 'Table 2',
+        is_data_sync: true,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 3,
+        name: 'Table 3',
+        is_data_sync: true,
+        is_two_way_data_sync: true,
+      },
+    ]
+
+    const result = serviceType.supportedTables(tables)
+    expect(result).toEqual([
+      {
+        id: 1,
+        name: 'Table 1',
+        is_data_sync: false,
+        is_two_way_data_sync: false,
+      },
+      {
+        id: 3,
+        name: 'Table 3',
+        is_data_sync: true,
+        is_two_way_data_sync: true,
+      },
+    ])
+    expect(result.length).toBe(2)
+  })
+
+  test('LocalBaserowFieldsUpdatedTriggerServiceType is in error unless a table and at least one field are selected', () => {
+    const serviceType = new LocalBaserowFieldsUpdatedTriggerServiceType({
+      app: { $i18n: { t: (key) => key } },
+    })
+
+    expect(
+      serviceType.isInError({ service: { table_id: null, field_ids: [] } })
+    ).toBe(true)
+    expect(
+      serviceType.isInError({ service: { table_id: 1, field_ids: [] } })
+    ).toBe(true)
+    expect(
+      serviceType.isInError({ service: { table_id: null, field_ids: [1] } })
+    ).toBe(true)
+    expect(
+      serviceType.isInError({ service: { table_id: 1, field_ids: [1, 2] } })
+    ).toBe(false)
+  })
+
+  test('getErrorMessage flags a data source whose integration is not resolvable', () => {
+    const application = { id: 1 }
+    const fakeApp = {
+      $store: {
+        getters: {
+          'integration/getIntegrationById': (app, id) =>
+            id === 5 ? { id: 5, type: 'local_baserow' } : undefined,
+        },
+      },
+      $registry: {
+        get: () => ({ getErrorMessage: () => null }),
+      },
+      $i18n: { t: (key) => key },
+    }
+    const serviceType = new LocalBaserowGetRowServiceType({ app: fakeApp })
+
+    // Live integration + table selected → valid.
+    expect(
+      serviceType.getErrorMessage({
+        service: { integration_id: 5, table_id: 99 },
+        application,
+      })
+    ).toBe(null)
+
+    // Integration trashed/absent (not in the store) → misconfigured.
+    expect(
+      serviceType.getErrorMessage({
+        service: { integration_id: 41, table_id: 99 },
+        application,
+      })
+    ).toBe('serviceType.errorMisconfiguredIntegration')
+
+    // Without an application the integration can't be resolved, so the check is
+    // skipped (no false positive); other checks still apply.
+    expect(
+      serviceType.getErrorMessage({
+        service: { integration_id: 41, table_id: 99 },
+      })
+    ).toBe(null)
+
+    // A service with no integration configured must not be flagged by the
+    // integration check even when an application is present - the more specific
+    // checks (e.g. no table selected) cover that case.
+    expect(
+      serviceType.getErrorMessage({
+        service: { table_id: 99 },
+        application,
+      })
+    ).toBe(null)
+  })
+
+  test('a trashed integration agent marks the integration and service as in error', () => {
+    const integration = {
+      id: 5,
+      type: 'local_baserow',
+      authorized_subject: {
+        id: 9,
+        type: 'core.Agent',
+        name: 'Writer',
+        trashed: true,
+      },
+    }
+    const application = { id: 1, integrations: [integration] }
+    const registry = testApp.getRegistry()
+    const integrationType = registry.get('integration', 'local_baserow')
+    const serviceType = registry.get('service', 'local_baserow_get_row')
+
+    expect(integrationType.isInError(integration)).toBe(true)
+    expect(integrationType.getSummary(integration)).toBe(
+      'localBaserowIntegrationType.localBaserowNoUser'
+    )
+    expect(
+      integrationType.getSummary({
+        ...integration,
+        authorized_subject: {
+          ...integration.authorized_subject,
+          trashed: false,
+        },
+      })
+    ).toBe('localBaserowIntegrationType.localBaserowSubjectSummary')
+    expect(
+      serviceType.getErrorMessage({
+        service: { integration_id: 5, table_id: 99 },
+        application,
+      })
+    ).toBe('localBaserowIntegrationType.errorTrashedAgent')
+    expect(en.localBaserowIntegrationType.errorTrashedAgent).toBe(
+      'The authorized agent has been trashed'
+    )
+  })
+
+  test('the update row service is in error without a row ID, the create row service is not', () => {
+    const registry = testApp.getRegistry()
+    const updateRow = registry.get('service', 'local_baserow_update_row')
+    const createRow = registry.get('service', 'local_baserow_create_row')
+    const emptyRowId = { formula: '', mode: 'simple', version: '0.1' }
+    const rowId = { formula: "get('row.id')", mode: 'simple', version: '0.1' }
+
+    expect(
+      updateRow.getErrorMessage({
+        service: { table_id: 1, row_id: emptyRowId },
+      })
+    ).toBe('serviceType.errorNoRowIdSelected')
+    expect(
+      updateRow.getErrorMessage({
+        service: { table_id: 1, row_id: { ...emptyRowId, formula: '  ' } },
+      })
+    ).toBe('serviceType.errorNoRowIdSelected')
+    expect(
+      updateRow.getErrorMessage({ service: { table_id: 1, row_id: rowId } })
+    ).toBe(null)
+    // A public page's service carries no formulas, so nothing to check.
+    expect(updateRow.getErrorMessage({ service: { table_id: 1 } })).toBe(null)
+    // The table comes first: the row ID input is disabled until one is chosen.
+    expect(
+      updateRow.getErrorMessage({
+        service: { table_id: null, row_id: emptyRowId },
+      })
+    ).toBe('serviceType.errorNoTableSelected')
+    expect(
+      createRow.getErrorMessage({
+        service: { table_id: 1, row_id: emptyRowId },
+      })
+    ).toBe(null)
+    expect(en.serviceType.errorNoRowIdSelected).toBe('No row ID selected')
+  })
+
+  test('the create rows service reports a missing table before missing rows', () => {
+    const createRows = testApp
+      .getRegistry()
+      .get('service', 'local_baserow_create_rows')
+    const emptyRows = { formula: '', mode: 'simple', version: '0.1' }
+
+    expect(
+      createRows.getErrorMessage({
+        service: { table_id: null, rows: emptyRows },
+      })
+    ).toBe('serviceType.errorNoTableSelected')
+    expect(
+      createRows.getErrorMessage({ service: { table_id: 1, rows: emptyRows } })
+    ).toBe('serviceType.errorNoRowsSelected')
+  })
+})

@@ -1,0 +1,528 @@
+import FieldService from '@baserow/modules/database/services/field'
+import { clone } from '@baserow/modules/core/utils/object'
+
+// One permissions request per database at a time, with one more queued when a
+// field lands mid-request, so the newest response is the last one applied.
+const permissionRefreshes = new Map()
+
+/**
+ * Refetches the workspace permissions after a field appeared. A role on the
+ * table or database is handed out as a list of field ids fetched with the
+ * workspace, so until this runs every field scoped check refuses the new field.
+ */
+function refreshPermissionsAfterField(dispatch, databaseId) {
+  const pending = permissionRefreshes.get(databaseId)
+  if (pending) {
+    pending.again = true
+    return pending.promise
+  }
+  const entry = { again: false }
+  entry.promise = (async () => {
+    try {
+      do {
+        entry.again = false
+        await dispatch('application/refreshPermissions', databaseId, {
+          root: true,
+        })
+      } while (entry.again)
+    } catch (error) {
+      // The field is already in the store, so the toast asks for a reload.
+      await dispatch('toast/setPermissionsUpdated', true, { root: true })
+    } finally {
+      permissionRefreshes.delete(databaseId)
+    }
+  })()
+  permissionRefreshes.set(databaseId, entry)
+  return entry.promise
+}
+
+export function populateField(field, registry) {
+  const type = registry.get('field', field.type)
+
+  field._ = {
+    type: type.serialize(),
+    loading: false,
+  }
+  return type.populate(field)
+}
+
+export const state = () => ({
+  types: {},
+  loading: false,
+  loaded: null,
+  items: [],
+  errorRefreshGeneration: 0,
+})
+
+export const mutations = {
+  SET_ITEMS(state, fields) {
+    state.items = fields
+  },
+  SET_LOADING(state, value) {
+    state.loading = value
+  },
+  SET_ITEM_LOADING(state, { field, value }) {
+    if (!Object.prototype.hasOwnProperty.call(field, '_')) {
+      return
+    }
+    field._.loading = value
+  },
+  SET_ITEM_ERROR(state, { field, value }) {
+    const storedField = state.items.find((item) => item.id === field.id)
+    const fieldToUpdate = storedField || field
+    fieldToUpdate.error = value
+  },
+  SET_ITEM_VALUES(state, { id, values }) {
+    const storedField = state.items.find((item) => item.id === id)
+    if (storedField) {
+      Object.assign(storedField, values)
+    }
+  },
+  SET_LOADED(state, value) {
+    state.loaded = value
+      ? { tableId: value.tableId, viewId: value.viewId }
+      : value
+  },
+  SET_ERROR_REFRESH_GENERATION(state, value) {
+    state.errorRefreshGeneration = value
+  },
+  ADD_ITEM(state, item) {
+    state.items.push(item)
+  },
+  UPDATE_ITEM(state, { id, values }) {
+    const index = state.items.findIndex((item) => item.id === id)
+    state.items.splice(index, 1, values)
+  },
+  DELETE_ITEM(state, id) {
+    const index = state.items.findIndex((item) => item.id === id)
+    state.items.splice(index, 1)
+  },
+  SET_SELECTED(state, field) {
+    Object.values(state.items).forEach((item) => {
+      item._.selected = false
+    })
+    field._.selected = true
+    state.selected = field
+  },
+  UNSELECT(state) {
+    Object.values(state.items).forEach((item) => {
+      item._.selected = false
+    })
+    state.selected = {}
+  },
+}
+
+export const actions = {
+  /**
+   * Changes the loading state of a specific field.
+   */
+  setItemLoading({ commit }, { field, value }) {
+    commit('SET_ITEM_LOADING', { field, value })
+  },
+  /**
+   * Updates a field's computed error locally without making an API request.
+   */
+  setItemError({ commit }, { field, value }) {
+    commit('SET_ITEM_ERROR', { field, value })
+  },
+  /**
+   * Patches a stored field with values its save response could not carry,
+   * because the field type wrote more after the response was built.
+   */
+  setItemValues({ commit }, { id, values }) {
+    commit('SET_ITEM_VALUES', { id, values })
+  },
+  /**
+   * Refreshes computed field errors for the table cached in the field store.
+   * This preserves the existing field objects and view state.
+   */
+  async refreshLoadedFieldErrors(
+    { state, commit },
+    { realtimeRecovery = false } = {}
+  ) {
+    if (!state.loaded) {
+      return
+    }
+
+    const loaded = { ...state.loaded }
+    const requestGeneration = state.errorRefreshGeneration + 1
+    commit('SET_ERROR_REFRESH_GENERATION', requestGeneration)
+    const { $client } = this
+    const { data } = await FieldService($client).fetchAll(
+      loaded.tableId,
+      loaded.viewId,
+      realtimeRecovery
+    )
+
+    if (
+      !state.loaded ||
+      state.errorRefreshGeneration !== requestGeneration ||
+      state.loaded.tableId !== loaded.tableId ||
+      state.loaded.viewId !== loaded.viewId
+    ) {
+      return
+    }
+
+    const fieldsById = new Map(data.map((field) => [field.id, field]))
+    for (const field of state.items) {
+      const refreshedField = fieldsById.get(field.id)
+      if (
+        refreshedField &&
+        Object.prototype.hasOwnProperty.call(refreshedField, 'error')
+      ) {
+        commit('SET_ITEM_ERROR', {
+          field,
+          value: refreshedField.error || null,
+        })
+      }
+    }
+  },
+  /**
+   * Fetches all the fields of a given table. The is mostly called when the user
+   * selects a different table.
+   */
+  async fetchAll(
+    { commit, getters, dispatch, state, rootGetters },
+    { table, viewId = null }
+  ) {
+    const { $registry, $client } = this
+    commit('SET_LOADING', true)
+    commit('SET_ERROR_REFRESH_GENERATION', state.errorRefreshGeneration + 1)
+    commit('UNSELECT', {})
+
+    // The table page fetches without blocking the navigation, so another table
+    // can have been selected while the request was running. Whether it succeeds
+    // or fails, the fields of the table that was navigated away from must then
+    // not replace or clear the ones of the selected table.
+    const isStale = () => {
+      const selectedTableId = rootGetters['table/getSelectedId']
+      return selectedTableId && selectedTableId !== table.id
+    }
+
+    try {
+      const { data } = await FieldService($client).fetchAll(table.id, viewId)
+      if (isStale()) {
+        return getters.getAll
+      }
+      await dispatch('forceSetFields', { fields: data })
+      commit('SET_LOADED', { tableId: table.id, viewId })
+    } catch (error) {
+      if (!isStale()) {
+        commit('SET_ITEMS', [])
+        commit('SET_LOADING', false)
+        commit('SET_LOADED', null)
+      }
+
+      throw error
+    }
+    return getters.getAll
+  },
+  forceSetFields({ commit, rootGetters }, { fields }) {
+    const { $registry } = this
+    fields.forEach((part, index) => {
+      populateField(fields[index], $registry)
+    })
+
+    commit('SET_ITEMS', fields)
+    commit('SET_LOADING', false)
+
+    return { fields }
+  },
+  /**
+   * Creates a new field with the provided type for the given table.
+   */
+  async create(
+    context,
+    { type, table, values, forceCreate = true, undoRedoActionGroupId = null }
+  ) {
+    const { $registry, $client } = this
+    const { dispatch } = context
+
+    if (Object.prototype.hasOwnProperty.call(values, 'type')) {
+      throw new Error(
+        'The key "type" is a reserved, but is already set on the ' +
+          'values when creating a new field.'
+      )
+    }
+
+    if (!$registry.exists('field', type)) {
+      throw new Error(`A field with type "${type}" doesn't exist.`)
+    }
+
+    const postData = clone(values)
+    postData.type = type
+    const { data } = await FieldService($client).create(
+      table.id,
+      postData,
+      undoRedoActionGroupId
+    )
+    const forceCreateCallback = async () => {
+      return await dispatch('forceCreate', {
+        table,
+        values: data,
+        relatedFields: data.related_fields,
+      })
+    }
+    const fieldType = $registry.get('field', type)
+
+    const fetchNeeded =
+      fieldType.shouldFetchDataWhenAdded() ||
+      anyFieldsNeedFetch(data.related_fields, $registry)
+    const callback = forceCreate
+      ? await forceCreateCallback()
+      : forceCreateCallback
+    return {
+      forceCreateCallback: callback,
+      fetchNeeded,
+      newField: data,
+      undoRedoActionGroupId,
+    }
+  },
+  /**
+   * Restores a field into the field store and notifies the selected view that the
+   * field has been restored so it can update it's own state if the view type contains
+   * any field specific state.
+   */
+  async fieldRestored(context, { table, selectedView, values }) {
+    const { $registry } = this
+    const { commit, dispatch } = context
+    const fieldType = $registry.get('field', values.type)
+    const populatedField = populateField(values, $registry)
+    commit('ADD_ITEM', populatedField)
+    // A trashed field drops out of the list the same way a new one is missing.
+    refreshPermissionsAfterField(dispatch, table.database_id)
+
+    if (selectedView) {
+      const selectedViewType = $registry.get('view', selectedView.type)
+      await selectedViewType.fieldRestored(
+        context,
+        table,
+        selectedView,
+        populatedField,
+        fieldType,
+        'page/'
+      )
+    }
+  },
+  /**
+   * Forcefully create a new field without making a call to the backend.
+   */
+  async forceCreate(context, { table, values, relatedFields = [] }) {
+    const { $registry } = this
+    const { commit, dispatch } = context
+    const fieldType = $registry.get('field', values.type)
+    const data = populateField(values, $registry)
+    commit('ADD_ITEM', data)
+    // Not awaited: the field shows straight away and its checks pass once
+    // the response lands.
+    refreshPermissionsAfterField(dispatch, table.database_id)
+
+    // Call the field created event on all the registered views because they might
+    // need to change things in loaded data. For example the grid field will add the
+    // field to all of the rows that are in memory.
+    for (const viewType of Object.values($registry.getAll('view'))) {
+      await viewType.afterFieldCreated(context, table, data, fieldType, 'page/')
+    }
+
+    await dispatch('forceUpdateFields', {
+      fields: relatedFields,
+    })
+  },
+  /**
+   * Updates the values of the provided field.
+   */
+  async update(
+    context,
+    { field, type, values, forceUpdate = true, undoRedoActionGroupId = null }
+  ) {
+    const { $registry, $client } = this
+    const { dispatch } = context
+
+    if (Object.prototype.hasOwnProperty.call(values, 'type')) {
+      throw new Error(
+        'The key "type" is a reserved, but is already set on the values when ' +
+          'creating a new field.'
+      )
+    }
+
+    if (!$registry.exists('field', type)) {
+      throw new Error(`A field with type "${type}" doesn't exist.`)
+    }
+
+    const oldField = clone(field)
+    const postData = clone(values)
+    postData.type = type
+
+    const { data } = await FieldService($client).update(
+      field.id,
+      postData,
+      undoRedoActionGroupId
+    )
+    const forceUpdateCallback = async () => {
+      return await dispatch('forceUpdate', {
+        field,
+        oldField,
+        data,
+        relatedFields: data.related_fields,
+      })
+    }
+
+    return forceUpdate ? await forceUpdateCallback() : forceUpdateCallback
+  },
+  /**
+   * Promote the provided field to primary field.
+   */
+  async changePrimary(context, { field, forceUpdate = true }) {
+    const { $registry, $client } = this
+    const { dispatch } = context
+
+    const newField = clone(field)
+    const oldField = clone(field)
+    newField.primary = true
+
+    const { data } = await FieldService($client).changePrimary(
+      field.table_id,
+      field.id
+    )
+    const forceUpdateCallback = async () => {
+      return await dispatch('forceUpdate', {
+        field,
+        oldField,
+        data,
+        relatedFields: data.related_fields,
+      })
+    }
+
+    return forceUpdate ? await forceUpdateCallback() : forceUpdateCallback
+  },
+  /**
+   * Forcefully update an existing field without making a request to the backend.
+   */
+  async forceUpdate(context, { field, oldField, data, relatedFields = [] }) {
+    const { $registry } = this
+    const { commit, dispatch } = context
+    const fieldType = $registry.get('field', data.type)
+    data = populateField(data, $registry)
+
+    commit('UPDATE_ITEM', { id: field.id, values: data })
+
+    // The view might need to do some cleanup regarding the filters and sortings if the
+    // type has changed.
+    await dispatch(
+      'view/fieldUpdated',
+      { field: data, fieldType },
+      { root: true }
+    )
+
+    // Call the field updated event on all the registered views because they might
+    // need to change things in loaded data. For example the changed rows.
+    for (const viewType of Object.values($registry.getAll('view'))) {
+      await viewType.afterFieldUpdated(
+        context,
+        data,
+        oldField,
+        fieldType,
+        'page/'
+      )
+    }
+
+    await dispatch('forceUpdateFields', {
+      fields: relatedFields,
+    })
+  },
+  /**
+   * Forcefully updates a list of fields.
+   */
+  async forceUpdateFields({ getters, dispatch }, { fields }) {
+    for (const f of fields) {
+      const field = getters.get(f.id)
+      if (field !== undefined) {
+        const oldField = clone(field)
+        await dispatch('forceUpdate', {
+          field,
+          oldField,
+          data: f,
+        })
+      }
+    }
+  },
+  /**
+   * Deletes an existing field with the provided id.
+   */
+  async delete({ commit, dispatch }, field) {
+    try {
+      const { data } = await dispatch('deleteCall', field)
+      await dispatch('forceDelete', field)
+      await dispatch('forceUpdateFields', {
+        fields: data.related_fields,
+      })
+    } catch (error) {
+      // If the field to delete wasn't found we can just delete it from the
+      // state.
+      if (error.response && error.response.status === 404) {
+        dispatch('forceDelete', field)
+      } else {
+        throw error
+      }
+    }
+  },
+  /**
+   * Only makes the delete call to the server.
+   */
+  async deleteCall({ commit, dispatch }, field) {
+    const { $client } = this
+    return await FieldService($client).delete(field.id)
+  },
+  /**
+   * Remove the field from the items without calling the server.
+   */
+  async forceDelete(context, field) {
+    const { commit, dispatch } = context
+
+    // Also delete the related filters if there are any.
+    dispatch('view/fieldDeleted', { field }, { root: true })
+    commit('DELETE_ITEM', field.id)
+
+    // Call the field delete event on all the registered views because they might
+    // need to change things in loaded data. For example the grid field will remove the
+    // field options of that field.
+    const fieldType = this.$registry.get('field', field.type)
+    for (const viewType of Object.values(this.$registry.getAll('view'))) {
+      await viewType.afterFieldDeleted(context, field, fieldType, 'page/')
+    }
+  },
+}
+
+export const getters = {
+  isLoaded(state) {
+    return !!state.loaded
+  },
+  isLoadedFor: (state) => (tableId, viewId) => {
+    return (
+      !!state.loaded &&
+      state.loaded.tableId === tableId &&
+      state.loaded.viewId === viewId
+    )
+  },
+  get: (state) => (id) => {
+    return state.items.find((item) => item.id === id)
+  },
+  getAll(state) {
+    return state.items
+  },
+}
+
+export default {
+  namespaced: true,
+  state,
+  getters,
+  actions,
+  mutations,
+}
+
+export function anyFieldsNeedFetch(fields, registry) {
+  return fields.some((f) => {
+    const relatedFieldType = registry.get('field', f.type)
+    return relatedFieldType.shouldFetchDataWhenAdded()
+  })
+}

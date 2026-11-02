@@ -1,0 +1,954 @@
+import { useNuxtApp } from '#app'
+import WidgetService from '@baserow/modules/dashboard/services/widget'
+import DataSourceService from '@baserow/modules/dashboard/services/dataSource'
+import PublicDashboardService from '@baserow/modules/dashboard/services/publicDashboard'
+import IntegrationService from '@baserow/modules/core/services/integration'
+import { getToken, setToken } from '@baserow/modules/core/utils/auth'
+import { ConcurrentPriorityTaskQueue } from '@baserow/modules/core/utils/queue'
+import debounce from 'lodash/debounce'
+
+export const state = () => ({
+  dashboardId: null,
+  dashboardGeneration: 0,
+  widgetFetchGeneration: 0,
+  dataSourceCollectionFetchGeneration: 0,
+  dataSourceDispatchGenerations: {},
+  dataSourceMutationGenerations: {},
+  loading: false,
+  editMode: false,
+  selectedWidgetId: null,
+  widgets: [],
+  dataSources: [],
+  integrations: [],
+  // A cache for data that has been
+  // returned as a result of dispatching
+  // a data source. The keys are data source ids.
+  data: {},
+  // Set while a publicly shared dashboard is shown. Its data sources are then
+  // dispatched through the public endpoint of the slug, with the token of a
+  // password protected dashboard.
+  publicSlug: null,
+  publicAuthToken: null,
+})
+
+let debouncedWidgetUpdate = null
+
+const DEFAULT_DATA_SOURCE_DISPATCH_CONCURRENCY = 5
+const DATA_SOURCE_DISPATCH_MAX_RETRIES = 3
+const DATA_SOURCE_DISPATCH_RETRY_DELAY_MS = 250
+const dataSourceDispatchQueues = new WeakMap()
+
+const getDataSourceDispatchQueue = (state, concurrency) => {
+  let queue = dataSourceDispatchQueues.get(state)
+  if (queue === undefined) {
+    queue = new ConcurrentPriorityTaskQueue({ concurrency })
+    dataSourceDispatchQueues.set(state, queue)
+  } else {
+    queue.setConcurrency(concurrency)
+  }
+  return queue
+}
+
+export const getDataSourceDispatchConcurrency = ($config) => {
+  const configuredValue = Number.parseInt(
+    $config?.public?.baserowDashboardDataSourceDispatchConcurrency,
+    10
+  )
+  return Number.isFinite(configuredValue) && configuredValue > 0
+    ? configuredValue
+    : DEFAULT_DATA_SOURCE_DISPATCH_CONCURRENCY
+}
+
+/**
+ * Orders data sources according to the position of their first widget. Sources
+ * without a widget are kept last, in the order returned by the backend.
+ */
+export const prioritizeDataSources = (dataSources, widgets) => {
+  const widgetPositionByDataSourceId = new Map()
+  ;[...widgets]
+    .sort(
+      (a, b) =>
+        (a.grid_y ?? 0) - (b.grid_y ?? 0) || (a.grid_x ?? 0) - (b.grid_x ?? 0)
+    )
+    .forEach((widget, index) => {
+      if (!widgetPositionByDataSourceId.has(widget.data_source_id)) {
+        widgetPositionByDataSourceId.set(widget.data_source_id, index)
+      }
+    })
+
+  return dataSources
+    .map((dataSource, index) => ({ dataSource, index }))
+    .sort((a, b) => {
+      const aPriority =
+        widgetPositionByDataSourceId.get(a.dataSource.id) ??
+        Number.MAX_SAFE_INTEGER
+      const bPriority =
+        widgetPositionByDataSourceId.get(b.dataSource.id) ??
+        Number.MAX_SAFE_INTEGER
+      return aPriority - bPriority || a.index - b.index
+    })
+    .map(({ dataSource }) => dataSource)
+}
+
+/** Returns whether the request was rejected by a concurrency or rate limit. */
+const isTooManyRequestsError = (error) =>
+  error?.isTooManyRequests?.() || error?.response?.status === 429
+
+const getRetryAfterMs = (error, attempt) => {
+  const headers = error?.response?.headers
+  const retryAfter = headers?.get?.('retry-after') ?? headers?.['retry-after']
+  if (retryAfter !== undefined) {
+    const seconds = Number.parseFloat(retryAfter)
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000
+    }
+
+    const retryAt = Date.parse(retryAfter)
+    if (Number.isFinite(retryAt)) {
+      return Math.max(0, retryAt - Date.now())
+    }
+  }
+
+  return DATA_SOURCE_DISPATCH_RETRY_DELAY_MS * 2 ** attempt
+}
+
+const normalizeDashboardFetchRequest = (request, state, generationKey) => {
+  const requestValues =
+    typeof request === 'object' && request !== null
+      ? request
+      : { dashboardId: request }
+
+  return {
+    dashboardId: requestValues.dashboardId,
+    dashboardGeneration:
+      requestValues.dashboardGeneration ?? state.dashboardGeneration,
+    generation: requestValues.generation ?? state[generationKey],
+  }
+}
+
+const normalizeDataSourceRequestContext = (request, state) => {
+  const requestValues =
+    typeof request === 'object' && request !== null
+      ? request
+      : { dataSourceId: request }
+
+  return {
+    dataSourceId: requestValues.dataSourceId,
+    dashboardId: requestValues.dashboardId ?? state.dashboardId,
+    dashboardGeneration:
+      requestValues.dashboardGeneration ?? state.dashboardGeneration,
+  }
+}
+
+const getDataSourceDispatchGeneration = (state, dataSourceId) =>
+  state.dataSourceDispatchGenerations[dataSourceId] ?? 0
+
+const getDataSourceMutationGeneration = (state, dataSourceId) =>
+  state.dataSourceMutationGenerations[dataSourceId] ?? 0
+
+const getDataSourceDispatchRequest = (request, state) => {
+  const requestContext = normalizeDataSourceRequestContext(request, state)
+  return {
+    ...requestContext,
+    generation: getDataSourceDispatchGeneration(
+      state,
+      requestContext.dataSourceId
+    ),
+  }
+}
+
+const getDataSourceMutationRequest = (request, state) => {
+  const requestContext = normalizeDataSourceRequestContext(request, state)
+  return {
+    ...requestContext,
+    generation: getDataSourceMutationGeneration(
+      state,
+      requestContext.dataSourceId
+    ),
+  }
+}
+
+const isDashboardRequestCurrent = (state, request) => {
+  return (
+    state.dashboardId === request.dashboardId &&
+    state.dashboardGeneration === request.dashboardGeneration
+  )
+}
+
+const isFetchRequestCurrent = (state, request, generationKey) => {
+  return (
+    isDashboardRequestCurrent(state, request) &&
+    state[generationKey] === request.generation
+  )
+}
+
+const isDataSourceDispatchCurrent = (state, request) => {
+  return (
+    isDashboardRequestCurrent(state, request) &&
+    state.dataSources.some(
+      (dataSource) => dataSource.id === request.dataSourceId
+    ) &&
+    getDataSourceDispatchGeneration(state, request.dataSourceId) ===
+      request.generation
+  )
+}
+
+const isDataSourceMutationCurrent = (state, request) => {
+  return (
+    isDashboardRequestCurrent(state, request) &&
+    state.dataSources.some(
+      (dataSource) => dataSource.id === request.dataSourceId
+    ) &&
+    getDataSourceMutationGeneration(state, request.dataSourceId) ===
+      request.generation
+  )
+}
+
+const refreshAfterWidgetCreation = async (dispatch, dashboard) => {
+  const refreshes = [
+    () => dispatch('fetchNewDataSources', dashboard.id),
+    () => dispatch('application/refreshPermissions', dashboard, { root: true }),
+  ]
+  const results = await Promise.allSettled(
+    refreshes.map((refresh) => Promise.resolve().then(refresh))
+  )
+  const retries = results.flatMap((result, index) => {
+    return result.status === 'rejected'
+      ? [Promise.resolve().then(refreshes[index])]
+      : []
+  })
+
+  await Promise.allSettled(retries)
+}
+
+export const mutations = {
+  RESET(state) {
+    dataSourceDispatchQueues.get(state)?.cancelPending()
+    state.dashboardId = null
+    state.dashboardGeneration += 1
+    state.widgetFetchGeneration += 1
+    state.dataSourceCollectionFetchGeneration += 1
+    state.dataSourceDispatchGenerations = {}
+    state.dataSourceMutationGenerations = {}
+    state.editMode = false
+    state.selectedWidgetId = null
+    state.widgets = []
+    state.dataSources = []
+    state.integrations = []
+    state.data = {}
+    state.publicSlug = null
+    state.publicAuthToken = null
+  },
+  SET_PUBLIC(state, { slug, authToken = null }) {
+    state.publicSlug = slug
+    state.publicAuthToken = authToken
+  },
+  SET_DASHBOARD_ID(state, dashboardId) {
+    if (state.dashboardId !== dashboardId) {
+      dataSourceDispatchQueues.get(state)?.cancelPending()
+      state.dashboardGeneration += 1
+      state.widgetFetchGeneration += 1
+      state.dataSourceCollectionFetchGeneration += 1
+      state.dataSourceDispatchGenerations = {}
+      state.dataSourceMutationGenerations = {}
+    }
+    state.dashboardId = dashboardId
+  },
+  INVALIDATE_WIDGET_FETCH(state) {
+    state.widgetFetchGeneration += 1
+  },
+  INVALIDATE_DATA_SOURCE_COLLECTION_FETCH(state) {
+    state.dataSourceCollectionFetchGeneration += 1
+  },
+  INVALIDATE_DATA_SOURCE_DISPATCH(state, dataSourceId) {
+    state.dataSourceDispatchGenerations[dataSourceId] =
+      getDataSourceDispatchGeneration(state, dataSourceId) + 1
+  },
+  INVALIDATE_DATA_SOURCE_MUTATION(state, dataSourceId) {
+    state.dataSourceMutationGenerations[dataSourceId] =
+      getDataSourceMutationGeneration(state, dataSourceId) + 1
+  },
+  TOGGLE_EDIT_MODE(state) {
+    state.editMode = !state.editMode
+  },
+  ADD_WIDGET(state, widget) {
+    const existingWidget = state.widgets.find(
+      (existingWidget) => existingWidget.id === widget.id
+    )
+    if (existingWidget) {
+      Object.assign(existingWidget, widget)
+    } else {
+      state.widgets.push(widget)
+    }
+  },
+  SET_WIDGETS(state, widgets) {
+    state.widgets = widgets
+    if (!widgets.some((widget) => widget.id === state.selectedWidgetId)) {
+      state.selectedWidgetId = null
+    }
+  },
+  ADD_DATA_SOURCE(state, dataSource) {
+    const existingDataSource = state.dataSources.find(
+      (existingDataSource) => existingDataSource.id === dataSource.id
+    )
+    if (existingDataSource) {
+      Object.assign(existingDataSource, dataSource)
+    } else {
+      state.dataSources.push(dataSource)
+    }
+  },
+  SET_DATA_SOURCES(state, dataSources) {
+    const dataSourceIds = new Set(dataSources.map(({ id }) => id))
+
+    for (const existingDataSource of state.dataSources) {
+      if (!dataSourceIds.has(existingDataSource.id)) {
+        state.dataSourceDispatchGenerations[existingDataSource.id] =
+          getDataSourceDispatchGeneration(state, existingDataSource.id) + 1
+        state.dataSourceMutationGenerations[existingDataSource.id] =
+          getDataSourceMutationGeneration(state, existingDataSource.id) + 1
+        delete state.data[existingDataSource.id]
+      }
+    }
+
+    const existingDataSourcesById = Object.fromEntries(
+      state.dataSources.map((dataSource) => [dataSource.id, dataSource])
+    )
+    state.dataSources = dataSources.map((dataSource) => {
+      const existingDataSource = existingDataSourcesById[dataSource.id]
+      if (existingDataSource) {
+        Object.assign(existingDataSource, dataSource)
+        return existingDataSource
+      }
+      return dataSource
+    })
+  },
+  UPDATE_DATA_SOURCE(state, { dataSourceId, values }) {
+    const dataSource = state.dataSources.find(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+    if (dataSource) {
+      Object.assign(dataSource, values)
+    } else {
+      state.dataSources.push({ id: dataSourceId, ...values })
+    }
+  },
+  UPDATE_DATA(state, { dataSourceId, values }) {
+    if (state.data[dataSourceId] === undefined) {
+      state.data[dataSourceId] = {}
+    }
+    state.data = {
+      ...state.data,
+      [dataSourceId]: { ...values },
+    }
+  },
+  ADD_INTEGRATION(state, integration) {
+    state.integrations.push(integration)
+  },
+  SELECT_WIDGET(state, widgetId) {
+    state.selectedWidgetId = widgetId
+  },
+  UPDATE_WIDGET(state, { widgetId, values }) {
+    const widget = state.widgets.find((widget) => widget.id === widgetId)
+    if (!widget) {
+      return
+    }
+    // In Vue 3, direct assignment works thanks to Proxy-based reactivity
+    if (Array.isArray(values.series_config)) {
+      widget.series_config = [...values.series_config]
+    }
+    Object.assign(widget, values)
+  },
+  UPDATE_WIDGET_LAYOUTS(state, layouts) {
+    const widgetsById = new Map(
+      state.widgets.map((widget) => [widget.id, widget])
+    )
+    layouts.forEach(({ id, grid_x, grid_y, grid_width, grid_height }) => {
+      const widget = widgetsById.get(id)
+      if (widget) {
+        Object.assign(widget, { grid_x, grid_y, grid_width, grid_height })
+      }
+    })
+  },
+  DELETE_WIDGET(state, widgetId) {
+    const index = state.widgets.findIndex((widget) => widget.id === widgetId)
+    if (index !== -1) {
+      state.widgets.splice(index, 1)
+    }
+    if (state.selectedWidgetId === widgetId) {
+      state.selectedWidgetId = null
+    }
+  },
+  SET_LOADING(state, value) {
+    state.loading = value
+  },
+}
+
+export const actions = {
+  reset({ commit }) {
+    commit('RESET')
+  },
+  toggleEditMode({ commit }) {
+    commit('TOGGLE_EDIT_MODE')
+  },
+  enterEditMode({ getters, commit }) {
+    if (!getters.isEditMode) {
+      commit('TOGGLE_EDIT_MODE')
+    }
+  },
+  selectWidget({ commit }, widgetId) {
+    commit('SELECT_WIDGET', widgetId)
+  },
+  updateWidget(
+    { state, commit, dispatch },
+    { widgetId, values, originalValues }
+  ) {
+    return new Promise((resolve, reject) => {
+      const { $client } = this
+      commit('INVALIDATE_WIDGET_FETCH')
+      const request = normalizeDashboardFetchRequest(
+        state.dashboardId,
+        state,
+        'widgetFetchGeneration'
+      )
+      commit('UPDATE_WIDGET', { widgetId, values })
+
+      let previousOriginalValues = originalValues
+      if (debouncedWidgetUpdate) {
+        debouncedWidgetUpdate.cancel()
+        previousOriginalValues = debouncedWidgetUpdate.originalValues
+      }
+
+      debouncedWidgetUpdate = debounce(async () => {
+        try {
+          await WidgetService($client).update(widgetId, values)
+          debouncedWidgetUpdate = null
+          if (
+            isDashboardRequestCurrent(state, request) &&
+            !isFetchRequestCurrent(state, request, 'widgetFetchGeneration')
+          ) {
+            await dispatch('fetchWidgets', request.dashboardId)
+          }
+          resolve()
+        } catch (error) {
+          if (isFetchRequestCurrent(state, request, 'widgetFetchGeneration')) {
+            commit('UPDATE_WIDGET', {
+              widgetId,
+              values: previousOriginalValues,
+            })
+          } else if (isDashboardRequestCurrent(state, request)) {
+            await dispatch('fetchWidgets', request.dashboardId)
+          }
+          reject(error)
+        }
+      }, 1000)
+      debouncedWidgetUpdate.originalValues = previousOriginalValues
+      debouncedWidgetUpdate()
+    })
+  },
+  async handleWidgetUpdated({ state, commit, dispatch }, widget) {
+    commit('INVALIDATE_WIDGET_FETCH')
+    if (
+      state.loading ||
+      !state.widgets.some((existingWidget) => existingWidget.id === widget.id)
+    ) {
+      await dispatch('fetchWidgets', state.dashboardId)
+      return
+    }
+    commit('UPDATE_WIDGET', { widgetId: widget.id, values: widget })
+  },
+  async updateDataSource(
+    { state, commit, dispatch },
+    { dataSourceId, values, widget }
+  ) {
+    const { $client, $registry } = this
+    const previousData = state.data[dataSourceId]
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    commit('INVALIDATE_DATA_SOURCE_DISPATCH', dataSourceId)
+    commit('INVALIDATE_DATA_SOURCE_MUTATION', dataSourceId)
+    const request = getDataSourceMutationRequest({ dataSourceId }, state)
+    commit('UPDATE_DATA', { dataSourceId, values: null })
+
+    let data
+    try {
+      const response = await DataSourceService($client).update(
+        dataSourceId,
+        values
+      )
+      data = response.data
+    } catch (error) {
+      if (isDataSourceMutationCurrent(state, request)) {
+        const hasPreviousData =
+          previousData && Object.keys(previousData).length > 0
+        commit('UPDATE_DATA', {
+          dataSourceId,
+          values: hasPreviousData ? previousData : { _error: true },
+        })
+      }
+      throw error
+    }
+
+    if (!isDataSourceMutationCurrent(state, request)) {
+      return
+    }
+
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    commit('UPDATE_DATA_SOURCE', {
+      dataSourceId,
+      values: data,
+    })
+    try {
+      if (widget) {
+        const widgetType = $registry.get('dashboardWidget', widget.type)
+        await widgetType.dataSourceUpdated(widget, data)
+        if (!isDataSourceMutationCurrent(state, request)) {
+          return
+        }
+      }
+
+      await dispatch('dispatchDataSource', {
+        dataSourceId,
+        dashboardId: request.dashboardId,
+        dashboardGeneration: request.dashboardGeneration,
+      })
+    } catch (error) {
+      if (isDataSourceMutationCurrent(state, request)) {
+        commit('UPDATE_DATA', {
+          dataSourceId,
+          values: { _error: true },
+        })
+      }
+      throw error
+    }
+  },
+  async handleDataSourceUpdated({ state, commit, dispatch }, dataSource) {
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    commit('INVALIDATE_DATA_SOURCE_MUTATION', dataSource.id)
+    commit('UPDATE_DATA_SOURCE', {
+      dataSourceId: dataSource.id,
+      values: dataSource,
+    })
+    await dispatch('dispatchDataSource', {
+      dataSourceId: dataSource.id,
+      dashboardId: state.dashboardId,
+      dashboardGeneration: state.dashboardGeneration,
+    })
+  },
+  /**
+   * Shows a publicly shared dashboard. Its widgets and data sources come from
+   * the public info endpoint, so nothing is fetched here. The data sources are
+   * dispatched afterwards with `dispatchDataSources`, in the browser only.
+   */
+  openPublicDashboard(
+    { commit },
+    { slug, authToken = null, dashboardId, widgets, dataSources }
+  ) {
+    commit('RESET')
+    commit('SET_DASHBOARD_ID', dashboardId)
+    commit('SET_PUBLIC', { slug, authToken })
+    commit('SET_WIDGETS', widgets)
+    commit('SET_DATA_SOURCES', dataSources)
+  },
+  /**
+   * Remembers the token that the public auth endpoint handed out for the right
+   * password: in a cookie keyed by the slug, so that it survives a reload, and
+   * in the store for the navigation to the dashboard that follows.
+   */
+  async setPublicAuthToken({ commit }, { slug, token }) {
+    await setToken(this.app, token, slug)
+    commit('SET_PUBLIC', { slug, authToken: token })
+  },
+  /**
+   * Returns the token remembered for the slug: the one in the store when the
+   * visitor just entered the password, otherwise the one in the cookie. `null`
+   * when there is none, which is fine for a dashboard without a password.
+   */
+  async restorePublicAuthToken({ state }, { slug }) {
+    if (state.publicSlug === slug && state.publicAuthToken) {
+      return state.publicAuthToken
+    }
+    return (await getToken(this.app, slug)) || null
+  },
+  /**
+   * Dispatches every data source of the current dashboard, the ones shown by the
+   * top most widgets first.
+   */
+  async dispatchDataSources({ state, dispatch }) {
+    const request = {
+      dashboardId: state.dashboardId,
+      dashboardGeneration: state.dashboardGeneration,
+    }
+    const queuedDataSources = prioritizeDataSources(
+      state.dataSources,
+      state.widgets
+    )
+    await Promise.allSettled(
+      queuedDataSources.map((dataSource, priority) =>
+        dispatch('dispatchDataSource', {
+          dataSourceId: dataSource.id,
+          dashboardId: request.dashboardId,
+          dashboardGeneration: request.dashboardGeneration,
+          priority,
+        })
+      )
+    )
+  },
+  async fetchInitial({ state, commit, dispatch }, { dashboardId, forEditing }) {
+    const { $client } = this
+    commit('RESET')
+    commit('SET_LOADING', true)
+    commit('SET_DASHBOARD_ID', dashboardId)
+    const request = {
+      dashboardId,
+      dashboardGeneration: state.dashboardGeneration,
+    }
+
+    let widgets
+    do {
+      widgets = await dispatch('fetchWidgets', dashboardId)
+    } while (widgets === undefined && isDashboardRequestCurrent(state, request))
+    if (!isDashboardRequestCurrent(state, request)) {
+      return
+    }
+
+    // Render widgets while their data sources are still loading.
+    commit('SET_LOADING', false)
+    let dataSources
+    do {
+      dataSources = await dispatch('fetchNewDataSources', dashboardId)
+    } while (
+      dataSources === undefined &&
+      isDashboardRequestCurrent(state, request)
+    )
+    if (!isDashboardRequestCurrent(state, request)) {
+      return
+    }
+    if (forEditing) {
+      const { data: integrationsData } =
+        await IntegrationService($client).fetchAll(dashboardId)
+      if (!isDashboardRequestCurrent(state, request)) {
+        return
+      }
+      integrationsData.forEach((integration) => {
+        commit('ADD_INTEGRATION', integration)
+      })
+    }
+  },
+  async fetchWidgets({ state, commit }, requestValues) {
+    const { $client } = this
+    const dashboardId =
+      typeof requestValues === 'object' && requestValues !== null
+        ? requestValues.dashboardId
+        : requestValues
+    if (dashboardId !== state.dashboardId) {
+      return
+    }
+    commit('INVALIDATE_WIDGET_FETCH')
+    const request = normalizeDashboardFetchRequest(
+      dashboardId,
+      state,
+      'widgetFetchGeneration'
+    )
+    const { data } = await WidgetService($client).getAllWidgets(
+      request.dashboardId
+    )
+    if (!isFetchRequestCurrent(state, request, 'widgetFetchGeneration')) {
+      return
+    }
+    commit('SET_WIDGETS', data)
+    return data
+  },
+  async fetchNewDataSources(
+    { state, commit, dispatch, getters },
+    requestValues
+  ) {
+    const { $client } = this
+    const dashboardId =
+      typeof requestValues === 'object' && requestValues !== null
+        ? requestValues.dashboardId
+        : requestValues
+    if (dashboardId !== state.dashboardId) {
+      return
+    }
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    const request = normalizeDashboardFetchRequest(
+      dashboardId,
+      state,
+      'dataSourceCollectionFetchGeneration'
+    )
+    const { data: dataSourcesData } = await DataSourceService(
+      $client
+    ).getAllDataSources(request.dashboardId)
+
+    if (
+      !isFetchRequestCurrent(
+        state,
+        request,
+        'dataSourceCollectionFetchGeneration'
+      )
+    ) {
+      return
+    }
+
+    const dataSourceIdsToDispatch = new Set(
+      dataSourcesData.flatMap((dataSource) => {
+        const existingDataSource = getters.getDataSourceById(dataSource.id)
+        const existingData = state.data[dataSource.id]
+        const shouldDispatch =
+          !existingDataSource ||
+          !existingData ||
+          Object.keys(existingData).length === 0
+        return shouldDispatch ? [dataSource.id] : []
+      })
+    )
+    commit('SET_DATA_SOURCES', dataSourcesData)
+
+    const queuedDataSources = prioritizeDataSources(
+      dataSourcesData.filter(({ id }) => dataSourceIdsToDispatch.has(id)),
+      state.widgets
+    )
+    await Promise.allSettled(
+      queuedDataSources.map((dataSource, priority) =>
+        dispatch('dispatchDataSource', {
+          dataSourceId: dataSource.id,
+          dashboardId: request.dashboardId,
+          dashboardGeneration: request.dashboardGeneration,
+          priority,
+        })
+      )
+    )
+    if (
+      !isFetchRequestCurrent(
+        state,
+        request,
+        'dataSourceCollectionFetchGeneration'
+      )
+    ) {
+      return
+    }
+    return dataSourcesData
+  },
+  async createWidget({ state, dispatch }, { dashboard, widget }) {
+    const { $client } = this
+    const request = {
+      dashboardId: dashboard.id,
+      dashboardGeneration: state.dashboardGeneration,
+    }
+    const { data: widgetData } = await WidgetService($client).create(
+      dashboard.id,
+      widget
+    )
+    if (!isDashboardRequestCurrent(state, request)) {
+      return widgetData
+    }
+    const createdWidget = await dispatch('handleNewWidgetCreated', widgetData)
+    if (!isDashboardRequestCurrent(state, request)) {
+      return createdWidget
+    }
+    dispatch('selectWidget', createdWidget.id)
+    // The POST above is the creation boundary. Refreshing related client state must
+    // never turn a persisted widget into an apparent creation failure.
+    await refreshAfterWidgetCreation(dispatch, dashboard)
+    return createdWidget
+  },
+  handleNewWidgetCreated({ state, commit }, widget) {
+    if (widget.dashboard_id !== state.dashboardId) {
+      return widget
+    }
+    commit('INVALIDATE_WIDGET_FETCH')
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    commit('ADD_WIDGET', widget)
+    return widget
+  },
+  async dispatchDataSource({ state, commit }, requestValues) {
+    const { $client, $config } = this
+    const requestContext = normalizeDataSourceRequestContext(
+      requestValues,
+      state
+    )
+    if (
+      !isDashboardRequestCurrent(state, requestContext) ||
+      !state.dataSources.some(
+        (dataSource) => dataSource.id === requestContext.dataSourceId
+      )
+    ) {
+      return
+    }
+
+    commit('INVALIDATE_DATA_SOURCE_DISPATCH', requestContext.dataSourceId)
+    const request = getDataSourceDispatchRequest(requestContext, state)
+    commit('UPDATE_DATA', { dataSourceId: request.dataSourceId, values: null })
+    const queue = getDataSourceDispatchQueue(
+      state,
+      getDataSourceDispatchConcurrency($config)
+    )
+    const priority = requestValues?.priority ?? 0
+
+    try {
+      const response = await queue.add(
+        () => {
+          if (!isDataSourceDispatchCurrent(state, request)) {
+            return undefined
+          }
+          if (state.publicSlug !== null) {
+            return PublicDashboardService($client).dispatch(
+              state.publicSlug,
+              request.dataSourceId,
+              state.publicAuthToken
+            )
+          }
+          return DataSourceService($client).dispatch(request.dataSourceId)
+        },
+        priority,
+        {
+          maxRetries: DATA_SOURCE_DISPATCH_MAX_RETRIES,
+          shouldRetry: (error) =>
+            isDataSourceDispatchCurrent(state, request) &&
+            isTooManyRequestsError(error),
+          retryDelay: getRetryAfterMs,
+        }
+      )
+      if (
+        response === undefined ||
+        !isDataSourceDispatchCurrent(state, request)
+      ) {
+        return
+      }
+      commit('UPDATE_DATA', {
+        dataSourceId: request.dataSourceId,
+        values: response.data,
+      })
+    } catch (error) {
+      if (!isDataSourceDispatchCurrent(state, request)) {
+        return
+      }
+      commit('UPDATE_DATA', {
+        dataSourceId: request.dataSourceId,
+        values: { _error: true },
+      })
+    }
+  },
+  async deleteWidget({ state, commit, dispatch }, widgetId) {
+    const { $client } = this
+    commit('INVALIDATE_WIDGET_FETCH')
+    const request = normalizeDashboardFetchRequest(
+      state.dashboardId,
+      state,
+      'widgetFetchGeneration'
+    )
+    await WidgetService($client).delete(widgetId)
+    if (!isDashboardRequestCurrent(state, request)) {
+      return
+    }
+    await dispatch('fetchWidgets', request.dashboardId)
+  },
+  async handleWidgetDeleted({ state, commit, dispatch }, widgetId) {
+    const widgetExists = state.widgets.some((widget) => widget.id === widgetId)
+    commit('INVALIDATE_WIDGET_FETCH')
+    if (state.loading || !widgetExists) {
+      await dispatch('fetchWidgets', state.dashboardId)
+      return
+    }
+    commit('DELETE_WIDGET', widgetId)
+  },
+  async updateWidgetLayout({ state, commit }, { dashboardId, layout }) {
+    const { $client } = this
+    commit('INVALIDATE_WIDGET_FETCH')
+    const request = normalizeDashboardFetchRequest(
+      dashboardId,
+      state,
+      'widgetFetchGeneration'
+    )
+    const { data } = await WidgetService($client).updateLayout(
+      dashboardId,
+      layout
+    )
+    if (!isFetchRequestCurrent(state, request, 'widgetFetchGeneration')) {
+      return data
+    }
+    commit('UPDATE_WIDGET_LAYOUTS', data)
+    return data
+  },
+  async handleWidgetsLayoutUpdated({ state, commit, dispatch }) {
+    commit('INVALIDATE_WIDGET_FETCH')
+    commit('INVALIDATE_DATA_SOURCE_COLLECTION_FETCH')
+    await Promise.allSettled([
+      dispatch('fetchWidgets', state.dashboardId),
+      dispatch('fetchNewDataSources', state.dashboardId),
+    ])
+  },
+}
+
+export const getters = {
+  getDashboardId(state) {
+    return state.dashboardId
+  },
+  isEditMode(state) {
+    return state.editMode
+  },
+  isLoading(state) {
+    return state.loading
+  },
+  isEmpty(state) {
+    return state.widgets.length === 0
+  },
+  getWidgetById: (state, getters) => (widgetId) => {
+    return state.widgets.find((widget) => widget.id === widgetId)
+  },
+  getWidgets(state) {
+    return state.widgets.toSorted((first, second) => {
+      const byY = (first.grid_y ?? 0) - (second.grid_y ?? 0)
+      if (byY !== 0) {
+        return byY
+      }
+
+      const byX = (first.grid_x ?? 0) - (second.grid_x ?? 0)
+      if (byX !== 0) {
+        return byX
+      }
+
+      return first.id - second.id
+    })
+  },
+  getSelectedWidgetId(state) {
+    return state.selectedWidgetId
+  },
+  getSelectedWidget(state) {
+    return state.widgets.find((widget) => widget.id === state.selectedWidgetId)
+  },
+  getDataSourceById: (state, getters) => (dataSourceId) => {
+    return state.dataSources.find(
+      (dataSource) => dataSource.id === dataSourceId
+    )
+  },
+  getData(state) {
+    return state.data
+  },
+  getDataForDataSource: (state, getters) => (dataSourceId) => {
+    return state.data[dataSourceId]
+  },
+  isPublic(state) {
+    return state.publicSlug !== null
+  },
+  getPublicSlug(state) {
+    return state.publicSlug
+  },
+  getPublicAuthToken(state) {
+    return state.publicAuthToken
+  },
+  getIntegrations(state) {
+    return state.integrations
+  },
+  getIntegrationById: (state) => (integrationId) => {
+    return state.integrations.find(
+      (integration) => integration.id === integrationId
+    )
+  },
+}
+
+export default {
+  namespaced: true,
+  state,
+  getters,
+  actions,
+  mutations,
+}

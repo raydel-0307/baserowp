@@ -1,0 +1,33 @@
+.markdown {
+  & > .ab-blockquote,
+  & > .ab-code,
+  & > .ab-heading,
+  & > .ab-hr,
+  & > .ab-image,
+  & > .ab-link,
+  & > .ab-table,
+  & > .ab-text {
+    margin-top: 1.5em;
+  }
+
+  & > .ab-list {
+    margin-top: 1em;
+  }
+
+  & > *:first-child {
+    margin-top: 0;
+  }
+
+  // Inline markdown (see the `inline` prop of `MarkdownIt`) has no block
+  // children: it holds inline elements only and inherits the surrounding
+  // typography, so none of the block spacing above applies. The compound
+  // selector keeps this override at the same specificity as the rules above
+  // so that, coming last, it wins.
+  &.markdown--inline {
+    display: inline;
+
+    & > * {
+      margin-top: 0;
+    }
+  }
+}

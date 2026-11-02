@@ -1,0 +1,362 @@
+from dataclasses import dataclass
+
+from django.contrib.auth.models import AbstractUser
+from django.db import transaction
+from django.utils.translation import gettext_lazy as _
+
+from baserow.contrib.dashboard.actions import DASHBOARD_ACTION_CONTEXT
+from baserow.core.action.models import Action
+from baserow.core.action.registries import ActionTypeDescription, UndoableActionType
+from baserow.core.action.scopes import ApplicationActionScopeType
+
+from .models import Widget
+from .service import WidgetService
+from .types import UpdatedWidgetLayout, WidgetLayoutDelta, WidgetLayoutDict
+
+
+class CreateWidgetActionType(UndoableActionType):
+    type = "create_widget"
+    description = ActionTypeDescription(
+        _("Create widget"),
+        _('Widget "%(widget_title)s" (%(widget_id)s) created'),
+        DASHBOARD_ACTION_CONTEXT,
+    )
+    analytics_params = ["dashboard_id", "widget_id", "widget_type"]
+
+    @dataclass
+    class Params:
+        dashboard_id: int
+        dashboard_name: str
+        widget_id: int
+        widget_title: str
+        widget_type: str
+        # ``None`` identifies actions stored before grid layouts were introduced.
+        # Empty lists are valid sides of a delta when no other widget changed.
+        original_layout: list[WidgetLayoutDict] | None = None
+        new_layout: list[WidgetLayoutDict] | None = None
+
+    @classmethod
+    @transaction.atomic
+    def do(
+        cls, user: AbstractUser, dashboard_id: int, widget_type: str, data: dict
+    ) -> Widget:
+        widget_service = WidgetService()
+        created_widget = widget_service.create_widget_with_layout(
+            user, widget_type, dashboard_id, **data
+        )
+        widget = created_widget.widget
+        cls.register_action(
+            user=user,
+            params=cls.Params(
+                widget.dashboard.id,
+                widget.dashboard.name,
+                widget.id,
+                widget.title,
+                widget_type,
+                created_widget.layout_delta.original_layout,
+                created_widget.layout_delta.new_layout,
+            ),
+            scope=cls.scope(widget.dashboard.id),
+            workspace=widget.dashboard.workspace,
+        )
+        return widget
+
+    @classmethod
+    def scope(cls, dashboard_id):
+        return ApplicationActionScopeType.value(dashboard_id)
+
+    @classmethod
+    @transaction.atomic
+    def undo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_undo: Action,
+    ):
+        widget_service = WidgetService()
+        if params.original_layout is None:
+            widget_service.delete_widget_legacy(user, params.widget_id)
+        else:
+            assert params.new_layout is not None
+            updated_layout = widget_service.delete_widget_and_restore_layout(
+                user,
+                params.widget_id,
+                WidgetLayoutDelta(params.new_layout, params.original_layout),
+            )
+            action_to_undo.params["new_layout"] = (
+                updated_layout.layout_delta.original_layout
+            )
+            action_to_undo.params["original_layout"] = (
+                updated_layout.layout_delta.new_layout
+            )
+
+    @classmethod
+    @transaction.atomic
+    def redo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_redo: Action,
+    ):
+        widget_service = WidgetService()
+        if params.new_layout is None:
+            widget_service.restore_widget_legacy(user, params.widget_id)
+        else:
+            assert params.original_layout is not None
+            updated_layout = widget_service.restore_widget_and_update_layout(
+                user,
+                params.dashboard_id,
+                params.widget_id,
+                WidgetLayoutDelta(params.original_layout, params.new_layout),
+            )
+            action_to_redo.params["original_layout"] = (
+                updated_layout.layout_delta.original_layout
+            )
+            action_to_redo.params["new_layout"] = updated_layout.layout_delta.new_layout
+
+
+class UpdateWidgetActionType(UndoableActionType):
+    type = "update_widget"
+    description = ActionTypeDescription(
+        _("Update widget"),
+        _('Widget "%(widget_title)s" (%(widget_id)s) updated'),
+        DASHBOARD_ACTION_CONTEXT,
+    )
+    analytics_params = ["dashboard_id", "widget_id"]
+
+    @dataclass
+    class Params:
+        dashboard_id: int
+        dashboard_name: str
+        widget_id: int
+        widget_title: str
+        widget_type: str
+        widget_original_params: dict[str, any]
+        widget_new_params: dict[str, any]
+
+    @classmethod
+    def do(
+        cls,
+        user: AbstractUser,
+        widget_id: int,
+        widget_type: str,
+        new_data: dict,
+    ) -> Widget:
+        updated_widget = WidgetService().update_widget(user, widget_id, **new_data)
+        cls.register_action(
+            user=user,
+            params=cls.Params(
+                updated_widget.widget.dashboard.id,
+                updated_widget.widget.dashboard.name,
+                updated_widget.widget.id,
+                updated_widget.widget.title,
+                widget_type,
+                updated_widget.original_values,
+                updated_widget.new_values,
+            ),
+            scope=cls.scope(updated_widget.widget.dashboard.id),
+            workspace=updated_widget.widget.dashboard.workspace,
+        )
+        return updated_widget.widget
+
+    @classmethod
+    def scope(cls, dashboard_id):
+        return ApplicationActionScopeType.value(dashboard_id)
+
+    @classmethod
+    def undo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_undo: Action,
+    ):
+        WidgetService().update_widget(
+            user, params.widget_id, **params.widget_original_params
+        )
+
+    @classmethod
+    def redo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_redo: Action,
+    ):
+        WidgetService().update_widget(
+            user, params.widget_id, **params.widget_new_params
+        )
+
+
+class UpdateWidgetLayoutActionType(UndoableActionType):
+    type = "update_widget_layout"
+    description = ActionTypeDescription(
+        _("Update widget layout"),
+        _("Dashboard widget layout updated"),
+        DASHBOARD_ACTION_CONTEXT,
+    )
+    analytics_params = ["dashboard_id"]
+
+    @dataclass
+    class Params:
+        dashboard_id: int
+        dashboard_name: str
+        original_layout: list[WidgetLayoutDict]
+        new_layout: list[WidgetLayoutDict]
+
+    @classmethod
+    @transaction.atomic
+    def do(
+        cls,
+        user: AbstractUser,
+        dashboard_id: int,
+        new_layout: list[WidgetLayoutDict],
+    ) -> UpdatedWidgetLayout:
+        updated_layout = WidgetService().update_visible_widget_layout(
+            user, dashboard_id, new_layout
+        )
+        if updated_layout.layout_delta.has_changes:
+            cls.register_action(
+                user=user,
+                params=cls.Params(
+                    updated_layout.dashboard.id,
+                    updated_layout.dashboard.name,
+                    updated_layout.layout_delta.original_layout,
+                    updated_layout.layout_delta.new_layout,
+                ),
+                scope=cls.scope(updated_layout.dashboard.id),
+                workspace=updated_layout.dashboard.workspace,
+            )
+        return updated_layout
+
+    @classmethod
+    def scope(cls, dashboard_id):
+        return ApplicationActionScopeType.value(dashboard_id)
+
+    @classmethod
+    def undo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_undo: Action,
+    ):
+        updated_layout = WidgetService().replay_widget_layout(
+            user,
+            params.dashboard_id,
+            WidgetLayoutDelta(params.new_layout, params.original_layout),
+        )
+        action_to_undo.params["new_layout"] = (
+            updated_layout.layout_delta.original_layout
+        )
+        action_to_undo.params["original_layout"] = (
+            updated_layout.layout_delta.new_layout
+        )
+
+    @classmethod
+    def redo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_redo: Action,
+    ):
+        updated_layout = WidgetService().replay_widget_layout(
+            user,
+            params.dashboard_id,
+            WidgetLayoutDelta(params.original_layout, params.new_layout),
+        )
+        action_to_redo.params["original_layout"] = (
+            updated_layout.layout_delta.original_layout
+        )
+        action_to_redo.params["new_layout"] = updated_layout.layout_delta.new_layout
+
+
+class DeleteWidgetActionType(UndoableActionType):
+    type = "delete_widget"
+    description = ActionTypeDescription(
+        _("Delete widget"),
+        _('Widget "%(widget_title)s" (%(widget_id)s) deleted'),
+        DASHBOARD_ACTION_CONTEXT,
+    )
+    analytics_params = ["dashboard_id", "widget_id"]
+
+    @dataclass
+    class Params:
+        dashboard_id: int
+        dashboard_name: str
+        widget_id: int
+        widget_title: str
+        # ``None`` identifies actions stored before grid layouts were introduced.
+        # Empty lists are valid sides of a delta when a widget is created/deleted.
+        original_layout: list[WidgetLayoutDict] | None = None
+        new_layout: list[WidgetLayoutDict] | None = None
+
+    @classmethod
+    @transaction.atomic
+    def do(cls, user: AbstractUser, widget_id: int) -> None:
+        updated_layout = WidgetService().delete_widget_and_compact_layout(
+            user, widget_id
+        )
+        deleted_widget = updated_layout.deleted_widget
+        assert deleted_widget is not None
+        cls.register_action(
+            user=user,
+            params=cls.Params(
+                updated_layout.dashboard.id,
+                updated_layout.dashboard.name,
+                deleted_widget.id,
+                deleted_widget.title,
+                updated_layout.layout_delta.original_layout,
+                updated_layout.layout_delta.new_layout,
+            ),
+            scope=cls.scope(updated_layout.dashboard.id),
+            workspace=updated_layout.dashboard.workspace,
+        )
+
+    @classmethod
+    def scope(cls, dashboard_id):
+        return ApplicationActionScopeType.value(dashboard_id)
+
+    @classmethod
+    def undo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_undo: Action,
+    ):
+        widget_service = WidgetService()
+        if params.original_layout is None:
+            widget_service.restore_widget_legacy(user, params.widget_id)
+        else:
+            assert params.new_layout is not None
+            updated_layout = widget_service.restore_widget_and_update_layout(
+                user,
+                params.dashboard_id,
+                params.widget_id,
+                WidgetLayoutDelta(params.new_layout, params.original_layout),
+            )
+            action_to_undo.params["new_layout"] = (
+                updated_layout.layout_delta.original_layout
+            )
+            action_to_undo.params["original_layout"] = (
+                updated_layout.layout_delta.new_layout
+            )
+
+    @classmethod
+    def redo(
+        cls,
+        user: AbstractUser,
+        params: Params,
+        action_to_redo: Action,
+    ):
+        widget_service = WidgetService()
+        if params.new_layout is None:
+            widget_service.delete_widget_legacy(user, params.widget_id)
+        else:
+            assert params.original_layout is not None
+            updated_layout = widget_service.delete_widget_and_restore_layout(
+                user,
+                params.widget_id,
+                WidgetLayoutDelta(params.original_layout, params.new_layout),
+            )
+            action_to_redo.params["original_layout"] = (
+                updated_layout.layout_delta.original_layout
+            )
+            action_to_redo.params["new_layout"] = updated_layout.layout_delta.new_layout

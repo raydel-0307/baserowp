@@ -1,0 +1,78 @@
+from django.conf import settings
+
+from celery_singleton import Singleton
+
+from baserow.config.celery import app
+
+from .action.tasks import cleanup_old_actions, setup_periodic_action_tasks
+from .chat_runs.tasks import (
+    execute_chat_run,
+    prune_chat_runs,
+    setup_periodic_chat_run_tasks,
+    sweep_chat_runs,
+)
+from .last_viewed.tasks import (
+    clean_up_stale_last_viewed_items,
+    mark_item_viewed,
+    setup_periodic_last_viewed_tasks,
+)
+from .mcp.oauth.tasks import (
+    delete_unused_mcp_oauth_clients,
+    setup_periodic_mcp_oauth_tasks,
+)
+from .snapshots.tasks import delete_expired_snapshots
+from .telemetry.tasks import initialize_otel
+from .trash.tasks import (
+    mark_old_trash_for_permanent_deletion,
+    permanently_delete_marked_trash,
+    setup_period_trash_tasks,
+)
+from .usage.tasks import run_calculate_storage
+from .user.tasks import (
+    check_pending_account_deletion,
+    share_onboarding_details_with_baserow,
+)
+from .user_templates.tasks import (
+    delete_orphaned_user_template_workspaces,
+    setup_periodic_user_template_tasks,
+)
+
+
+@app.task(
+    base=Singleton,
+    raise_on_duplicate=False,
+    bind=True,
+    queue="export",
+    time_limit=settings.BASEROW_SYNC_TEMPLATES_TIME_LIMIT,
+    lock_expiry=settings.BASEROW_SYNC_TEMPLATES_TIME_LIMIT,
+)
+def sync_templates_task(self):
+    from baserow.core.handler import CoreHandler
+
+    CoreHandler().sync_templates(pattern=settings.BASEROW_SYNC_TEMPLATES_PATTERN)
+
+
+__all__ = [
+    "delete_unused_mcp_oauth_clients",
+    "setup_periodic_mcp_oauth_tasks",
+    "execute_chat_run",
+    "prune_chat_runs",
+    "setup_periodic_chat_run_tasks",
+    "sweep_chat_runs",
+    "permanently_delete_marked_trash",
+    "mark_old_trash_for_permanent_deletion",
+    "setup_period_trash_tasks",
+    "cleanup_old_actions",
+    "setup_periodic_action_tasks",
+    "sync_templates_task",
+    "run_calculate_storage",
+    "check_pending_account_deletion",
+    "delete_expired_snapshots",
+    "initialize_otel",
+    "share_onboarding_details_with_baserow",
+    "mark_item_viewed",
+    "clean_up_stale_last_viewed_items",
+    "setup_periodic_last_viewed_tasks",
+    "delete_orphaned_user_template_workspaces",
+    "setup_periodic_user_template_tasks",
+]

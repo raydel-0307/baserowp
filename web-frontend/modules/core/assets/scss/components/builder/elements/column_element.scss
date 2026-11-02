@@ -1,0 +1,27 @@
+.column-element {
+  display: grid;
+  width: 100%;
+  gap: var(--space-between-columns);
+  align-items: stretch;
+  grid-template-columns: var(--grid-template-columns);
+}
+
+.column-element__column {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: var(--alignment);
+  min-width: 0;
+}
+
+.column-element__element {
+  width: 100%;
+}
+
+.column-element__column > .add-element-zone {
+  flex: 1;
+}
+
+.column-element__column > .add-element-zone--drag-active {
+  min-height: 24px;
+}

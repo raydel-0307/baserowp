@@ -1,0 +1,174 @@
+import { ApplicationType } from '@baserow/modules/core/applicationTypes'
+import ApplicationContext from '@baserow/modules/automation/components/application/ApplicationContext'
+import AutomationForm from '@baserow/modules/automation/components/form/AutomationForm'
+import SidebarComponentAutomation from '@baserow/modules/automation/components/sidebar/SidebarComponentAutomation'
+import { populateAutomationWorkflow } from '@baserow/modules/automation/store/automationWorkflow'
+import { pageFinished } from '@baserow/modules/core/utils/routing'
+import { nextTick } from '#imports'
+import WorkflowTemplate from '@baserow/modules/automation/components/workflow/WorkflowTemplate.vue'
+import WorkflowTemplateSideBar from '@baserow/modules/automation/components/workflow/WorkflowTemplateSideBar.vue'
+import { integrationsErrorMessage } from '@baserow/modules/core/utils/integration'
+
+export class AutomationApplicationType extends ApplicationType {
+  static getType() {
+    return 'automation'
+  }
+
+  getIconClass() {
+    return 'baserow-icon-automation'
+  }
+
+  getIconColor() {
+    return 'yellow'
+  }
+
+  getName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.automation')
+  }
+
+  getNamePlural() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.automations')
+  }
+
+  getViewLabel() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.viewAutomation')
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.automationDesc')
+  }
+
+  getDefaultName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.automationDefaultName')
+  }
+
+  supportsTrash() {
+    return false
+  }
+
+  getApplicationContextComponent() {
+    return ApplicationContext
+  }
+
+  getErrorMessage(application) {
+    return integrationsErrorMessage(this.app, application.integrations)
+  }
+
+  getApplicationFormComponent() {
+    return AutomationForm
+  }
+
+  getSidebarComponent() {
+    return SidebarComponentAutomation
+  }
+
+  getTemplateSidebarComponent() {
+    return WorkflowTemplateSideBar
+  }
+
+  getTemplatesPageComponent() {
+    return WorkflowTemplate
+  }
+
+  getTemplatePage(application) {
+    return {
+      automation: application,
+      page: application.workflows[0],
+    }
+  }
+
+  delete(application) {
+    const { $store, $router } = this.app
+    const workflowSelected = $store.getters['automationWorkflow/getWorkflows'](
+      application
+    ).some((workflow) => workflow._.selected)
+
+    if (workflowSelected) {
+      $router.push({
+        name: 'workspace',
+        params: { workspaceId: application.workspace.id },
+      })
+    }
+  }
+
+  async loadExtraData(automation) {
+    const { $store } = this.app
+    if (!automation._loadedOnce) {
+      const [integrations] = await Promise.all([
+        $store.dispatch('integration/fetch', {
+          application: automation,
+        }),
+      ])
+
+      // Null when the list changed under the fetch and it gave up rather than
+      // write an answer older than the screen. Marking the automation loaded
+      // now would leave its dropdowns short for the session.
+      if (integrations !== null) {
+        await $store.dispatch('application/forceUpdate', {
+          application: automation,
+          data: { _loadedOnce: true },
+        })
+      }
+    }
+  }
+
+  populate(application) {
+    const values = super.populate(application)
+    values.workflows = values.workflows.map(populateAutomationWorkflow)
+    if (!values.integrations) {
+      values.integrations = []
+    }
+    if (!values.selectedNodeId) {
+      values.selectedNodeId = null
+    }
+    return values
+  }
+
+  async select(application) {
+    const { $router, $store, $i18n } = this.app
+
+    const workflows =
+      $store.getters['automationWorkflow/getWorkflows'](application)
+
+    if (workflows.length > 0) {
+      await $router.push({
+        name: 'automation-workflow',
+        params: {
+          automationId: application.id,
+          workflowId: workflows[0].id,
+        },
+      })
+      await pageFinished(this.app)
+      await nextTick()
+      return true
+    } else {
+      $store.dispatch('toast/error', {
+        title: $i18n.t('applicationType.cantSelectAutomationWorkflowTitle'),
+        message: $i18n.t(
+          'applicationType.cantSelectAutomationWorkflowDescription'
+        ),
+      })
+    }
+
+    return true
+  }
+
+  isVisible(application) {
+    // Don't show an automation application when the user doesn't
+    // have permissions to list workflows.
+    return this.app.$hasPermission(
+      'automation.list_workflows',
+      application,
+      application.workspace.id
+    )
+  }
+
+  getOrder() {
+    return 90
+  }
+}

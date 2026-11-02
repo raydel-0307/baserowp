@@ -1,0 +1,2735 @@
+import {
+  CheckboxElementType,
+  ChoiceElementType,
+  ElementType,
+  InputTextElementType,
+  RecordSelectorElementType,
+  RatingInputElementType,
+  RatingElementType,
+} from '@baserow/modules/builder/elementTypes'
+import {
+  VISIBILITY_NOT_LOGGED,
+  VISIBILITY_LOGGED_IN,
+  ROLE_TYPE_ALLOW_EXCEPT,
+  ROLE_TYPE_DISALLOW_EXCEPT,
+  VISIBILITY_ALL,
+  ROLE_TYPE_ALLOW_ALL,
+  DATA_SCOPES,
+} from '@baserow/modules/builder/constants'
+import {
+  CHOICE_OPTION_TYPES,
+  IFRAME_SOURCE_TYPES,
+  IMAGE_SOURCE_TYPES,
+  PAGE_ELEMENT_BEHAVIOURS,
+} from '@baserow/modules/builder/enums'
+import { LocalBaserowListRowsServiceType } from '@baserow/modules/integrations/localBaserow/serviceTypes'
+
+describe('elementTypes tests', () => {
+  let testApp
+  beforeAll(() => {
+    testApp = useNuxtApp()
+  })
+  const contextBlankParam = { page: { parameters: { id: '' } } }
+
+  const misconfiguredOpenPageWorkflowActionPage = {
+    id: 1,
+    shared: false,
+    path_params: [{ name: 'id', type: 'numeric' }],
+  }
+  const misconfiguredOpenPageWorkflowAction = {
+    type: 'open_page',
+    page_parameters: [],
+    navigation_type: 'page',
+    navigate_to_page_id: misconfiguredOpenPageWorkflowActionPage.id,
+  }
+
+  describe('CollectionElementTypeMixin tests', () => {
+    test('hasAncestorOfType', () => {
+      const page = { id: 123 }
+      const elementParent = { id: 456, type: 'column', page_id: page.id }
+      const element = {
+        id: 789,
+        type: 'heading',
+        page_id: page.id,
+      }
+      page.graph = { 0: 456, 456: { children: { '': [789] } }, 789: {} }
+      page.elementMap = { 456: elementParent, 789: element }
+      const elementType = testApp.$registry.get('element', element.type)
+      expect(elementType.hasAncestorOfType(page, element, 'column')).toBe(true)
+      expect(elementType.hasAncestorOfType(page, element, 'repeat')).toBe(false)
+    })
+
+    test('hasCollectionAncestor', () => {
+      const page = { id: 123 }
+      const repeatAncestor = { id: 111, type: 'repeat', page_id: page.id }
+      const tableElement = {
+        id: 222,
+        type: 'table',
+        page_id: page.id,
+      }
+      page.graph = { 0: 111, 111: { children: { '': [222] } }, 222: {} }
+      page.elementMap = { 111: repeatAncestor, 222: tableElement }
+      const repeatElementType = testApp.$registry.get(
+        'element',
+        repeatAncestor.type
+      )
+      expect(
+        repeatElementType.hasCollectionAncestor(page, repeatAncestor)
+      ).toBe(false)
+      const tableElementType = testApp.$registry.get(
+        'element',
+        tableElement.type
+      )
+      expect(tableElementType.hasCollectionAncestor(page, tableElement)).toBe(
+        true
+      )
+    })
+
+    test('uses the data scope to include a repeat in its record index path', () => {
+      const page = { id: 123 }
+      const repeat = { id: 111, type: 'repeat', page_id: page.id }
+      page.graph = { 0: 111, 111: {} }
+      page.elementMap = { 111: repeat }
+      const elementType = testApp.$registry.get('element', repeat.type)
+      const applicationContext = {
+        builder: { id: 1 },
+        page,
+        recordIndexPath: [3],
+      }
+
+      expect(
+        elementType.uniqueElementId({ element: repeat, applicationContext })
+      ).toBe('111')
+      expect(
+        elementType.uniqueElementId({
+          element: repeat,
+          applicationContext: {
+            ...applicationContext,
+            dataScope: DATA_SCOPES.INCLUDE_TARGET_ELEMENT,
+          },
+        })
+      ).toBe('111.3')
+    })
+
+    test('table and menu events resolve formulas against their selected records', async () => {
+      const tableElementType = testApp.$registry.get('element', 'table')
+      const menuElementType = testApp.$registry.get('element', 'menu')
+      const table = {
+        id: 11,
+        type: 'table',
+        page_id: 1,
+        data_source_id: 1,
+        fields: [{ type: 'button', uid: 'table-button', name: 'Table button' }],
+        _: { content: [{ name: 'First cell' }, { name: 'Second cell' }] },
+      }
+      const repeat = {
+        id: 12,
+        type: 'repeat',
+        page_id: 1,
+        data_source_id: 2,
+        _: { content: [{ name: 'First row' }, { name: 'Second row' }] },
+      }
+      const menu = {
+        id: 13,
+        type: 'menu',
+        page_id: 1,
+        menu_items: [
+          { type: 'button', uid: 'menu-button', name: 'Menu button' },
+        ],
+      }
+      const page = {
+        id: 1,
+        dataSources: [
+          { id: 1, type: 'csv_file_reader' },
+          { id: 2, type: 'csv_file_reader' },
+        ],
+        elementMap: { 11: table, 12: repeat, 13: menu },
+        graph: {
+          0: 11,
+          11: { next: { '': [12] } },
+          12: { children: { '': [13] } },
+          13: {},
+        },
+      }
+      const builder = { id: 1, pages: [page, { id: 2, shared: true }] }
+      const resolvedValues = []
+      const workflowAction = { id: 1, type: 'test' }
+      const workflowActionType = {
+        execute: ({ resolveFormula }) => {
+          resolvedValues.push(
+            resolveFormula({
+              formula: "get('current_record.name')",
+              mode: 'advanced',
+            })
+          )
+        },
+      }
+      const app = {
+        $registry: {
+          get: (registryName, type) =>
+            registryName === 'workflowAction'
+              ? workflowActionType
+              : testApp.$registry.get(registryName, type),
+          getAll: (...args) => testApp.$registry.getAll(...args),
+        },
+        $store: {
+          getters: { 'page/getSharedPage': () => builder.pages[1] },
+          dispatch: vi.fn(),
+        },
+        $i18n: testApp.$i18n,
+      }
+
+      for (const [event, element, expected] of [
+        [tableElementType.getEvents(table)[0], table, 'Second cell'],
+        [menuElementType.getEvents(menu)[0], menu, 'Second row'],
+      ]) {
+        event.app = app
+        await event.fire({
+          workflowActions: [workflowAction],
+          applicationContext: {
+            builder,
+            page,
+            element,
+            recordIndexPath: [1],
+            dataScope: DATA_SCOPES.INCLUDE_TARGET_ELEMENT,
+          },
+        })
+        expect(resolvedValues.at(-1)).toBe(expected)
+      }
+    })
+
+    test('hasSourceOfData', () => {
+      const repeatElementType = testApp.$registry.get('element', 'repeat')
+      expect(repeatElementType.hasSourceOfData({ data_source_id: 1 })).toBe(
+        true
+      )
+      expect(
+        repeatElementType.hasSourceOfData({ schema_property: 'field_1' })
+      ).toBe(true)
+      expect(
+        repeatElementType.hasSourceOfData({
+          data_source_id: null,
+          schema_property: null,
+        })
+      ).toBe(false)
+    })
+  })
+
+  describe('elementType getDisplayName permutation tests', () => {
+    test('ElementType returns the name by default', () => {
+      const elementType = new ElementType()
+      expect(elementType.getDisplayName({}, {})).toBe(null)
+    })
+    test('ColumnElementType returns the name by default', () => {
+      const elementType = testApp.$registry.get('element', 'column')
+      expect(elementType.getDisplayName({}, {})).toBe('elementType.column')
+    })
+    test('ColumnElementType provides its public responsive styles', () => {
+      const elementType = testApp.$registry.get('element', 'column')
+      const styles = elementType.getPublicResponsiveStyles({
+        breakpoints: { mobile: 640, tablet: 1024 },
+      })
+
+      expect(styles).toContain('@media (min-width: 1025px)')
+      expect(styles).toContain(
+        '@media (min-width: 641px) and (max-width: 1024px)'
+      )
+      expect(styles).toContain('@media (max-width: 640px)')
+      expect(styles).toContain(
+        '.column-element--public.column-element--stack-smartphone'
+      )
+    })
+    test('InputTextElementType label and default_value variations', () => {
+      const elementType = testApp.$registry.get('element', 'input_text')
+      expect(
+        elementType.getDisplayName({ label: { formula: "'First name'" } }, {})
+      ).toBe('First name')
+      expect(
+        elementType.getDisplayName(
+          { placeholder: { formula: "'Choose a first name...'" } },
+          {}
+        )
+      ).toBe('Choose a first name...')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { label: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(
+        elementType.getDisplayName(
+          { label: { formula: '' }, placeholder: { formula: '' } },
+          {}
+        )
+      ).toBe(elementType.name)
+    })
+    test('ChoiceElementType label, default_value & placeholder variations', () => {
+      const elementType = testApp.$registry.get('element', 'choice')
+      expect(
+        elementType.getDisplayName({ label: { formula: "'Animals'" } }, {})
+      ).toBe('Animals')
+      expect(
+        elementType.getDisplayName(
+          { placeholder: { formula: "'Choose an animal'" } },
+          {}
+        )
+      ).toBe('Choose an animal')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { label: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(
+        elementType.getDisplayName(
+          { label: { formula: '' }, placeholder: { formula: '' } },
+          {}
+        )
+      ).toBe(elementType.name)
+    })
+    test('CheckboxElementType with and without a label to use', () => {
+      const elementType = testApp.$registry.get('element', 'checkbox')
+      expect(
+        elementType.getDisplayName({ label: { formula: "'Active'" } }, {})
+      ).toBe('Active')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { label: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(elementType.getDisplayName({ label: { formula: '' } }, {})).toBe(
+        elementType.name
+      )
+    })
+    test('HeadingElementType with and without a value to use', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      expect(
+        elementType.getDisplayName({ value: { formula: "'A heading'" } }, {})
+      ).toBe('A heading')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { value: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(elementType.getDisplayName({ value: { formula: '' } }, {})).toBe(
+        elementType.name
+      )
+    })
+    test('TextElementType with and without a value to use', () => {
+      const elementType = testApp.$registry.get('element', 'text')
+      expect(
+        elementType.getDisplayName({ value: { formula: "'Some text'" } }, {})
+      ).toBe('Some text')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { value: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(elementType.getDisplayName({ value: { formula: '' } }, {})).toBe(
+        elementType.name
+      )
+    })
+    test('LinkElementType page and custom URL variations', () => {
+      const elementType = testApp.$registry.get('element', 'link')
+      const applicationContext = {
+        builder: {
+          pages: [{ id: 1, name: 'Contact Us', shared: false }],
+        },
+      }
+      expect(
+        elementType.getDisplayName(
+          {
+            navigate_to_page_id: 1,
+            navigation_type: 'page',
+            value: { formula: '' },
+          },
+          applicationContext
+        )
+      ).toBe('elementType.link -> Contact Us')
+
+      // If we were not able to find the page, we fall back to trying for a value.
+      expect(
+        elementType.getDisplayName(
+          {
+            value: { formula: "'Click me'" },
+            navigate_to_page_id: 2,
+            navigation_type: 'page',
+          },
+          applicationContext
+        )
+      ).toBe('Click me')
+
+      // If we were not able to find the page, and there's no value, we fall back to the name.
+      expect(
+        elementType.getDisplayName(
+          {
+            navigate_to_page_id: 2,
+            navigation_type: 'page',
+            value: { formula: '' },
+          },
+          applicationContext
+        )
+      ).toBe(elementType.name)
+
+      expect(
+        elementType.getDisplayName(
+          {
+            navigation_type: 'custom',
+            navigate_to_url: { formula: "'https://baserow.io'" },
+            value: { formula: "'Link name'" },
+          },
+          applicationContext
+        )
+      ).toBe('Link name -> https://baserow.io')
+    })
+    test('ImageElementType with and without alt text to use', () => {
+      const elementType = testApp.$registry.get('element', 'image')
+      expect(
+        elementType.getDisplayName(
+          { alt_text: { formula: "'Baserow logo'" } },
+          {}
+        )
+      ).toBe('Baserow logo')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { alt_text: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(
+        elementType.getDisplayName({ alt_text: { formula: '' } }, {})
+      ).toBe(elementType.name)
+    })
+    test('ButtonElementType with and without value to use', () => {
+      const elementType = testApp.$registry.get('element', 'button')
+      expect(
+        elementType.getDisplayName({ value: { formula: "'Click me'" } }, {})
+      ).toBe('Click me')
+      // If a formula resolves to a blank string, fallback to the name.
+      expect(
+        elementType.getDisplayName(
+          { value: { formula: "get('page_parameter.id')" } },
+          contextBlankParam
+        )
+      ).toBe(elementType.name)
+      expect(elementType.getDisplayName({ value: { formula: '' } }, {})).toBe(
+        elementType.name
+      )
+    })
+    test('TableElementType with and without data_source_id to use', () => {
+      const elementType = testApp.$registry.get('element', 'table')
+      const page = {
+        id: 1,
+        name: 'Contact Us',
+        dataSources: [
+          { id: 1, type: 'local_baserow_list_rows', name: 'Customers' },
+        ],
+      }
+
+      const sharedPage = {
+        id: 2,
+        shared: true,
+        name: '__shared__',
+        dataSources: [],
+      }
+
+      const applicationContext = {
+        page,
+        builder: { pages: [page, sharedPage] },
+      }
+      expect(
+        elementType.getDisplayName({ data_source_id: 1 }, applicationContext)
+      ).toBe('elementType.table - Customers')
+
+      // In the event we don't find the data source.
+      expect(
+        elementType.getDisplayName({ data_source_id: 2 }, applicationContext)
+      ).toBe(elementType.name)
+
+      expect(elementType.getDisplayName({}, applicationContext)).toBe(
+        elementType.name
+      )
+    })
+    test('FormContainerElementType returns the name by default', () => {
+      const elementType = testApp.$registry.get('element', 'form_container')
+      expect(elementType.getDisplayName({}, {})).toBe(elementType.name)
+    })
+    test('IFrameElementType with and without a url to use', () => {
+      const elementType = testApp.$registry.get('element', 'iframe')
+      expect(
+        elementType.getDisplayName(
+          { url: { formula: "'https://www.youtube.com/watch?v=dQw4w9WgXcQ'" } },
+          {}
+        )
+      ).toBe('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+      expect(elementType.getDisplayName({ url: { formula: '' } }, {})).toBe(
+        elementType.name
+      )
+    })
+  })
+  describe('elementType isVisible', () => {
+    test('HeadingElementType isVisible', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+
+      const element = {
+        value: { formula: "'Heading'", mode: 'simple' },
+        roles: [],
+        role_type: ROLE_TYPE_ALLOW_ALL,
+        visibility: VISIBILITY_ALL,
+        visibility_condition: { formula: 'true', mode: 'simple' },
+      }
+
+      const applicationContextNotLogged = {
+        builder: { userSourceUser: { authenticated: false } },
+      }
+      const applicationContextLoggedAdmin = {
+        builder: {
+          userSourceUser: {
+            authenticated: true,
+            user: {
+              email: 'fake@email.com',
+              id: 42,
+              username: 'Fake',
+              role: 'admin',
+              user_source_uid: '',
+            },
+          },
+        },
+      }
+      const applicationContextLoggedUser = {
+        builder: {
+          userSourceUser: {
+            authenticated: true,
+            user: {
+              email: 'fake@email.com',
+              id: 42,
+              username: 'Fake',
+              role: 'user',
+              user_source_uid: '',
+            },
+          },
+        },
+      }
+
+      // Nothing should hide it
+      expect(
+        elementType.isVisible({
+          element,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeTruthy()
+
+      let elementTest = {
+        ...element,
+        visibility_condition: {
+          ...element.visibility_condition,
+          formula: 'false',
+        },
+      }
+      // The visibility formula resolves to false
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeFalsy()
+
+      elementTest = {
+        ...element,
+        visibility: VISIBILITY_NOT_LOGGED,
+      }
+      // Not logged only
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeTruthy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedUser,
+        })
+      ).toBeFalsy()
+
+      elementTest = {
+        ...element,
+        visibility: VISIBILITY_LOGGED_IN,
+      }
+      // Logged only
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeFalsy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedUser,
+        })
+      ).toBeTruthy()
+
+      elementTest = {
+        ...element,
+        visibility: VISIBILITY_LOGGED_IN,
+        role_type: ROLE_TYPE_DISALLOW_EXCEPT,
+        roles: ['admin'],
+      }
+      // Logged admin only
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeFalsy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedUser,
+        })
+      ).toBeFalsy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedAdmin,
+        })
+      ).toBeTruthy()
+
+      elementTest = {
+        ...element,
+        visibility: VISIBILITY_LOGGED_IN,
+        role_type: ROLE_TYPE_ALLOW_EXCEPT,
+        roles: ['admin'],
+      }
+      // Logged except admin
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextNotLogged,
+        })
+      ).toBeFalsy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedUser,
+        })
+      ).toBeTruthy()
+      expect(
+        elementType.isVisible({
+          element: elementTest,
+          applicationContext: applicationContextLoggedAdmin,
+        })
+      ).toBeFalsy()
+    })
+  })
+  describe('elementType form validation tests', () => {
+    test('RatingInputElementType | required | no value', () => {
+      const elementType = new RatingInputElementType()
+      expect(elementType.isValid({ required: true, max_value: 5 }, null)).toBe(
+        false
+      )
+      expect(
+        elementType.isValid({ required: true, max_value: 5 }, undefined)
+      ).toBe(false)
+    })
+
+    test('RatingInputElementType | required | valid value', () => {
+      const elementType = new RatingInputElementType()
+      expect(elementType.isValid({ required: true, max_value: 5 }, 3)).toBe(
+        true
+      )
+    })
+
+    test('RatingInputElementType | not required | no value', () => {
+      const elementType = new RatingInputElementType()
+      expect(elementType.isValid({ required: false, max_value: 5 }, null)).toBe(
+        true
+      )
+      expect(
+        elementType.isValid({ required: false, max_value: 5 }, undefined)
+      ).toBe(false)
+    })
+
+    test('RatingInputElementType | invalid range', () => {
+      const elementType = new RatingInputElementType()
+      expect(elementType.isValid({ max_value: 5 }, -1)).toBe(false)
+      expect(elementType.isValid({ max_value: 5 }, 6)).toBe(false)
+    })
+
+    test('InputTextElementType | required | no value.', () => {
+      const elementType = new InputTextElementType()
+      expect(elementType.isValid({ required: true }, null)).toBe(false)
+    })
+    test('InputTextElementType | required | integer | valid positive value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid({ required: true, validation_type: 'integer' }, 42)
+      ).toBe(true)
+    })
+    test('InputTextElementType | required | integer | valid negative value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid({ required: true, validation_type: 'integer' }, -42)
+      ).toBe(true)
+    })
+    test('InputTextElementType | required | integer | zero value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid({ required: true, validation_type: 'integer' }, 0)
+      ).toBe(true)
+    })
+    test('InputTextElementType | required | integer | invalid value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid(
+          { required: true, validation_type: 'integer' },
+          'horse'
+        )
+      ).toBe(false)
+    })
+    test('InputTextElementType | not required | integer | no value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid({ required: false, validation_type: 'integer' }, '')
+      ).toBe(true)
+    })
+    test.each(['3.2', '32', NaN, Infinity])(
+      'InputTextElementType rejects unparsed or non-finite numeric value %s',
+      (value) => {
+        const elementType = new InputTextElementType()
+        expect(
+          elementType.isValid(
+            { required: false, validation_type: 'integer' },
+            value
+          )
+        ).toBe(false)
+      }
+    )
+    test('InputTextElementType | required | email | valid value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid(
+          { required: true, validation_type: 'email' },
+          'peter@baserow.io'
+        )
+      ).toBe(true)
+    })
+    test('InputTextElementType | required | email | invalid value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid(
+          { required: true, validation_type: 'email' },
+          'peterbaserow.io'
+        )
+      ).toBe(false)
+    })
+    test('InputTextElementType | not required | email | no value.', () => {
+      const elementType = new InputTextElementType()
+      expect(
+        elementType.isValid({ required: false, validation_type: 'email' }, '')
+      ).toBe(true)
+    })
+    // The backend validates with Django's `validate_email`, so the values it
+    // rejects must be rejected here too, not only on submit.
+    test.each(['aaa@aa', 'dzd@vz', 'a@b', 'Dörte@Sörensen.example.com'])(
+      'InputTextElementType | required | email | backend-rejected value %s.',
+      (value) => {
+        const elementType = new InputTextElementType()
+        expect(
+          elementType.isValid(
+            { required: true, validation_type: 'email' },
+            value
+          )
+        ).toBe(false)
+      }
+    )
+    test.each(['foo@bar.com', 'user@localhost', 'user@пример.рф'])(
+      'InputTextElementType | required | email | backend-accepted value %s.',
+      (value) => {
+        const elementType = new InputTextElementType()
+        expect(
+          elementType.isValid(
+            { required: true, validation_type: 'email' },
+            value
+          )
+        ).toBe(true)
+      }
+    )
+    // Django accepts these, but the database email field a form usually writes
+    // into does not, so the element rejects them inline instead of on submit.
+    test.each(["o'brien@example.com", '100%@example.com'])(
+      'InputTextElementType | required | email | email-field value %s.',
+      (value) => {
+        const elementType = new InputTextElementType()
+        expect(
+          elementType.isValid(
+            { required: true, validation_type: 'email' },
+            value
+          )
+        ).toBe(false)
+      }
+    )
+    test('InputTextElementType with any value.', () => {
+      const elementType = new InputTextElementType()
+      expect(elementType.isValid({ validation_type: 'any' }, 42)).toBe(true)
+      expect(elementType.isValid({ validation_type: 'any' }, 'horse')).toBe(
+        true
+      )
+      expect(
+        elementType.isValid({ validation_type: 'any' }, 'peter@baserow.io')
+      ).toBe(true)
+    })
+    test('CheckboxElementType | required | unchecked.', () => {
+      const elementType = new CheckboxElementType()
+      expect(elementType.isValid({ required: true }, false)).toBe(false)
+    })
+    test('CheckboxElementType | required | checked.', () => {
+      const elementType = new CheckboxElementType()
+      expect(elementType.isValid({ required: true }, true)).toBe(true)
+    })
+    test('CheckboxElementType | not required | unchecked.', () => {
+      const elementType = new CheckboxElementType()
+      expect(elementType.isValid({ required: false }, false)).toBe(true)
+    })
+    test('CheckboxElementType | not required | checked.', () => {
+      const elementType = new CheckboxElementType()
+      expect(elementType.isValid({ required: false }, true)).toBe(true)
+    })
+    test('ChoiceElementType | required | no value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, '', {})).toBe(false)
+    })
+    test('ChoiceElementType | required | blank option.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [
+          { id: 1, value: '', name: 'Blank' },
+          { id: 2, value: 'uk', name: 'UK' },
+        ],
+      }
+      expect(elementType.isValid(element, '', {})).toBe(true)
+    })
+    test('ChoiceElementType | required | valid value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, 'uk', {})).toBe(true)
+    })
+    test('ChoiceElementType | not required | no value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: false,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, '', {})).toBe(true)
+    })
+    test('ChoiceElementType | not required | valid value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: false,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, 'uk', {})).toBe(true)
+    })
+    test('ChoiceElementType | required multiple | undefined value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        multiple: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, undefined, {})).toBe(false)
+    })
+    test('ChoiceElementType | not required multiple | undefined value.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: false,
+        multiple: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [{ id: 1, value: 'uk', name: 'UK' }],
+      }
+      expect(elementType.isValid(element, undefined, {})).toBe(true)
+    })
+    test('RecordSelectorElementType | required | no value.', () => {
+      const elementType = new RecordSelectorElementType()
+      const element = { required: true, multiple: false }
+      expect(elementType.isValid(element, '', {})).toBe(false)
+    })
+    test('RecordSelectorType | required | valid value.', () => {
+      const app = {
+        store: {
+          getters: {
+            'elementContent/getElementContent'() {
+              return [{ id: 1 }, { id: 2 }]
+            },
+          },
+        },
+      }
+      const elementType = new RecordSelectorElementType({ app })
+      const element = { required: true, multiple: false, data_source_id: 1 }
+      expect(elementType.isValid(element, 1, {})).toBe(true)
+    })
+    test('RecordSelectorElementType | not required | no value.', () => {
+      const app = {
+        store: {
+          getters: {
+            'elementContent/getElementContent'() {
+              return [{ id: 1 }, { id: 2 }]
+            },
+          },
+        },
+      }
+      const elementType = new RecordSelectorElementType({ app })
+      const element = { required: false, multiple: false, data_source_id: 1 }
+      expect(elementType.isValid(element, '', {})).toBe(true)
+    })
+    test('RecordSelectorType | not required | valid value.', () => {
+      const app = {
+        store: {
+          getters: {
+            'elementContent/getElementContent'() {
+              return [{ id: 1 }, { id: 2 }]
+            },
+          },
+        },
+      }
+      const elementType = new RecordSelectorElementType({ app })
+      const element = { required: false, multiple: false, data_source_id: 1 }
+      expect(elementType.isValid(element, 1, {})).toBe(true)
+    })
+    test.each([
+      [true, undefined, false],
+      [true, null, false],
+      [true, [], false],
+      [true, [1], true],
+      [false, undefined, false],
+      [false, null, false],
+      [false, 1, true],
+    ])(
+      'RecordSelectorElementType | required | multiple=%s, value=%j',
+      (multiple, value, expected) => {
+        const elementType = new RecordSelectorElementType()
+        const element = { required: true, multiple, data_source_id: 1 }
+        expect(elementType.isValid(element, value, {})).toBe(expected)
+      }
+    )
+    test.each([
+      [false, '', null],
+      [false, null, null],
+      [false, '42', 42],
+      [true, [''], []],
+      [true, ['42', '43'], [42, 43]],
+    ])(
+      'Record selector List rows default: multiple=%s, value=%j',
+      (multiple, defaultValue, expected) => {
+        const elementType = new RecordSelectorElementType()
+        vi.spyOn(elementType, 'getRecordIdServiceType').mockReturnValue(
+          new LocalBaserowListRowsServiceType({})
+        )
+        vi.spyOn(elementType, 'resolveFormula').mockReturnValue(defaultValue)
+
+        expect(
+          elementType.getInitialFormDataValue(
+            { multiple, default_value: {} },
+            {}
+          )
+        ).toEqual(expected)
+      }
+    )
+    test('RecordSelectorElementType | string data source id default value.', () => {
+      const serviceType = {
+        parseRecordId(value) {
+          return value
+        },
+        getRecordIdDataType() {
+          return 'string'
+        },
+      }
+      const sharedPage = { id: 2 }
+      const page = { id: 1 }
+      const dataSource = { id: 1, type: 'grouped_rows' }
+      const app = {
+        $registry: {
+          get(namespace, type) {
+            if (namespace === 'service' && type === dataSource.type) {
+              return serviceType
+            }
+          },
+        },
+        $store: {
+          getters: {
+            'page/getSharedPage'() {
+              return sharedPage
+            },
+            'dataSource/getPagesDataSourceById'() {
+              return dataSource
+            },
+          },
+        },
+      }
+      const elementType = new RecordSelectorElementType({ app })
+      vi.spyOn(elementType, 'resolveFormula').mockReturnValue('Group A')
+
+      const element = {
+        default_value: {},
+        multiple: false,
+        data_source_id: dataSource.id,
+      }
+
+      expect(
+        elementType.getInitialFormDataValue(element, {
+          builder: { id: 1 },
+          page,
+        })
+      ).toBe('Group A')
+      expect(
+        elementType.formDataType(element, {
+          builder: { id: 1 },
+          page,
+        })
+      ).toBe('string')
+      expect(
+        elementType.getDataSchema(element, {
+          builder: { id: 1 },
+          page,
+        })
+      ).toEqual({ type: 'string' })
+
+      expect(
+        elementType.getDataSchema(
+          { ...element, multiple: true },
+          {
+            builder: { id: 1 },
+            page,
+          }
+        )
+      ).toEqual({ type: 'array', items: { type: 'string' } })
+    })
+  })
+
+  describe('elementType isDisallowedReason for base elements', () => {
+    test("Heading can't be placed on header nor footer if before/after another element", () => {
+      const headingElementType = testApp.$registry.get('element', 'heading')
+
+      const page = { id: 123 }
+      const sharedPage = { id: 124, shared: true }
+      const anotherMultiPage = {
+        id: 111,
+        type: 'header',
+        page_id: sharedPage.id,
+      }
+      page.elementMap = {}
+      sharedPage.elementMap = { 111: anotherMultiPage }
+
+      expect(
+        headingElementType.isDisallowedReason({
+          builder: { id: 1, pages: [sharedPage, page] },
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: anotherMultiPage,
+          placeInContainer: null,
+          pagePlace: 'header',
+        })
+      ).toEqual('elementType.notAllowedLocation')
+
+      expect(
+        headingElementType.isDisallowedReason({
+          builder: { id: 1, pages: [sharedPage, page] },
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          placeInContainer: null,
+          pagePlace: 'footer',
+        })
+      ).toEqual('elementType.notAllowedLocation')
+    })
+  })
+
+  describe('elementType isDisallowedReason tests', () => {
+    test('FormContainerElementType itself as a nested child.', () => {
+      const formContainerElementType = testApp.$registry.get(
+        'element',
+        'form_container'
+      )
+
+      const page = { id: 123 }
+      const formAncestor = { id: 111, type: 'form_container', page_id: page.id }
+      const columnAncestor1 = {
+        id: 112,
+        type: 'column',
+        page_id: page.id,
+      }
+      const columnAncestor2 = {
+        id: 113,
+        type: 'column',
+        page_id: page.id,
+      }
+
+      // formAncestor (root) → next → columnAncestor2; formAncestor → child → columnAncestor1
+      page.graph = {
+        0: 111,
+        111: { next: { '': [113] }, children: { '': [112] } },
+        112: {},
+        113: {},
+      }
+      page.elementMap = {
+        111: formAncestor,
+        112: columnAncestor1,
+        113: columnAncestor2,
+      }
+
+      expect(
+        formContainerElementType.isDisallowedReason({
+          builder: { id: 1 },
+          page,
+          parentElement: formAncestor,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual('elementType.notAllowedInsideSameType')
+      expect(
+        formContainerElementType.isDisallowedReason({
+          builder: { id: 1 },
+          page,
+          parentElement: columnAncestor1,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual('elementType.notAllowedInsideSameType')
+      // We check a top level column element
+      expect(
+        formContainerElementType.isDisallowedReason({
+          builder: { id: 1 },
+          page,
+          parentElement: columnAncestor2,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual(null)
+    })
+    test('ColumnElementType itself as a nested child.', () => {
+      const columnContainerElementType = testApp.$registry.get(
+        'element',
+        'column'
+      )
+
+      const page = { id: 123 }
+      const columnAncestor = { id: 111, type: 'column', page_id: page.id }
+
+      page.elementMap = { 111: columnAncestor }
+
+      expect(
+        columnContainerElementType.isDisallowedReason({
+          builder: { id: 1 },
+          page,
+          parentElement: columnAncestor,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual('elementType.notAllowedInsideSameType')
+    })
+    test('RepeatElementType allow itself as a nested child.', () => {
+      const repeatContainerElementType = testApp.$registry.get(
+        'element',
+        'repeat'
+      )
+
+      const page = { id: 123 }
+      const repeatAncestor = { id: 111, type: 'repeat', page_id: page.id }
+
+      page.elementMap = { 111: repeatAncestor }
+
+      expect(
+        repeatContainerElementType.isDisallowedReason({
+          builder: { id: 1 },
+          page,
+          parentElement: repeatAncestor,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual(null)
+    })
+    test('RepeatElementType cannot be moved inside itself.', () => {
+      const repeatContainerElementType = testApp.$registry.get(
+        'element',
+        'repeat'
+      )
+
+      const page = {
+        id: 123,
+        orderedElements: [],
+      }
+      const repeatElement = { id: 111, type: 'repeat', page_id: page.id }
+      const nestedRepeatElement = {
+        id: 112,
+        type: 'repeat',
+        page_id: page.id,
+      }
+
+      page.graph = {
+        0: 111,
+        111: { children: { content: [112] } },
+        112: {},
+      }
+      page.elementMap = {
+        111: repeatElement,
+        112: nestedRepeatElement,
+      }
+      page.orderedElements = [repeatElement, nestedRepeatElement]
+
+      expect(
+        repeatContainerElementType.isDisallowedReason({
+          builder: { id: 1, pages: [page] },
+          page,
+          element: repeatElement,
+          parentElement: nestedRepeatElement,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual('elementType.notAllowedLocation')
+    })
+    test('ColumnElementType cannot be moved if one of its children is disallowed in the destination.', () => {
+      const columnContainerElementType = testApp.$registry.get(
+        'element',
+        'column'
+      )
+
+      const page = {
+        id: 123,
+        orderedElements: [],
+      }
+      const destinationFormContainer = {
+        id: 111,
+        type: 'form_container',
+        page_id: page.id,
+      }
+      const columnElement = {
+        id: 112,
+        type: 'column',
+        page_id: page.id,
+      }
+      const childFormContainer = {
+        id: 113,
+        type: 'form_container',
+        page_id: page.id,
+      }
+
+      page.graph = {
+        0: 111,
+        111: { next: { '': [112] } },
+        112: { children: { '': [113] } },
+        113: {},
+      }
+      page.elementMap = {
+        111: destinationFormContainer,
+        112: columnElement,
+        113: childFormContainer,
+      }
+      page.orderedElements = [
+        destinationFormContainer,
+        columnElement,
+        childFormContainer,
+      ]
+
+      expect(
+        columnContainerElementType.isDisallowedReason({
+          builder: { id: 1, pages: [page] },
+          page,
+          element: columnElement,
+          parentElement: destinationFormContainer,
+          beforeElement: null,
+          placeInContainer: 'content',
+        })
+      ).toEqual('elementType.notAllowedLocation')
+    })
+  })
+
+  describe('elementTypes ChoiceElementType getOptionsResolved tests', () => {
+    test('getOptionsResolved returns Value if Value is not null.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [
+          { id: 1, value: '', name: 'Foo Name' },
+          { id: 2, value: 'bar_name', name: 'Bar Name' },
+        ],
+      }
+
+      // When the Value is non-null, we expect them to be returned verbatim.
+      expect(elementType.getOptionsResolved(element)).toEqual([
+        { name: 'Foo Name', value: '' },
+        { name: 'Bar Name', value: 'bar_name' },
+      ])
+    })
+
+    test('getOptionsResolved returns Name if Value is null.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [
+          { id: 1, value: null, name: 'Foo Name' },
+          { id: 2, value: 'bar_name', name: 'Bar Name' },
+        ],
+      }
+
+      // When Value is null, we assume the user wants it to be the same as
+      // the Name. Thus, we return 'Foo Name' instead of null.
+      expect(elementType.getOptionsResolved(element)).toEqual([
+        { name: 'Foo Name', value: 'Foo Name' },
+        { name: 'Bar Name', value: 'bar_name' },
+      ])
+    })
+
+    test('getOptionsResolved returns Value if it is an empty string.', () => {
+      const elementType = new ChoiceElementType()
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [
+          { id: 1, value: '', name: 'Foo Name' },
+          { id: 2, value: 'bar_name', name: 'Bar Name' },
+        ],
+      }
+
+      // Since an empty string is a valid Value, if the user has explicitly
+      // declared it, we should return an empty string.
+      expect(elementType.getOptionsResolved(element)).toEqual([
+        { name: 'Foo Name', value: '' },
+        { name: 'Bar Name', value: 'bar_name' },
+      ])
+    })
+
+    test('getOptionsResolved carries the format of the name formula for formula options.', () => {
+      const elementType = testApp.$registry.get('element', 'choice')
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.FORMULAS,
+        formula_value: { formula: "'a,b'" },
+        formula_name: { formula: "'**A**,**B**'", format: 'markdown' },
+      }
+
+      // The element renders the names in that format.
+      expect(elementType.getOptionsResolved(element, {})).toEqual([
+        { id: 0, value: 'a', name: '**A**', nameFormat: 'markdown' },
+        { id: 1, value: 'b', name: '**B**', nameFormat: 'markdown' },
+      ])
+    })
+
+    test('getOptionsResolved leaves the name format undefined for plain formula options.', () => {
+      const elementType = testApp.$registry.get('element', 'choice')
+      const element = {
+        required: true,
+        option_type: CHOICE_OPTION_TYPES.FORMULAS,
+        formula_value: { formula: "'a,b'" },
+        formula_name: { formula: "'A,B'" },
+      }
+
+      expect(elementType.getOptionsResolved(element, {})).toEqual([
+        { id: 0, value: 'a', name: 'A', nameFormat: undefined },
+        { id: 1, value: 'b', name: 'B', nameFormat: undefined },
+      ])
+    })
+  })
+
+  describe('HeadingElementType isInError tests', () => {
+    test('Returns true if Heading Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+
+      // Heading with missing value is invalid
+      expect(
+        elementType.isInError(
+          { value: { formula: '' } },
+          { page: {}, element: { value: { formula: '' } } }
+        )
+      ).toBe(true)
+
+      // Heading with value is valid
+      expect(
+        elementType.isInError(
+          { value: { formula: "'Foo Heading'" } },
+          {
+            page: {},
+            element: { value: { formula: "'Foo Heading'" } },
+          }
+        )
+      ).toBe(false)
+    })
+  })
+
+  describe('TextElementType isInError tests', () => {
+    test('Returns true if Text Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'text')
+
+      // Text with missing value is invalid
+      expect(
+        elementType.isInError(
+          { value: { formula: '' } },
+          { page: {}, element: { value: { formula: '' } } }
+        )
+      ).toBe(true)
+
+      // Text with value is valid
+      expect(
+        elementType.isInError(
+          { value: { formula: "'Foo Text'" } },
+          {
+            page: {},
+            element: { value: { formula: "'Foo Text'" } },
+          }
+        )
+      ).toBe(false)
+    })
+  })
+
+  describe('LinkElementType isInError tests', () => {
+    test('Returns true if Link Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'link')
+
+      // Link with missing text is invalid
+      expect(
+        elementType.isInError(
+          { value: { formula: '' } },
+          { element: { value: { formula: '' } } }
+        )
+      ).toBe(true)
+
+      // When navigation_type is 'page' the navigate_to_page_id must be set
+      let element = {
+        navigation_type: 'page',
+        navigate_to_page_id: '',
+        value: { formula: "'Foo Link'" },
+      }
+      expect(elementType.isInError(element, { page: {}, element })).toBe(true)
+
+      // Otherwise it is valid
+      const page = { id: 10, shared: false, order: 1 }
+      const builder = { pages: [page] }
+      element.navigate_to_page_id = 10
+      expect(elementType.isInError(element, { page, builder, element })).toBe(
+        false
+      )
+
+      // When navigation_type is 'custom' the navigate_to_url must be set
+      element = {
+        navigation_type: 'custom',
+        navigate_to_url: { formula: '' },
+        value: { formula: "'Test'" },
+      }
+      expect(elementType.isInError(element, { page, element })).toBe(true)
+      expect(elementType.getErrorMessage(element, { page, element })).toBe(
+        'elementType.errorNavigationUrlMissing'
+      )
+
+      // Otherwise it is valid
+      element.navigate_to_url = { formula: 'http://localhost' }
+      element.value = { formula: "'Foo Link'" }
+      expect(elementType.isInError(element, { page, element })).toBe(false)
+    })
+  })
+
+  describe('ImageElementType isInError tests', () => {
+    test('Returns true if Image Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'image')
+
+      // Image with image_source_type of 'upload' must have an image_file url
+      const element = { image_source_type: IMAGE_SOURCE_TYPES.UPLOAD }
+      expect(elementType.isInError(element, { element })).toBe(true)
+
+      // Otherwise it is valid
+      element.image_file = { url: 'http://localhost' }
+      expect(elementType.isInError(element, { element })).toBe(false)
+
+      // Image with image_source_type of 'url' must have an image_url
+      delete element.image_file
+      element.image_source_type = IMAGE_SOURCE_TYPES.URL
+      expect(elementType.isInError(element, { element })).toBe(true)
+
+      // Otherwise it is valid
+      element.image_url = { formula: "'http://localhost'" }
+      expect(elementType.isInError(element, { element })).toBe(false)
+    })
+  })
+
+  describe('ChoiceElementType getErrorMessage tests', () => {
+    test('is in error when a manual option has an empty name', () => {
+      const elementType = testApp.$registry.get('element', 'choice')
+      const element = {
+        option_type: CHOICE_OPTION_TYPES.MANUAL,
+        options: [
+          { id: 1, name: '', value: null },
+          { id: 2, name: 'Blank value', value: '' },
+        ],
+      }
+
+      expect(elementType.getErrorMessage(element, {})).toBe(
+        'elementType.errorOptionNameMissing'
+      )
+
+      element.options[0].name = '   '
+      expect(elementType.getErrorMessage(element, {})).toBe(
+        'elementType.errorOptionNameMissing'
+      )
+
+      element.options[0].name = 'Named option'
+      expect(elementType.getErrorMessage(element, {})).toBeNull()
+    })
+  })
+
+  describe('ButtonElementType isInError tests', () => {
+    test('Returns true if Button Element has no errors, but has misconfigured workflow actions.', () => {
+      const page = {
+        id: 2,
+        shared: false,
+        name: 'Foo Page',
+        workflowActions: [
+          { ...misconfiguredOpenPageWorkflowAction, element_id: 50 },
+        ],
+      }
+      const element = {
+        id: 50,
+        value: { formula: "'Click me'" },
+        page_id: page.id,
+      }
+      const builder = {
+        id: 1,
+        pages: [page, misconfiguredOpenPageWorkflowActionPage],
+      }
+      const elementType = testApp.$registry.get('element', 'button')
+
+      // Button with value and invalid workflowAction is invalid
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+    })
+
+    test('Returns true if Button Element open page action has a missing page parameter value.', () => {
+      const targetPage = {
+        id: 1,
+        shared: false,
+        order: 1,
+        path_params: [{ name: 'id', type: 'numeric' }],
+      }
+      const page = {
+        id: 2,
+        shared: false,
+        order: 2,
+        name: 'Foo Page',
+        workflowActions: [
+          {
+            type: 'open_page',
+            element_id: 50,
+            page_parameters: [{ name: 'id', value: {} }],
+            navigation_type: 'page',
+            navigate_to_page_id: targetPage.id,
+          },
+        ],
+      }
+      const element = {
+        id: 50,
+        value: { formula: "'Click me'" },
+        page_id: page.id,
+      }
+      const builder = {
+        id: 1,
+        pages: [targetPage, page],
+      }
+      const elementType = testApp.$registry.get('element', 'button')
+
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+    })
+
+    test('Returns true if Button Element has errors, false otherwise', () => {
+      const page = {
+        id: 1,
+        shared: false,
+        name: { formula: "'Foo Page'" },
+        workflowActions: [],
+      }
+      const builder = { id: 1, pages: [page] }
+      const element = { id: 50, value: { formula: '' }, page_id: page.id }
+      const elementType = testApp.$registry.get('element', 'button')
+
+      // Button with missing value is invalid
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      // Button with value but missing workflowActions is invalid
+      element.value = { formula: "'click me'" }
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      // Button with value and workflowAction is valid
+      page.workflowActions = [{ element_id: 50, type: 'open_page' }]
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        false
+      )
+    })
+  })
+
+  describe('IFrameElementType isInError tests', () => {
+    test('Returns true if IFrame Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'iframe')
+
+      // IFrame with source_type of 'url' and missing url is invalid
+      const element = {
+        source_type: IFRAME_SOURCE_TYPES.URL,
+        url: { formula: '' },
+        embed: { formula: '' },
+      }
+      expect(elementType.isInError(element, { element })).toBe(true)
+
+      // Otherwise it is valid
+      element.url = { formula: "'http://localhost'" }
+      expect(elementType.isInError(element, { element })).toBe(false)
+
+      // IFrame with source_type of 'embed' and missing embed is invalid
+      element.source_type = IFRAME_SOURCE_TYPES.EMBED
+      expect(elementType.isInError(element, { element })).toBe(true)
+
+      // Otherwise it is valid
+      element.embed = { formula: "'http://localhost'" }
+      expect(elementType.isInError(element, { element })).toBe(false)
+
+      // Default is to return no errors
+      element.source_type = 'foo'
+      expect(elementType.isInError(element, { element })).toBe(false)
+    })
+  })
+
+  describe('FormContainerElementType isInError tests', () => {
+    test('Returns true if Form Container Element has no errors, but has misconfigured workflow actions.', () => {
+      const page = {
+        id: 2,
+        shared: false,
+        name: 'Foo Page',
+        workflowActions: [
+          { ...misconfiguredOpenPageWorkflowAction, element_id: 50 },
+        ],
+      }
+      const element = {
+        id: 50,
+        submit_button_label: { formula: "'Submit'" },
+        page_id: page.id,
+      }
+      const childElement = {
+        id: 51,
+        type: 'input_text',
+        page_id: page.id,
+      }
+      page.elementMap = { 50: element, 51: childElement }
+      page.orderedElements = [element, childElement]
+      const builder = {
+        id: 1,
+        pages: [page, misconfiguredOpenPageWorkflowActionPage],
+      }
+      const elementType = testApp.$registry.get('element', 'form_container')
+
+      // Form container with value and workflowAction is valid
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+    })
+    test('Returns true if Form Container Element has errors, false otherwise', () => {
+      const page = {
+        id: 1,
+        shared: false,
+        name: 'Foo Page',
+        workflowActions: [],
+      }
+      const element = {
+        id: 50,
+        submit_button_label: { formula: "'Submit'" },
+        page_id: page.id,
+      }
+      page.elementMap = { 50: element }
+      page.orderedElements = [element]
+      const builder = {
+        id: 1,
+        pages: [page, misconfiguredOpenPageWorkflowActionPage],
+      }
+
+      const elementType = testApp.$registry.get('element', 'form_container')
+
+      // Invalid if we have no workflow actions
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      // Invalid if we have no children
+      page.workflowActions = [{ element_id: 50, type: 'open_page' }]
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      // Valid as we have all required fields
+      const childElement = {
+        id: 51,
+        type: 'input_text',
+        page_id: page.id,
+      }
+      page.graph = { 0: 50, 50: { children: { '': [51] } }, 51: {} }
+      page.elementMap = { 50: element, 51: childElement }
+      page.orderedElements = [element, childElement]
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        false
+      )
+    })
+  })
+
+  describe('MenuElementType isInError tests', () => {
+    test('Returns true if Menu Element has errors, false otherwise', () => {
+      const elementType = testApp.$registry.get('element', 'menu')
+
+      const page = {
+        id: 1,
+        shared: false,
+        name: 'Foo Page',
+        workflowActions: [],
+      }
+      const element = {
+        id: 50,
+        page_id: page.id,
+        menu_items: [],
+      }
+      const builder = {
+        id: 1,
+        pages: [page],
+      }
+
+      // Menu element with zero Menu items is invalid.
+      expect(
+        elementType.isInError(element, { page: {}, element, builder })
+      ).toBe(true)
+
+      const menuItem = {
+        type: 'button',
+        name: 'foo button',
+      }
+      element.menu_items = [menuItem]
+
+      // Button Menu item without workflow actions is invalid.
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      page.workflowActions = [{ element_id: 50, type: 'open_page' }]
+      element.menu_items[0].name = ''
+
+      // Button Menu item with empty name is invalid.
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      element.menu_items[0].type = 'link'
+      element.menu_items[0].name = ''
+
+      // Link Menu item with empty name is invalid.
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      element.menu_items[0].name = 'sub link'
+      element.menu_items[0].navigation_type = 'page'
+      element.menu_items[0].navigate_to_page_id = ''
+
+      // Link Menu item - sublink with Page navigation but no page ID is invalid.
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      element.menu_items[0].name = 'sub link'
+      element.menu_items[0].navigation_type = 'custom'
+      element.menu_items[0].navigate_to_url = { formula: '' }
+
+      // Link Menu item - sublink with custom navigation but no URL is invalid.
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        true
+      )
+
+      // Valid Button Menu item
+      element.menu_items[0].type = 'button'
+      element.menu_items[0].name = 'foo button'
+      page.workflowActions = [{ element_id: 50, type: 'open_page' }]
+
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        false
+      )
+
+      // Valid Link Menu item - page
+      element.menu_items[0].type = 'link'
+      element.menu_items[0].name = 'foo link'
+      element.menu_items[0].navigation_type = 'page'
+      element.menu_items[0].navigate_to_page_id = 10
+
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        false
+      )
+
+      // Valid Link Menu item - custom
+      element.menu_items[0].type = 'link'
+      element.menu_items[0].name = 'foo link'
+      element.menu_items[0].navigation_type = 'custom'
+      element.menu_items[0].navigate_to_url = {
+        formula: "'https://www.baserow.io'",
+      }
+
+      expect(elementType.isInError(element, { page, element, builder })).toBe(
+        false
+      )
+    })
+  })
+
+  describe('ElementType getDefaultValues tests', () => {
+    test('returns values unchanged when no parent element', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const page = { id: 1 }
+      const values = { style_padding_top: 20 }
+      expect(elementType.getDefaultValues(page, values, null)).toEqual({
+        style_padding_top: 20,
+      })
+    })
+
+    test('merges parent container child defaults when parent provided', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const page = { id: 1 }
+      const parentElement = { id: 10, type: 'column' }
+      const values = { style_padding_top: 20 }
+      expect(elementType.getDefaultValues(page, values, parentElement)).toEqual(
+        {
+          style_padding_top: 20,
+          style_padding_left: 0,
+          style_padding_right: 0,
+        }
+      )
+    })
+
+    test('parent whose getDefaultChildValues returns {} leaves values unchanged', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const page = { id: 1 }
+      const parentElement = { id: 10, type: 'simple_container' }
+      const values = { style_padding_top: 20 }
+      expect(elementType.getDefaultValues(page, values, parentElement)).toEqual(
+        {
+          style_padding_top: 20,
+        }
+      )
+    })
+  })
+
+  describe('MultiPageElementType tests', () => {
+    test.each(['header', 'footer'])(
+      '%s getDefaultValues returns normal positioning defaults',
+      (elementTypeName) => {
+        const elementType = testApp.$registry.get('element', elementTypeName)
+
+        expect(elementType.getDefaultValues({}, {})).toMatchObject({
+          behaviour: PAGE_ELEMENT_BEHAVIOURS.NORMAL,
+        })
+      }
+    )
+  })
+
+  describe('elementType elementAround tests', () => {
+    let page, sharedPage, builder
+    beforeEach(async () => {
+      // Populate a page with a bunch of elements
+      page = { id: 123, elements: [], orderedElements: [], elementMap: {} }
+      sharedPage = {
+        id: 124,
+        shared: true,
+        elements: [],
+        orderedElements: [],
+        elementMap: {},
+      }
+      builder = { id: 1, pages: [sharedPage, page] }
+
+      const heading1 = {
+        id: 42,
+        type: 'heading',
+      }
+      const heading2 = {
+        id: 43,
+        type: 'heading',
+      }
+      const elements = [heading1, heading2]
+
+      await Promise.all(
+        elements.map(async (element, index) => {
+          await testApp.$store.dispatch('element/forceCreate', {
+            page,
+            element: {
+              place_in_container: null,
+              ...element,
+              page_id: page.id,
+              order: `${index}.0000`,
+            },
+          })
+        })
+      )
+
+      const header1 = {
+        id: 111,
+        type: 'header',
+      }
+      const header2 = {
+        id: 112,
+        type: 'header',
+      }
+      const footer1 = {
+        id: 113,
+        type: 'footer',
+      }
+      const footer2 = {
+        id: 114,
+        type: 'footer',
+      }
+
+      const sharedPageElements = [header1, footer1, footer2, header2]
+
+      await Promise.all(
+        sharedPageElements.map(async (element, index) => {
+          await testApp.$store.dispatch('element/forceCreate', {
+            page: sharedPage,
+            element: {
+              place_in_container: null,
+              ...element,
+              page_id: sharedPage.id,
+              order: `${index}.0000`,
+            },
+          })
+        })
+      )
+    })
+    test('for first header.', () => {
+      const elementType = testApp.$registry.get('element', 'header')
+      const firstHeader = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 111)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: firstHeader,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before).toBeNull()
+      expect(elementsAround.after?.id).toEqual(112)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for second header.', () => {
+      const elementType = testApp.$registry.get('element', 'header')
+      const secondHeader = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 112)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: secondHeader,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before?.id).toEqual(111)
+      expect(elementsAround.after).toBeNull()
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for second header with sharedPage.', () => {
+      const elementType = testApp.$registry.get('element', 'header')
+      const secondHeader = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 112)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: secondHeader,
+        withSharedPage: true,
+      })
+      expect(elementsAround.before?.id).toEqual(111)
+      expect(elementsAround.after?.id).toEqual(42)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first fixed header ignores normal headers in the backend order.', async () => {
+      const fixedHeader1 = {
+        id: 115,
+        type: 'header',
+        behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+      }
+      const fixedHeader2 = {
+        id: 116,
+        type: 'header',
+        behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+      }
+
+      for (const [index, element] of [fixedHeader1, fixedHeader2].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page: sharedPage,
+          element: {
+            place_in_container: null,
+            ...element,
+            page_id: sharedPage.id,
+            order: `${index + 10}.0000`,
+          },
+        })
+      }
+
+      const elementType = testApp.$registry.get('element', 'header')
+      const storedFixedHeader1 = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], fixedHeader1.id)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: storedFixedHeader1,
+        withSharedPage: false,
+      })
+
+      expect(elementsAround.before).toBeNull()
+      expect(elementsAround.after?.id).toEqual(fixedHeader2.id)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first footer.', () => {
+      const elementType = testApp.$registry.get('element', 'footer')
+      const firstFooter = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 113)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: firstFooter,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before).toBeNull()
+      expect(elementsAround.after?.id).toEqual(114)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first footer with shared page.', () => {
+      const elementType = testApp.$registry.get('element', 'footer')
+      const firstFooter = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 113)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: firstFooter,
+        withSharedPage: true,
+      })
+      expect(elementsAround.before?.id).toEqual(43)
+      expect(elementsAround.after?.id).toEqual(114)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for second footer.', () => {
+      const elementType = testApp.$registry.get('element', 'footer')
+      const secondFooter = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 114)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: secondFooter,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before?.id).toEqual(113)
+      expect(elementsAround.after).toBeNull()
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first fixed footer ignores normal footers in the backend order.', async () => {
+      const fixedFooter1 = {
+        id: 117,
+        type: 'footer',
+        behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+      }
+      const fixedFooter2 = {
+        id: 118,
+        type: 'footer',
+        behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+      }
+
+      for (const [index, element] of [fixedFooter1, fixedFooter2].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page: sharedPage,
+          element: {
+            place_in_container: null,
+            ...element,
+            page_id: sharedPage.id,
+            order: `${index + 10}.0000`,
+          },
+        })
+      }
+
+      const elementType = testApp.$registry.get('element', 'footer')
+      const storedFixedFooter1 = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], fixedFooter1.id)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: storedFixedFooter1,
+        withSharedPage: false,
+      })
+
+      expect(elementsAround.before).toBeNull()
+      expect(elementsAround.after?.id).toEqual(fixedFooter2.id)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first heading.', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const firstHeading = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 42)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: firstHeading,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before).toBeNull()
+      expect(elementsAround.after?.id).toEqual(43)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for second heading.', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const secondHeading = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 43)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: secondHeading,
+        withSharedPage: false,
+      })
+      expect(elementsAround.before?.id).toEqual(42)
+      expect(elementsAround.after).toBeNull()
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for first heading with shared page.', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const firstHeading = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 42)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: firstHeading,
+        withSharedPage: true,
+      })
+      expect(elementsAround.before?.id).toEqual(112)
+      expect(elementsAround.after?.id).toEqual(43)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+    test('for second heading  with shared page.', () => {
+      const elementType = testApp.$registry.get('element', 'heading')
+      const secondHeading = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], 43)
+      const elementsAround = elementType.getElementsAround({
+        builder,
+        page,
+        element: secondHeading,
+        withSharedPage: true,
+      })
+      expect(elementsAround.before?.id).toEqual(42)
+      expect(elementsAround.after?.id).toEqual(113)
+      expect(elementsAround.left).toBeNull()
+      expect(elementsAround.right).toBeNull()
+    })
+  })
+
+  describe('HeaderElementType isDisallowedReason tests', () => {
+    // Use distinct IDs to avoid colliding with the elementAround suite above.
+    let page, sharedPage, builder
+    let heading1, heading2, heading3
+
+    beforeEach(async () => {
+      page = {
+        id: 300,
+        elements: [],
+        orderedElements: [],
+        elementMap: {},
+        graph: {},
+      }
+      sharedPage = {
+        id: 301,
+        shared: true,
+        elements: [],
+        orderedElements: [],
+        elementMap: {},
+        graph: {},
+      }
+      builder = { id: 10, pages: [sharedPage, page] }
+
+      heading1 = { id: 310, type: 'heading' }
+      heading2 = { id: 320, type: 'heading' }
+      heading3 = { id: 330, type: 'heading' }
+
+      for (const [i, el] of [heading1, heading2, heading3].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page,
+          element: {
+            place_in_container: null,
+            ...el,
+            page_id: page.id,
+            order: `${i + 1}.0000`,
+          },
+        })
+      }
+    })
+
+    test('allowed north of first content element when no header exists', async () => {
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: heading1,
+          afterElement: null,
+          pagePlace: 'content',
+        })
+      ).toBeNull()
+    })
+
+    test('disallowed north of non-first content element', async () => {
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: heading2,
+          afterElement: null,
+          pagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+
+    test('disallowed south of any element (afterElement set)', async () => {
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: heading3,
+          pagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+
+    test('allowed north of first content element even when a header already exists', async () => {
+      const headerEl = { id: 340, type: 'header' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...headerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+
+      const headerType = testApp.$registry.get('element', 'header')
+      // The first content element is always a valid north-of-first position for a header,
+      // regardless of how many headers already exist on the shared page.
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: heading1,
+          afterElement: null,
+          pagePlace: 'content',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed north of the existing header itself (on shared page)', async () => {
+      const headerEl = { id: 340, type: 'header' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...headerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+      const storedHeader = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], headerEl.id)
+
+      const headerType = testApp.$registry.get('element', 'header')
+      // ElementPreview for a shared element opens the modal with page = sharedPage
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: storedHeader,
+          afterElement: null,
+          pagePlace: 'header',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed south of the existing header (on shared page)', async () => {
+      const headerEl = { id: 340, type: 'header' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...headerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+      const storedHeader = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], headerEl.id)
+
+      const headerType = testApp.$registry.get('element', 'header')
+      // The entire header zone is valid for adding more headers — south is allowed.
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: storedHeader,
+          pagePlace: 'header',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed north of second header — header zone allows any position', async () => {
+      const header1 = { id: 340, type: 'header' }
+      const header2 = { id: 341, type: 'header' }
+      for (const [i, h] of [header1, header2].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page: sharedPage,
+          element: {
+            place_in_container: null,
+            ...h,
+            page_id: sharedPage.id,
+            order: `${i + 1}.0000`,
+          },
+        })
+      }
+      const storedHeader2 = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], header2.id)
+
+      const headerType = testApp.$registry.get('element', 'header')
+      // The entire header zone is valid — north of the second header is allowed.
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: storedHeader2,
+          afterElement: null,
+          pagePlace: 'header',
+        })
+      ).toBeNull()
+    })
+
+    test('drag-and-drop is unaffected: afterElement absent means modal guard does not fire', () => {
+      // useDropElementTarget never passes afterElement, so it remains undefined.
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined)
+          pagePlace: 'header',
+          referencePagePlace: 'header',
+        })
+      ).toBeNull()
+    })
+
+    test('drag-and-drop between fixed and normal headers is disallowed', () => {
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          element: {
+            id: 341,
+            type: 'header',
+            behaviour: PAGE_ELEMENT_BEHAVIOURS.NORMAL,
+          },
+          referenceElement: {
+            id: 340,
+            type: 'header',
+            behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+          },
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined) → D&D context
+          pagePlace: 'header',
+          referencePagePlace: 'header',
+        })
+      ).not.toBeNull()
+    })
+
+    test('normal and fixed headers resolve to different page sections', () => {
+      const headerType = testApp.$registry.get('element', 'header')
+
+      expect(
+        headerType.getPageSection({
+          type: 'header',
+          behaviour: PAGE_ELEMENT_BEHAVIOURS.NORMAL,
+        })
+      ).toBe('header')
+      expect(
+        headerType.getPageSection({
+          type: 'header',
+          behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+        })
+      ).toBe('fixed-header')
+    })
+
+    test('drag-and-drop into the content zone is disallowed (referencePagePlace=content)', () => {
+      // The empty content drop zone supplies referencePagePlace=content via
+      // targetPagePlace, which must keep a header out of the content zone.
+      const headerType = testApp.$registry.get('element', 'header')
+      expect(
+        headerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined) → D&D context
+          pagePlace: 'header',
+          referencePagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+  })
+
+  describe('FooterElementType isDisallowedReason tests', () => {
+    let page, sharedPage, builder
+    let heading1, heading2, heading3
+
+    beforeEach(async () => {
+      page = {
+        id: 400,
+        elements: [],
+        orderedElements: [],
+        elementMap: {},
+        graph: {},
+      }
+      sharedPage = {
+        id: 401,
+        shared: true,
+        elements: [],
+        orderedElements: [],
+        elementMap: {},
+        graph: {},
+      }
+      builder = { id: 20, pages: [sharedPage, page] }
+
+      heading1 = { id: 410, type: 'heading' }
+      heading2 = { id: 420, type: 'heading' }
+      heading3 = { id: 430, type: 'heading' }
+
+      for (const [i, el] of [heading1, heading2, heading3].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page,
+          element: {
+            place_in_container: null,
+            ...el,
+            page_id: page.id,
+            order: `${i + 1}.0000`,
+          },
+        })
+      }
+    })
+
+    test('allowed south of last content element when no footer exists', async () => {
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: heading3,
+          pagePlace: 'content',
+        })
+      ).toBeNull()
+    })
+
+    test('disallowed south of non-last content element', async () => {
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: heading2,
+          pagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+
+    test('disallowed north of any element (beforeElement set)', async () => {
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: heading1,
+          afterElement: null,
+          pagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+
+    test('allowed south of last content element even when a footer already exists', async () => {
+      const footerEl = { id: 440, type: 'footer' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...footerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+
+      const footerType = testApp.$registry.get('element', 'footer')
+      // The last content element is always a valid south-of-last position for a footer,
+      // regardless of how many footers already exist on the shared page.
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: heading3,
+          pagePlace: 'content',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed south of the existing footer itself (on shared page)', async () => {
+      const footerEl = { id: 440, type: 'footer' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...footerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+      const storedFooter = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], footerEl.id)
+
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: storedFooter,
+          pagePlace: 'footer',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed north of the existing footer (on shared page)', async () => {
+      const footerEl = { id: 440, type: 'footer' }
+      await testApp.$store.dispatch('element/forceCreate', {
+        page: sharedPage,
+        element: {
+          place_in_container: null,
+          ...footerEl,
+          page_id: sharedPage.id,
+          order: '1.0000',
+        },
+      })
+      const storedFooter = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], footerEl.id)
+
+      const footerType = testApp.$registry.get('element', 'footer')
+      // The entire footer zone is valid for adding more footers — north is allowed.
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: storedFooter,
+          afterElement: null,
+          pagePlace: 'footer',
+        })
+      ).toBeNull()
+    })
+
+    test('allowed south of first footer when two footers exist — footer zone allows any position', async () => {
+      const footer1 = { id: 440, type: 'footer' }
+      const footer2 = { id: 441, type: 'footer' }
+      for (const [i, f] of [footer1, footer2].entries()) {
+        await testApp.$store.dispatch('element/forceCreate', {
+          page: sharedPage,
+          element: {
+            place_in_container: null,
+            ...f,
+            page_id: sharedPage.id,
+            order: `${i + 1}.0000`,
+          },
+        })
+      }
+      const storedFooter1 = testApp.$store.getters[
+        'element/getElementByIdInPages'
+      ]([page, sharedPage], footer1.id)
+
+      const footerType = testApp.$registry.get('element', 'footer')
+      // The entire footer zone is valid — south of the first footer is allowed.
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          afterElement: storedFooter1,
+          pagePlace: 'footer',
+        })
+      ).toBeNull()
+    })
+
+    test('drag-and-drop is unaffected: afterElement absent means modal guard does not fire', () => {
+      // useDropElementTarget never passes afterElement, so it remains undefined.
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined)
+          pagePlace: 'footer',
+          referencePagePlace: 'footer',
+        })
+      ).toBeNull()
+    })
+
+    test('drag-and-drop between fixed and normal footers is disallowed', () => {
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page: sharedPage,
+          element: {
+            id: 441,
+            type: 'footer',
+            behaviour: PAGE_ELEMENT_BEHAVIOURS.NORMAL,
+          },
+          referenceElement: {
+            id: 440,
+            type: 'footer',
+            behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+          },
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined) → D&D context
+          pagePlace: 'footer',
+          referencePagePlace: 'footer',
+        })
+      ).not.toBeNull()
+    })
+
+    test('normal and fixed footers resolve to different page sections', () => {
+      const footerType = testApp.$registry.get('element', 'footer')
+
+      expect(
+        footerType.getPageSection({
+          type: 'footer',
+          behaviour: PAGE_ELEMENT_BEHAVIOURS.NORMAL,
+        })
+      ).toBe('footer')
+      expect(
+        footerType.getPageSection({
+          type: 'footer',
+          behaviour: PAGE_ELEMENT_BEHAVIOURS.FIXED,
+        })
+      ).toBe('fixed-footer')
+    })
+
+    test('drag-and-drop into the content zone is disallowed (referencePagePlace=content)', () => {
+      // The empty content drop zone supplies referencePagePlace=content via
+      // targetPagePlace, which must keep a footer out of the content zone.
+      const footerType = testApp.$registry.get('element', 'footer')
+      expect(
+        footerType.isDisallowedReason({
+          builder,
+          page,
+          parentElement: null,
+          beforeElement: null,
+          // afterElement intentionally absent (undefined) → D&D context
+          pagePlace: 'footer',
+          referencePagePlace: 'content',
+        })
+      ).not.toBeNull()
+    })
+  })
+})
+
+test('blocked iframes show a trust error before their configuration is evaluated', () => {
+  const type = useNuxtApp().$registry.get('element', 'iframe')
+  const context = { builder: { untrusted_content: true } }
+  expect(type.getErrorMessage({}, context)).toBe(
+    'builderUntrustedContent.warning'
+  )
+  context.builder.untrusted_content = false
+  expect(
+    type.getErrorMessage(
+      { source_type: IFRAME_SOURCE_TYPES.URL, url: { formula: '' } },
+      context
+    )
+  ).toBe('elementType.errorIframeUrlMissing')
+})

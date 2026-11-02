@@ -1,0 +1,1014 @@
+from unittest.mock import MagicMock
+
+import pytest
+from pydantic_ai import ModelRetry
+
+from baserow.contrib.database.views.models import View, ViewFilter
+from baserow_enterprise.assistant.tools.database.tools import (
+    create_view_filters,
+    create_views,
+    list_views,
+)
+from baserow_enterprise.assistant.tools.database.types import (
+    FormFieldOption,
+    ViewItemCreate,
+)
+from baserow_enterprise.assistant.tools.database.types.view_filters import (
+    ViewFilterItemCreate,
+    ViewFiltersArgs,
+)
+
+from .utils import create_fake_tool_helpers, make_test_ctx
+
+
+@pytest.mark.django_db
+def test_list_views_tool(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    view = data_fixture.create_grid_view(table=table, name="View 1", order=1)
+
+    ctx = make_test_ctx(user, workspace)
+    response = list_views(ctx, thought="test", table_id=table.id)
+
+    assert response == {
+        "views": [
+            {
+                "id": view.id,
+                "name": "View 1",
+                "public": False,
+                "type": "grid",
+                "row_height": "small",
+            }
+        ]
+    }
+
+    data_fixture.create_grid_view(table=table, name="View 2", order=2)
+    response = list_views(ctx, thought="test", table_id=table.id)
+    assert len(response["views"]) == 2
+    assert response["views"][0]["name"] == "View 1"
+    assert response["views"][1]["name"] == "View 2"
+
+
+@pytest.mark.django_db
+def test_create_grid_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Grid View",
+                public=False,
+                type="grid",
+                row_height="medium",
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Grid View"
+    grid = View.objects.get(name="Grid View").specific
+    assert grid.row_height_size == "medium"
+
+
+@pytest.mark.django_db
+def test_create_kanban_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    single_select = data_fixture.create_single_select_field(table=table, name="Status")
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Kanban View",
+                public=False,
+                type="kanban",
+                column_field_id=single_select.id,
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Kanban View"
+    assert View.objects.filter(name="Kanban View").exists()
+
+
+@pytest.mark.django_db
+def test_create_calendar_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    date_field = data_fixture.create_date_field(table=table, name="Date")
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Calendar View",
+                public=False,
+                type="calendar",
+                date_field_id=date_field.id,
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Calendar View"
+    assert View.objects.filter(name="Calendar View").exists()
+
+
+@pytest.mark.django_db
+def test_create_gallery_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    file_field = data_fixture.create_file_field(table=table, name="Files")
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Gallery View",
+                public=False,
+                type="gallery",
+                cover_field_id=file_field.id,
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Gallery View"
+    assert View.objects.filter(name="Gallery View").exists()
+
+
+@pytest.mark.django_db
+def test_create_timeline_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    start_date = data_fixture.create_date_field(table=table, name="Start Date")
+    end_date = data_fixture.create_date_field(table=table, name="End Date")
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Timeline View",
+                public=False,
+                type="timeline",
+                start_date_field_id=start_date.id,
+                end_date_field_id=end_date.id,
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Timeline View"
+    assert View.objects.filter(name="Timeline View").exists()
+
+
+@pytest.mark.django_db
+def test_create_form_view(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table, name="Name", primary=True)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Form View",
+                public=True,
+                type="form",
+                title="Contact Form",
+                description="Fill out this form",
+                submit_button_label="Submit",
+                receive_notification_on_submit=False,
+                submit_action="MESSAGE",
+                submit_action_message="Thank you!",
+                submit_action_redirect_url="",
+                field_options=[
+                    FormFieldOption(
+                        field_id=field.id,
+                        name="Your Name",
+                        description="Enter your name",
+                        required=True,
+                        order=1,
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert len(response["created_views"]) == 1
+    assert response["created_views"][0]["name"] == "Form View"
+    assert View.objects.filter(name="Form View").exists()
+
+
+# Text filter tests
+@pytest.mark.django_db
+def test_create_text_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table, name="Name")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="text",
+                        operator="equal",
+                        value="test",
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert len(response["created_view_filters"][0]["filters"]) == 1
+    assert response["created_view_filters"][0]["filters"][0]["operator"] == "equal"
+    assert response["changed"] is True
+    assert ViewFilter.objects.filter(view=view, field=field, type="equal").exists()
+
+
+@pytest.mark.django_db
+def test_empty_filter_group_reports_no_change(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    view = data_fixture.create_grid_view(table=table)
+
+    response = create_view_filters(
+        make_test_ctx(user, workspace),
+        thought="test",
+        view_filters=[ViewFiltersArgs(view_id=view.id, filters=[])],
+    )
+
+    assert response["created_view_filters"] == [{"view_id": view.id, "filters": []}]
+    assert response["changed"] is False
+
+
+@pytest.mark.django_db
+def test_create_text_not_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="text",
+                        operator="not_equal",
+                        value="test",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="not_equal").exists()
+
+
+@pytest.mark.django_db
+def test_create_text_contains_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="text",
+                        operator="contains",
+                        value="test",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="contains").exists()
+
+
+@pytest.mark.django_db
+def test_create_text_not_contains_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="text",
+                        operator="contains_not",
+                        value="test",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="contains_not"
+    ).exists()
+
+
+# Number filter tests
+@pytest.mark.django_db
+def test_create_number_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_number_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="number",
+                        operator="equal",
+                        value=42.0,
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="equal").exists()
+
+
+@pytest.mark.django_db
+def test_create_number_not_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_number_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="number",
+                        operator="not_equal",
+                        value=42.0,
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="not_equal").exists()
+
+
+@pytest.mark.django_db
+def test_create_number_higher_than_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_number_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="number",
+                        operator="higher_than",
+                        value=10.0,
+                        or_equal=False,
+                    )
+                ],
+            )
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="higher_than"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_number_lower_than_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_number_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="number",
+                        operator="lower_than",
+                        value=100.0,
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="lower_than").exists()
+
+
+# Date filter tests
+@pytest.mark.django_db
+def test_create_date_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_date_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="date",
+                        operator="equal",
+                        value="2024-01-15",
+                        mode="exact_date",
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="date_is").exists()
+
+
+@pytest.mark.django_db
+def test_create_date_not_equal_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_date_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="date",
+                        operator="not_equal",
+                        value=None,
+                        mode="today",
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="date_is_not"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_date_after_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_date_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="date",
+                        operator="after",
+                        value=7,
+                        mode="nr_days_ago",
+                        or_equal=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="date_is_after"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_date_before_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_date_field(table=table)
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="date",
+                        operator="before",
+                        value=None,
+                        mode="tomorrow",
+                        or_equal=True,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="date_is_on_or_before"
+    ).exists()
+
+
+# Single select filter tests
+@pytest.mark.django_db
+def test_create_single_select_is_any_of_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_single_select_field(table=table)
+    data_fixture.create_select_option(field=field, value="Option 1")
+    data_fixture.create_select_option(field=field, value="Option 2")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="single_select",
+                        operator="is_any_of",
+                        value=["Option 1", "Option 2"],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="single_select_is_any_of"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_single_select_is_none_of_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_single_select_field(table=table)
+    data_fixture.create_select_option(field=field, value="Bad Option")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="single_select",
+                        operator="is_none_of",
+                        value=["Bad Option"],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="single_select_is_none_of"
+    ).exists()
+
+
+# Boolean filter tests
+@pytest.mark.django_db
+def test_create_boolean_is_true_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_boolean_field(table=table, name="Active")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="boolean",
+                        operator="equal",
+                        value=True,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="equal").exists()
+
+
+@pytest.mark.django_db
+def test_create_boolean_is_false_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_boolean_field(table=table, name="Active")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="boolean",
+                        operator="equal",
+                        value=False,
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(view=view, field=field, type="equal").exists()
+
+
+# Multiple select filter tests
+@pytest.mark.django_db
+def test_create_multiple_select_is_any_of_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_multiple_select_field(table=table)
+    data_fixture.create_select_option(field=field, value="Tag 1")
+    data_fixture.create_select_option(field=field, value="Tag 2")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="multiple_select",
+                        operator="is_any_of",
+                        value=["Tag 1", "Tag 2"],
+                    )
+                ],
+            ),
+        ],
+    )
+
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="multiple_select_has"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_multiple_select_is_none_of_filter(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_multiple_select_field(table=table)
+    data_fixture.create_select_option(field=field, value="Bad Tag")
+    view = data_fixture.create_grid_view(table=table)
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_view_filters(
+        ctx,
+        thought="test",
+        view_filters=[
+            ViewFiltersArgs(
+                view_id=view.id,
+                filters=[
+                    ViewFilterItemCreate(
+                        field_id=field.id,
+                        type="multiple_select",
+                        operator="is_none_of",
+                        value=["Bad Tag"],
+                    )
+                ],
+            ),
+        ],
+    )
+    assert len(response["created_view_filters"]) == 1
+    assert ViewFilter.objects.filter(
+        view=view, field=field, type="multiple_select_has_not"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_create_views_bad_cover_field_asks_the_model_to_retry(data_fixture):
+    # A bad field id must come back as a retry prompt naming the valid fields.
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database, name="Photos")
+    data_fixture.create_text_field(table=table, name="Caption")
+
+    ctx = make_test_ctx(user, workspace)
+
+    with pytest.raises(ModelRetry) as exc_info:
+        create_views(
+            ctx,
+            table_id=table.id,
+            views=[ViewItemCreate(name="Gallery", type="gallery", cover_field_id=0)],
+            thought="test",
+        )
+
+    message = str(exc_info.value)
+    assert "Gallery" in message
+    assert "Caption" in message
+
+
+@pytest.mark.django_db
+def test_create_views_wrong_field_type_asks_the_model_to_retry(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database, name="Tasks")
+    text_field = data_fixture.create_text_field(table=table, name="Status")
+
+    ctx = make_test_ctx(user, workspace)
+
+    with pytest.raises(ModelRetry) as exc_info:
+        create_views(
+            ctx,
+            table_id=table.id,
+            views=[
+                ViewItemCreate(
+                    name="Board", type="kanban", column_field_id=text_field.id
+                )
+            ],
+            thought="test",
+        )
+
+    assert "Single Select" in str(exc_info.value)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("include_compatible", [True, False])
+def test_create_form_view_skips_incompatible_fields(data_fixture, include_compatible):
+    """Report only saved inputs, including when every requested field is skipped."""
+
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    name = data_fixture.create_text_field(table=table, name="Name", primary=True)
+    formula = data_fixture.create_formula_field(
+        table=table, name="Computed", formula="'x'"
+    )
+    supported_options = (
+        [
+            {
+                "field_id": name.id,
+                "name": "Your name",
+                "description": "Enter your name",
+                "required": True,
+                "order": 1,
+            }
+        ]
+        if include_compatible
+        else []
+    )
+
+    ctx = make_test_ctx(user, workspace)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[
+            ViewItemCreate(
+                name="Signup",
+                public=False,
+                type="form",
+                field_options=[
+                    *[FormFieldOption(**options) for options in supported_options],
+                    FormFieldOption(
+                        field_id=formula.id,
+                        name="Computed",
+                        description="",
+                        required=False,
+                        order=2,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    created = response["created_views"][0]
+    assert "Computed" in created["skipped_fields"]
+    assert "Not shown on the form" in created["skipped_fields"]
+    assert created["field_options"] == supported_options
+    form = View.objects.get(name="Signup").specific
+    assert (
+        list(
+            form.active_field_options.values(
+                "field_id", "name", "description", "required", "order"
+            )
+        )
+        == supported_options
+    )
+
+
+@pytest.mark.django_db
+def test_create_views_with_only_used_names_skips_them_without_navigating(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    data_fixture.create_grid_view(table=table, name="Grid")
+    tool_helpers = create_fake_tool_helpers()
+    tool_helpers.navigate_to = MagicMock()
+
+    ctx = make_test_ctx(user, workspace, tool_helpers=tool_helpers)
+    response = create_views(
+        ctx,
+        thought="test",
+        table_id=table.id,
+        views=[ViewItemCreate(name="Grid", type="grid")],
+    )
+
+    assert response == {"created_views": [], "skipped_views": ["Grid"]}
+    assert View.objects.filter(table=table).count() == 1
+    tool_helpers.navigate_to.assert_not_called()

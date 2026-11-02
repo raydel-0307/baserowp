@@ -1,0 +1,165 @@
+import os
+
+from baserow.config.settings.utils import enum_member_by_value, str_to_bool
+from baserow_enterprise.secure_file_serve.constants import SecureFileServePermission
+
+
+def setup(settings):
+    """
+    This function is called after Baserow as setup its own Django settings file but
+    before Django starts. Read and modify provided settings object as appropriate
+    just like you would in a normal Django settings file. E.g.:
+
+    settings.INSTALLED_APPS += ["some_custom_plugin_dep"]
+    for db, value in settings.DATABASES:
+        value['engine'] = 'some custom engine'
+    """
+
+    settings.BASEROW_ENTERPRISE_USER_SOURCE_COUNTING_TASK_INTERVAL_MINUTES = int(
+        os.getenv("BASEROW_ENTERPRISE_USER_SOURCE_COUNTING_TASK_INTERVAL_MINUTES", "")
+        or 15
+    )
+
+    settings.BASEROW_ENTERPRISE_USER_SOURCE_COUNTING_CACHE_TTL_SECONDS = int(
+        # Default TTL is 120 minutes: 60 seconds * 120
+        os.getenv("BASEROW_ENTERPRISE_USER_SOURCE_COUNTING_CACHE_TTL_SECONDS") or 7200
+    )
+
+    settings.BASEROW_ENTERPRISE_AUDIT_LOG_CLEANUP_INTERVAL_MINUTES = int(
+        os.getenv("BASEROW_ENTERPRISE_AUDIT_LOG_CLEANUP_INTERVAL_MINUTES", "")
+        or 24 * 60
+    )
+
+    settings.BASEROW_ENTERPRISE_AUDIT_LOG_RETENTION_DAYS = int(
+        os.getenv("BASEROW_ENTERPRISE_AUDIT_LOG_RETENTION_DAYS", "") or 365
+    )
+
+    # Comma-separated list of percentages (e.g. "50,80,95") at which the members of a
+    # workspace are notified that it is approaching its application user limit. The
+    # limit itself (100%) always notifies and is enforced separately.
+    settings.BASEROW_APPLICATION_USER_USAGE_WARNING_THRESHOLDS = sorted(
+        {
+            percent
+            for value in os.getenv(
+                "BASEROW_APPLICATION_USER_USAGE_WARNING_THRESHOLDS", "80"
+            ).split(",")
+            if value.strip()
+            for percent in [int(value.strip())]
+            if 0 < percent < 100
+        }
+    )
+
+    # The number of hours a workspace can be over its application user limit before
+    # logins to its published applications are refused. This gives the workspace
+    # time to upgrade or reduce its usage instead of being blocked the moment it
+    # goes over. Set it to 0 to refuse logins as soon as the periodic count detects
+    # the workspace is over its limit. It's capped at the default, so that a
+    # misconfiguration can't stretch the grace period far enough to effectively
+    # disable the limit.
+    #
+    # Every install has an application user limit, including unlicensed ones and
+    # those licensed before v1.32, which fall back to
+    # `DEFAULT_APPLICATION_USERS_LIMIT`. The limit is always enforced.
+    max_application_user_limit_grace_period_hours = 24 * 7  # 7 days
+    settings.BASEROW_APPLICATION_USER_LIMIT_GRACE_PERIOD_HOURS = min(
+        int(
+            os.getenv("BASEROW_APPLICATION_USER_LIMIT_GRACE_PERIOD_HOURS", "")
+            or max_application_user_limit_grace_period_hours
+        ),
+        max_application_user_limit_grace_period_hours,
+    )
+
+    # Set this to True to enable users to login with auth providers different than
+    # the one they were originally created with.
+    settings.BASEROW_ALLOW_MULTIPLE_SSO_PROVIDERS_FOR_SAME_ACCOUNT = bool(
+        os.getenv("BASEROW_ALLOW_MULTIPLE_SSO_PROVIDERS_FOR_SAME_ACCOUNT", False)
+    )
+
+    settings.BASEROW_SSO_ALLOW_PRIVATE_ADDRESS = str_to_bool(
+        os.getenv("BASEROW_SSO_ALLOW_PRIVATE_ADDRESS") or "true"
+    )
+
+    serve_files_through_backend_permission = (
+        os.getenv("BASEROW_SERVE_FILES_THROUGH_BACKEND_PERMISSION", "")
+        or SecureFileServePermission.DISABLED.value
+    )
+
+    settings.BASEROW_SERVE_FILES_THROUGH_BACKEND_PERMISSION = enum_member_by_value(
+        SecureFileServePermission, serve_files_through_backend_permission
+    )
+
+    # If the expire seconds is not set to a number greater than zero, the signature will
+    # never expire.
+    settings.BASEROW_SERVE_FILES_THROUGH_BACKEND_EXPIRE_SECONDS = (
+        int(os.getenv("BASEROW_SERVE_FILES_THROUGH_BACKEND_EXPIRE_SECONDS", "") or 0)
+        or None
+    )
+
+    serve_files_through_backend = bool(
+        os.getenv("BASEROW_SERVE_FILES_THROUGH_BACKEND", False)
+    )
+    if serve_files_through_backend:
+        settings.STORAGES["default"]["BACKEND"] = (
+            "baserow_enterprise.secure_file_serve.storage.EnterpriseFileStorage"
+        )
+
+    settings.BASEROW_SERVE_FILES_THROUGH_BACKEND = serve_files_through_backend
+
+    settings.BASEROW_ENTERPRISE_PERIODIC_DATA_SYNC_CHECK_INTERVAL_MINUTES = int(
+        os.getenv("BASEROW_ENTERPRISE_PERIODIC_DATA_SYNC_CHECK_INTERVAL_MINUTES", "")
+        or 1
+    )
+    settings.BASEROW_ENTERPRISE_MAX_PERIODIC_DATA_SYNC_CONSECUTIVE_ERRORS = int(
+        os.getenv("BASEROW_ENTERPRISE_MAX_PERIODIC_DATA_SYNC_CONSECUTIVE_ERRORS", "")
+        or 4
+    )
+
+    settings.ENTERPRISE_CODE_RUNNER_WASMTIME_EXECUTABLE = os.getenv(
+        "BASEROW_ENTERPRISE_CODE_RUNNER_WASMTIME_EXECUTABLE", "wasmtime"
+    )
+    settings.ENTERPRISE_CODE_RUNNER_DEFAULT_TYPE = os.getenv(
+        "BASEROW_ENTERPRISE_CODE_RUNNER_DEFAULT_TYPE", "wasmtime_quickjs"
+    )
+    settings.ENTERPRISE_CODE_RUNNER_QUICKJS_WASM_PATH = os.getenv(
+        "BASEROW_ENTERPRISE_CODE_RUNNER_QUICKJS_WASM_PATH",
+        "/usr/local/lib/baserow/qjs.wasm",
+    )
+    settings.ENTERPRISE_CODE_RUNNER_TIMEOUT_SECONDS = int(
+        os.getenv("BASEROW_ENTERPRISE_CODE_RUNNER_TIMEOUT_SECONDS", "") or 5
+    )
+    settings.ENTERPRISE_CODE_RUNNER_MEMORY_LIMIT_BYTES = int(
+        os.getenv("BASEROW_ENTERPRISE_CODE_RUNNER_MEMORY_LIMIT_BYTES", "")
+        or 16 * 1024 * 1024
+    )
+    settings.ENTERPRISE_CODE_RUNNER_FUEL_LIMIT = int(
+        os.getenv("BASEROW_ENTERPRISE_CODE_RUNNER_FUEL_LIMIT", "") or 1_000_000_000
+    )
+
+    # AI Assistant settings
+    # Deprecated: select the Kuma model under AI providers > AI features. Keep this
+    # fallback for compatibility, including providers without a database equivalent.
+    settings.BASEROW_ENTERPRISE_ASSISTANT_LLM_MODEL = os.getenv(
+        "BASEROW_ENTERPRISE_ASSISTANT_LLM_MODEL", ""
+    )
+    settings.BASEROW_ASSISTANT_PHOENIX_URL = os.getenv(
+        "BASEROW_ASSISTANT_PHOENIX_URL", ""
+    )
+    settings.BASEROW_ASSISTANT_PHOENIX_API_KEY = os.getenv(
+        "BASEROW_ASSISTANT_PHOENIX_API_KEY", ""
+    )
+    _temp_raw = os.getenv("BASEROW_ENTERPRISE_ASSISTANT_LLM_TEMPERATURE", "")
+    settings.BASEROW_ENTERPRISE_ASSISTANT_LLM_TEMPERATURE = (
+        float(_temp_raw) if _temp_raw else None
+    )
+
+    # Both model selectors are deprecated; retain their existing fallback precedence.
+    # Credential fallback (UDSPY_LM_API_KEY, UDSPY_LM_OPENAI_COMPATIBLE_BASE_URL)
+    # is handled at model-creation time in retrying_model._resolve_model().
+    _udspy_model = os.getenv("UDSPY_LM_MODEL", "")
+    if _udspy_model and not settings.BASEROW_ENTERPRISE_ASSISTANT_LLM_MODEL:
+        settings.BASEROW_ENTERPRISE_ASSISTANT_LLM_MODEL = _udspy_model
+
+    # Bridge old AWS_REGION_NAME to boto3's standard AWS_DEFAULT_REGION.
+    _aws_region = os.getenv("AWS_REGION_NAME", "")
+    if _aws_region:
+        os.environ.setdefault("AWS_DEFAULT_REGION", _aws_region)

@@ -1,0 +1,715 @@
+import csv
+import re
+from collections import defaultdict
+from functools import reduce
+from itertools import zip_longest
+from operator import or_
+from pathlib import Path
+from typing import Iterable, Tuple
+
+from django.conf import settings
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+from django.db import transaction
+
+from loguru import logger
+from pgvector.django import L2Distance
+
+from baserow.core.embeddings import get_embedder
+from baserow.core.text_chunking import split_text
+from baserow_enterprise.assistant.models import (
+    DEFAULT_CATEGORIES,
+    KnowledgeBaseCategory,
+    KnowledgeBaseChunk,
+    KnowledgeBaseDocument,
+)
+
+# The local embedding model truncates long inputs. Keep passages small enough for
+# ordinary prose, with overlap so a sentence at a boundary remains retrievable.
+# This is a character bound, not a promise about an arbitrary model's token limit.
+KNOWLEDGE_CHUNK_SIZE = 1000
+KNOWLEDGE_CHUNK_OVERLAP = 150
+KNOWLEDGE_CHUNK_VERSION = 1
+MAX_LEXICAL_QUERY_TERMS = 64
+
+
+def split_document(content: str):
+    """Yield bounded, overlapping source slices without dropping content."""
+
+    if not content:
+        yield 0, 0, ""
+    yield from split_text(content, KNOWLEDGE_CHUNK_SIZE, KNOWLEDGE_CHUNK_OVERLAP)
+
+
+class VectorHandler:
+    def __init__(self, embedder=None):
+        self._embedder = embedder
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            self._embedder = get_embedder()
+        return self._embedder
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """
+        Embed a list of texts.
+
+        :param texts: The list of texts to embed
+        :return: A list of vectors corresponding to the input texts
+        """
+
+        if not texts:
+            return []
+
+        embedder = self.embedder
+        if callable(embedder):
+            return embedder(texts)
+        else:
+            return embedder.embed_documents(texts)
+
+    def embed_knowledge_chunks(
+        self, chunks: list[KnowledgeBaseChunk]
+    ) -> list[list[float]]:
+        """
+        Embed a list of document chunks, using their content.
+
+        :param document_chunks: The list of document chunks to embed
+        :return: A list of embeddings corresponding to the input document chunks
+        """
+
+        return self.embed_texts([chunk.content for chunk in chunks])
+
+    def query(self, query: str, num_results: int = 10) -> list[KnowledgeBaseChunk]:
+        """
+        Retrieve the most relevant document chunks for the given query.
+        It vectorizes the query and performs a similarity search using the vector field.
+
+        :param query: The text query to search for
+        :param num_results: The number of results to return
+        :return: A list of KnowledgeBaseChunk instances matching the query
+        """
+
+        (vector_query,) = self.embed_texts([query])
+        return self.raw_query(vector_query, num_results=num_results)
+
+    def raw_query(
+        self, query_vector: list[float], num_results: int = 10
+    ) -> list[KnowledgeBaseChunk]:
+        """
+        Perform a raw similarity search using the vector field.
+
+        :param query_vector: The vector to search for
+        :param num_results: The number of results to return
+        :return: A list of KnowledgeBaseChunk instances matching the query
+        """
+
+        return (
+            KnowledgeBaseChunk.objects.filter(
+                source_document__status=KnowledgeBaseDocument.Status.READY,
+            )
+            .select_related("source_document")
+            .alias(
+                distance=L2Distance(KnowledgeBaseChunk.VECTOR_FIELD_NAME, query_vector)
+            )
+            .order_by("distance")[:num_results]
+        )
+
+
+class KnowledgeBaseHandler:
+    def __init__(self, vector_handler: VectorHandler | None = None):
+        self.vector_handler = vector_handler or VectorHandler()
+        self._try_init_vectors()
+
+    def _try_init_vectors(self):
+        """
+        Ensures that the vector field is initialized if the pgvector extension is
+        available, adding the necessary field to the model so it can be queried and
+        used.
+        """
+
+        KnowledgeBaseChunk.try_init_vector_field()
+
+    def can_have_knowledge_base(self):
+        """
+        Indicates whether it's possible for the knowledge base to be populated. In
+        order to do that, we need a valid embeddings server and PostgreSQL server must
+        support vectors.
+
+        :return: True if there is an embeddings server and pgvector extension is
+            enabled.
+        """
+
+        return (
+            settings.BASEROW_EMBEDDINGS_API_URL != ""
+            and KnowledgeBaseChunk.can_search_vectors()
+        )
+
+    def can_search(self) -> bool:
+        """
+        Returns whether the knowledge base has any documents with status READY that can
+        be searched.
+
+        :return: True if the pgvector extension is enabled, the embedding field exists
+            and there is at least one READY document, False otherwise.
+        """
+
+        return (
+            self.can_have_knowledge_base()
+            and KnowledgeBaseDocument.objects.filter(
+                status=KnowledgeBaseDocument.Status.READY
+            ).exists()
+        )
+
+    def search(self, query: str, num_results=10) -> list[KnowledgeBaseChunk]:
+        """
+        Retrieve the most relevant knowledge chunks for the given query.
+
+        :param query: The text query to search for
+        :param num_results: The number of results to return
+        :return: A list of KnowledgeBaseChunk instances matching the query
+        """
+
+        if num_results <= 0:
+            return []
+
+        # Semantic search can miss exact function names and information buried in
+        # legacy whole-page embeddings. Search terms independently (OR), so the
+        # filler words in a natural-language question cannot exclude a useful page.
+        candidate_limit = max(num_results * 4, 20)
+        semantic = list(self.vector_handler.query(query, num_results=candidate_limit))
+        # Bound Django's combined query depth for long or repetitive questions.
+        # The semantic query still receives the complete original question.
+        terms = list(dict.fromkeys(re.findall(r"\w+", query.lower())))[
+            :MAX_LEXICAL_QUERY_TERMS
+        ]
+        if not terms:
+            return semantic[:num_results]
+        lexical_query = reduce(
+            or_, (SearchQuery(term, config="english") for term in terms)
+        )
+        lexical_vector = SearchVector(
+            "source_document__title", weight="A", config="english"
+        ) + SearchVector("content", weight="B", config="english")
+        lexical = list(
+            KnowledgeBaseChunk.objects.filter(
+                source_document__status=KnowledgeBaseDocument.Status.READY
+            )
+            .select_related("source_document")
+            .annotate(rank=SearchRank(lexical_vector, lexical_query))
+            .filter(rank__gt=0)
+            .order_by("-rank", "id")[:candidate_limit]
+        )
+
+        # Alternate the rankings rather than adding their incomparable scores.
+        # Weak matches present in both lists must not bury a strong exact-term
+        # match present only in the lexical list (or a paraphrase only in vectors).
+        results = []
+        seen = set()
+        document_counts = defaultdict(int)
+        for pair in zip_longest(semantic, lexical):
+            for chunk in pair:
+                if chunk is None or chunk.id in seen:
+                    continue
+                seen.add(chunk.id)
+                # Overlap from one long page must not crowd out other sources.
+                if document_counts[chunk.source_document_id] >= 3:
+                    continue
+                results.append(chunk)
+                document_counts[chunk.source_document_id] += 1
+                if len(results) == num_results:
+                    return results
+        return results
+
+    def load_categories(self, categories_serialized: Iterable[Tuple[str, str | None]]):
+        """
+        Import categories into the knowledge base.
+
+        :param categories_serialized: An iterable of tuples containing category names
+            and their parent category names (or None if no parent).
+        """
+
+        category_by_name = {}
+        parent_name_by_name = {}
+        categories = []
+
+        # Make sure all categories exist, so later we can set the parent IDs
+        for name, parent_name in categories_serialized:
+            category = KnowledgeBaseCategory(name=name, parent_id=None)
+            categories.append(category)
+            category_by_name[name] = category
+            if parent_name:
+                parent_name_by_name[name] = parent_name
+
+        KnowledgeBaseCategory.objects.bulk_create(
+            categories,
+            update_conflicts=True,
+            unique_fields=["name"],
+            update_fields=["parent_id"],
+        )
+
+        # Now that all categories exist and have an ID, update the parent IDs
+        categories_with_parents = []
+        for name, parent_name in parent_name_by_name.items():
+            if (
+                not parent_name
+                or (parent_category := category_by_name.get(parent_name)) is None
+            ):
+                continue
+
+            category = category_by_name[name]
+            category.parent_id = parent_category.id
+            categories_with_parents.append(category)
+
+        KnowledgeBaseCategory.objects.bulk_update(
+            categories_with_parents, ["parent_id"]
+        )
+
+    def sync_knowledge_base_from_csv(self):
+        """
+        Sync entries from `website_export.csv` with the knowledgebase documents and
+        chunks. The idea is that this `website_export.csv` file can easily be
+        exported from the production version of saas.
+
+        It automatically checks if the entry already exists, and will create,
+        update or delete accordingly. This will make sure that if a FAQ question is
+        removed from the source, it will also be removed in the documents.
+        """
+
+        csv_path = self._csv_path()
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = [dict(r) for r in reader]
+
+        if not rows:
+            return
+
+        pages = {}  # (doc_type, slug) -> page dict
+        slugs_by_type = defaultdict(set)
+        cat_names = set()
+        faq_type = KnowledgeBaseDocument.DocumentType.FAQ
+
+        for row in rows:
+            row_id = row.get("id") or ""
+            base_slug = row.get("slug") or ""
+            title = row.get("title") or row.get("name") or ""
+            body = row.get("markdown_body") or ""
+            category = row.get("category") or ""
+            source_url = row.get("source_url") or ""
+            doc_type = self._csv_type_to_enum(row.get("type"))
+
+            if not (doc_type and base_slug and title):
+                continue
+
+            if doc_type == faq_type:
+                slug = f"{base_slug}-{row_id}"
+            else:
+                slug = base_slug
+
+            key = (doc_type, slug)
+            pages[key] = {
+                "title": title,
+                "body": body,
+                "category": category,
+                "source_url": source_url,
+                "type": doc_type,
+            }
+
+            slugs_by_type[doc_type].add(slug)
+            if category:
+                cat_names.add(category)
+
+        if not pages:
+            return
+
+        categories = {
+            c.name: c for c in KnowledgeBaseCategory.objects.filter(name__in=cat_names)
+        }
+
+        with transaction.atomic():
+            types_in_csv = list(slugs_by_type.keys())
+            existing = {
+                (d.type, d.slug): d
+                for d in KnowledgeBaseDocument.objects.filter(
+                    type__in=types_in_csv
+                ).prefetch_related("chunks")
+            }
+
+            # Deletes the user docs that exist in the KnowledgeBaseDocument,
+            # but do not exist in the CSV file anymore. This covers the scenario
+            # where a page is deleted.
+            for t in types_in_csv:
+                csv_slugs = slugs_by_type[t]
+                to_delete = [
+                    k for k in existing.keys() if k[0] == t and k[1] not in csv_slugs
+                ]
+                if to_delete:
+                    KnowledgeBaseDocument.objects.filter(
+                        type=t, slug__in=[s for (_, s) in to_delete]
+                    ).delete()
+                    for k in to_delete:
+                        existing.pop(k, None)
+
+            create, update = [], []
+            doc_ids_needing_chunks: set[int] = set()
+
+            for key, p in pages.items():
+                category = categories.get(p["category"]) if p["category"] else None
+                d = existing.get(key)
+                if d:
+                    changed = False
+                    body_changed = self._needs_reindex(d)
+                    if d.title != p["title"]:
+                        d.title = p["title"]
+                        changed = True
+                        body_changed = True
+                    if d.raw_content != p["body"]:
+                        d.raw_content = p["body"]
+                        changed = True
+                        body_changed = True
+                    if d.content != p["body"]:
+                        d.content = p["body"]
+                        changed = True
+                        body_changed = True
+                    if d.category_id != (category.id if category else None):
+                        d.category = category
+                        changed = True
+                    if d.process_document:
+                        d.process_document = False
+                        changed = True
+                    if d.status != KnowledgeBaseDocument.Status.READY:
+                        d.status = KnowledgeBaseDocument.Status.READY
+                        changed = True
+                    if d.source_url != p["source_url"]:
+                        d.source_url = p["source_url"]
+                        changed = True
+
+                    if changed:
+                        update.append(d)
+                    if body_changed:
+                        doc_ids_needing_chunks.add(d.id)
+                else:
+                    new_doc = KnowledgeBaseDocument(
+                        title=p["title"],
+                        slug=key[1],
+                        type=key[0],
+                        raw_content=p["body"],
+                        process_document=False,
+                        content=p["body"],
+                        status=KnowledgeBaseDocument.Status.READY,
+                        category=category,
+                        source_url=p["source_url"],
+                    )
+                    create.append(new_doc)
+
+            if create:
+                KnowledgeBaseDocument.objects.bulk_create(create)
+                fresh = KnowledgeBaseDocument.objects.filter(
+                    type__in=types_in_csv, slug__in=[d.slug for d in create]
+                )
+                for d in fresh:
+                    existing[(d.type, d.slug)] = d
+                    doc_ids_needing_chunks.add(d.id)
+
+            if update:
+                # The `updated_on` field is not saved during the bulk update, so we
+                # would need to pre_save this value before.
+                for d in update:
+                    d.updated_on = KnowledgeBaseDocument._meta.get_field(
+                        "updated_on"
+                    ).pre_save(d, add=False)
+
+                KnowledgeBaseDocument.objects.bulk_update(
+                    update,
+                    [
+                        "title",
+                        "raw_content",
+                        "process_document",
+                        "content",
+                        "status",
+                        "category",
+                        "source_url",
+                        "updated_on",
+                    ],
+                )
+
+            # If there are no chunks to rebuild, we can skip the final part because
+            # there is no need to delete and recreate the missing chunks.
+            if not doc_ids_needing_chunks:
+                return
+
+            KnowledgeBaseChunk.objects.filter(
+                source_document_id__in=list(doc_ids_needing_chunks)
+            ).delete()
+
+            chunks, texts = [], []
+            for (t, s), d in existing.items():
+                if d.id not in doc_ids_needing_chunks:
+                    continue
+                body = pages[(t, s)]["body"]
+                document_chunks = self._document_chunks(d, body)
+                chunks.extend(document_chunks)
+                texts.extend(
+                    f"{d.title[: KnowledgeBaseDocument.TITLE_MAX_LENGTH]}\n\n{chunk.content}"
+                    for chunk in document_chunks
+                )
+
+            if not chunks:
+                return
+
+            self._update_chunks(texts, chunks)
+
+    def sync_knowledge_base_from_dev_docs(self):
+        """
+        Sync the developer documentation from the local `docs/` folder with the
+        knowledgebase documents and chunks. Every .md file will be included. It will
+        automatically figure out a title, slug, etc. It automatically checks if the
+        entry already exists, and will create, update or delete accordingly.
+        """
+
+        docs_root = self._get_docs_path()
+        if docs_root is None:
+            logger.warning(
+                f"The {docs_root} folder does not exist, skip synchronizing the dev "
+                f"docs"
+            )
+            return
+
+        doc_type = KnowledgeBaseDocument.DocumentType.BASEROW_DEV_DOCS
+
+        pages: dict[str, dict] = {}
+        slugs: set[str] = set()
+
+        for md_path in docs_root.rglob("*.md"):
+            rel = md_path.relative_to(docs_root)
+            rel_str = rel.as_posix()
+            if not rel_str.lower().endswith(".md"):
+                continue
+
+            rel_without_md = rel_str[:-3]
+            slug = f"dev/{rel_without_md}"
+            slugs.add(slug)
+
+            stem = md_path.stem  # e.g. "ci-cd"
+            stem_normalized = stem.replace("_", "-")
+            parts = [p for p in stem_normalized.split("-") if p]
+            title = (
+                " ".join(p[:1].upper() + p[1:].lower() for p in parts)
+                if parts
+                else stem[:1].upper() + stem[1:].lower()
+            )
+
+            with md_path.open("r", encoding="utf-8") as f:
+                body = f.read()
+
+            source_url = f"https://baserow.io/docs/{rel_without_md}"
+
+            pages[slug] = {
+                "title": title,
+                "body": body,
+                "source_url": source_url,
+            }
+
+        dev_docs_category = KnowledgeBaseCategory.objects.filter(
+            name="dev_docs"
+        ).first()
+
+        with transaction.atomic():
+            existing = {
+                d.slug: d
+                for d in KnowledgeBaseDocument.objects.filter(
+                    type=doc_type
+                ).prefetch_related("chunks")
+            }
+
+            # Delete docs that no longer have a corresponding markdown file. This is
+            # needed because a file could be removed because it's no longer relevant.
+            # It should then not show up in the docs anymore.
+            to_delete_slugs = [s for s in existing.keys() if s not in slugs]
+            if to_delete_slugs:
+                KnowledgeBaseDocument.objects.filter(
+                    type=doc_type, slug__in=to_delete_slugs
+                ).delete()
+                for s in to_delete_slugs:
+                    existing.pop(s, None)
+
+            create, update = [], []
+            doc_ids_needing_chunks: set[int] = set()
+
+            for slug, p in pages.items():
+                d = existing.get(slug)
+                if d:
+                    changed = False
+                    body_changed = self._needs_reindex(d)
+                    if d.title != p["title"]:
+                        d.title = p["title"]
+                        changed = True
+                        body_changed = True
+                    if d.raw_content != p["body"]:
+                        d.raw_content = p["body"]
+                        changed = True
+                        body_changed = True
+                    if d.content != p["body"]:
+                        d.content = p["body"]
+                        changed = True
+                        body_changed = True
+                    if dev_docs_category and d.category_id != dev_docs_category.id:
+                        d.category = dev_docs_category
+                        changed = True
+                    if d.process_document:
+                        d.process_document = False
+                        changed = True
+                    if d.status != KnowledgeBaseDocument.Status.READY:
+                        d.status = KnowledgeBaseDocument.Status.READY
+                        changed = True
+                    if d.source_url != p["source_url"]:
+                        d.source_url = p["source_url"]
+                        changed = True
+
+                    if changed:
+                        update.append(d)
+                    if body_changed:
+                        doc_ids_needing_chunks.add(d.id)
+                else:
+                    new_doc = KnowledgeBaseDocument(
+                        title=p["title"],
+                        slug=slug,
+                        type=doc_type,
+                        raw_content=p["body"],
+                        process_document=False,
+                        content=p["body"],
+                        status=KnowledgeBaseDocument.Status.READY,
+                        category=dev_docs_category,
+                        source_url=p["source_url"],
+                    )
+                    create.append(new_doc)
+
+            if create:
+                KnowledgeBaseDocument.objects.bulk_create(create)
+                fresh = KnowledgeBaseDocument.objects.filter(
+                    type=doc_type, slug__in=[d.slug for d in create]
+                )
+                for d in fresh:
+                    existing[d.slug] = d
+                    doc_ids_needing_chunks.add(d.id)
+
+            if update:
+                # The `updated_on` field is not saved during the bulk update, so we
+                # would need to pre_save this value before.
+                for d in update:
+                    d.updated_on = KnowledgeBaseDocument._meta.get_field(
+                        "updated_on"
+                    ).pre_save(d, add=False)
+
+                KnowledgeBaseDocument.objects.bulk_update(
+                    update,
+                    [
+                        "title",
+                        "raw_content",
+                        "process_document",
+                        "content",
+                        "status",
+                        "category",
+                        "source_url",
+                        "updated_on",
+                    ],
+                )
+
+            # If there are no chunks to rebuild, we can skip the final part because
+            # there is no need to delete and recreate the missing chunks.
+            if not doc_ids_needing_chunks:
+                return
+
+            KnowledgeBaseChunk.objects.filter(
+                source_document_id__in=list(doc_ids_needing_chunks)
+            ).delete()
+
+            chunks, texts = [], []
+            for slug, d in existing.items():
+                if d.id not in doc_ids_needing_chunks:
+                    continue
+                body = pages[slug]["body"]
+                document_chunks = self._document_chunks(d, body)
+                chunks.extend(document_chunks)
+                texts.extend(
+                    f"{d.title[: KnowledgeBaseDocument.TITLE_MAX_LENGTH]}\n\n{chunk.content}"
+                    for chunk in document_chunks
+                )
+
+            if not chunks:
+                return
+
+            self._update_chunks(texts, chunks)
+
+    def _needs_reindex(self, document: KnowledgeBaseDocument) -> bool:
+        """Upgrade old whole-page indexes and repair incomplete passage sets."""
+
+        chunks = list(document.chunks.all())
+        return not chunks or any(
+            chunk.metadata.get("version") != KNOWLEDGE_CHUNK_VERSION
+            or chunk.metadata.get("total") != len(chunks)
+            for chunk in chunks
+        )
+
+    def _document_chunks(self, document: KnowledgeBaseDocument, body: str):
+        passages = list(split_document(body))
+        return [
+            KnowledgeBaseChunk(
+                source_document=document,
+                index=index,
+                content=content,
+                metadata={
+                    "version": KNOWLEDGE_CHUNK_VERSION,
+                    "start": start,
+                    "end": end,
+                    "total": len(passages),
+                },
+            )
+            for index, (start, end, content) in enumerate(passages)
+        ]
+
+    def _csv_path(self):
+        path = Path(__file__).resolve().parents[5] / "website_export.csv"
+
+        if not path.exists():
+            raise FileNotFoundError(f"CSV not found at: {path}")
+
+        return path
+
+    def _get_docs_path(self) -> Path | None:
+        """
+        Returns the path to the `docs` directory if it exists, otherwise None.
+        The folder is expected at `../../../../../../../docs` from this handler file.
+        """
+
+        path = Path(__file__).resolve().parents[7] / "docs"
+        if not path.exists() or not path.is_dir():
+            return None
+        return path
+
+    def _csv_type_to_enum(self, csv_value: str | None) -> str:
+        v = (csv_value or "").strip()
+        if not v:
+            return KnowledgeBaseDocument.DocumentType.RAW_DOCUMENT
+        for dt in KnowledgeBaseDocument.DocumentType:
+            if v.lower() == dt.value.lower():
+                return dt.value
+        return KnowledgeBaseDocument.DocumentType.RAW_DOCUMENT
+
+    def _update_chunks(self, texts, chunks):
+        embeddings = self.vector_handler.embed_texts(texts)
+        if KnowledgeBaseChunk.can_search_vectors():
+            for c, e in zip(chunks, embeddings):
+                c.embedding = list(e)
+                c._embedding_array = list(e)
+        else:
+            for c, e in zip(chunks, embeddings):
+                c._embedding_array = list(e)
+
+        KnowledgeBaseChunk.objects.bulk_create(chunks)
+
+    def sync_knowledge_base(self):
+        # Ensure default categories exist (parents set by load_categories)
+        self.load_categories(DEFAULT_CATEGORIES)
+
+        self.sync_knowledge_base_from_csv()
+        self.sync_knowledge_base_from_dev_docs()

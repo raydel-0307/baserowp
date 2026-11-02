@@ -1,0 +1,1558 @@
+import { Registerable } from '@baserow/modules/core/registry'
+import {
+  ActionNodeTypeMixin,
+  TriggerNodeTypeMixin,
+  UtilityNodeTypeMixin,
+  ContainerNodeTypeMixin,
+} from '@baserow/modules/automation/nodeTypeMixins'
+import {
+  LocalBaserowCreateRowServiceType,
+  LocalBaserowCreateRowsServiceType,
+  LocalBaserowUpdateRowServiceType,
+  LocalBaserowUpdateRowsServiceType,
+  LocalBaserowDeleteRowServiceType,
+  LocalBaserowRowsCreatedTriggerServiceType,
+  LocalBaserowRowsDeletedTriggerServiceType,
+  LocalBaserowRowsUpdatedTriggerServiceType,
+  LocalBaserowFieldsUpdatedTriggerServiceType,
+  LocalBaserowGetRowServiceType,
+  LocalBaserowListRowsServiceType,
+  LocalBaserowAggregateRowsServiceType,
+} from '@baserow/modules/integrations/localBaserow/serviceTypes'
+import LocalBaserowNodeServiceForm from '@baserow/modules/automation/components/workflow/LocalBaserowNodeServiceForm'
+import {
+  CoreCSVFileReaderServiceType,
+  CoreInboundEmailTriggerServiceType,
+  CoreHTTPRequestServiceType,
+  CoreRouterServiceType,
+  CoreGotoServiceType,
+  CoreSMTPEmailServiceType,
+  CoreHTTPTriggerServiceType,
+  CoreIteratorServiceType,
+  CoreManualTriggerServiceType,
+  CoreResponseServiceType,
+  CoreStartWorkflowServiceType,
+} from '@baserow/modules/integrations/core/serviceTypes'
+import { AIAgentServiceType } from '@baserow/modules/integrations/ai/serviceTypes'
+import {
+  buildGotoDestinations,
+  isValidGotoDestination,
+} from '@baserow/modules/automation/utils/gotoNode'
+import { uuid } from '@baserow/modules/core/utils/string'
+import { parseAliases } from '@baserow/modules/automation/utils/aliases'
+import { SlackWriteMessageServiceType } from '@baserow/modules/integrations/slack/serviceTypes'
+
+export class NodeType extends Registerable {
+  /**
+   * The display name of the node type, we use this value
+   * in create/update node lists.
+   * The name is derived from the service type's name.
+   * @returns {string} - The display name for the node.
+   */
+  get name() {
+    return this.serviceType.name
+  }
+
+  /**
+   * If the workflow designer doesn't provide a `label` for the node,
+   * this method is used to generate a default label.
+   * By default, it returns the node type's name.
+   * @param node - The node for which the default label is being generated.
+   * @returns {string} - The default label for the node.
+   */
+  getDefaultLabel({ node }) {
+    return this.name
+  }
+
+  /**
+   * The display label of the node type, we use this value
+   * in the editor when rendering the node.
+   * @returns {string} - The display label for the node.
+   */
+  getLabel({ automation, node }) {
+    return node.label || this.getDefaultLabel({ automation, node })
+  }
+
+  /**
+   * The label of a node in a workflow run history. Unlike `getLabel`, this is
+   * resolved from the history entry alone: the history references the
+   * published workflow copy that ran, whose node ids differ from the editor's,
+   * so the editor workflow can't be consulted. Node types that record extra
+   * run-time context (e.g. the branch taken, or the node jumped to) override
+   * this to surface it.
+   *
+   * @param {Object} nodeHistory The history entry of the node's run.
+   * @returns {string} - The label for the history entry.
+   */
+  getHistoryLabel({ nodeHistory }) {
+    return nodeHistory.node_label || this.name
+  }
+
+  /**
+   * Returns the text to be displayed on the graph just before the node.
+   */
+  getBeforeLabel({ workflow, node }) {
+    return this.app.$i18n.t('workflowNode.beforeLabelAction')
+  }
+
+  /**
+   * The node-to-node links this node declares. By default a node links to
+   * nothing; types like the "Go to node" override this to point at another
+   * node, and any future node that references another node can do the same.
+   * Each link is surfaced as a paired marker on both the source and
+   * destination cards, so every entry returned must already be a valid link.
+   *
+   * @param {Object} workflow The workflow the node belongs to.
+   * @param {Object} node The node the links originate from.
+   * @returns {Array<{ destinationNodeId: number }>} The outgoing links.
+   */
+  getConnections({ workflow, node }) {
+    return []
+  }
+
+  /**
+   * A hook called for every node after any node is moved within `workflow`,
+   * mirroring the backend's `after_move`. A node type can override this to
+   * reconcile state the move may have invalidated (for example a link to
+   * another node that now sits on a different branch or level), returning the
+   * values needed to repair `node`. Returns null (the default) when the type
+   * has nothing to reconcile.
+   *
+   * @param {Object} workflow The workflow the node belongs to.
+   * @param {Object} node The node to reconcile.
+   * @returns {Object|null} The values to update the node with, or null.
+   */
+  afterMove({ workflow, node }) {
+    return null
+  }
+
+  /**
+   * The selectable destinations to pass into the node's form component via
+   * its `destinations` prop, for node types whose form lets the user pick
+   * another node as a jump target. Returns undefined by default so the prop
+   * isn't bound as a stray fallthrough attribute on forms that don't use it.
+   *
+   * @param {Object} workflow The workflow the node belongs to.
+   * @param {Object} node The node whose form is being rendered.
+   * @param {Object} automation The automation the workflow belongs to.
+   * @returns {{ value: number, name: string }[]|undefined} The destinations.
+   */
+  getDestinations({ workflow, node, automation }) {
+    return undefined
+  }
+
+  /**
+   * The node type's description.
+   * The description is derived from the service type's description.
+   * @returns {string} - The node's description.
+   */
+  get description() {
+    return this.serviceType.description
+  }
+
+  /**
+   * Extra terms the add-node menu search matches for this node type, besides
+   * its name and description. Derived from the service type's aliases.
+   * @returns {string[]}
+   */
+  get aliases() {
+    return this.serviceType.aliases
+  }
+
+  /**
+   * New nodes must implement this method to return their
+   * specific service type.
+   * @throws {Error} If the method is not implemented.
+   */
+  get serviceType() {
+    throw new Error('This method must be implemented')
+  }
+
+  get group() {
+    return this.serviceType.group
+  }
+
+  /**
+   * The icon which is shown inside the editor's node.
+   * @returns {string} - The node's icon class.
+   */
+
+  get iconClass() {
+    return this.serviceType.icon
+  }
+
+  get iconColor() {
+    return this.group.iconColor
+  }
+
+  /**
+   * The node type's image, which will be displayed in dropdowns.
+   * @returns - The node's image.
+   */
+  get image() {
+    return this.serviceType.image
+  }
+
+  /**
+   * The node type's editor component. Not yet implemented.
+   * @returns {object|null} - The node's editor component.
+   */
+  get component() {
+    return null
+  }
+
+  /**
+   * The node type's form component.
+   * The component is derived from the service type's form component.
+   * @returns {object} - The node's form component.
+   */
+  get formComponent() {
+    return this.serviceType.formComponent
+  }
+
+  get returnsList() {
+    return Boolean(this.serviceType.returnsList)
+  }
+
+  /**
+   * Whether this node type can be moved around the workflow. By default,
+   * all nodes can be moved. This can be overridden by the node type
+   * to prevent moving.
+   * @returns {boolean} - Whether the node can be moved.
+   */
+  get isFixed() {
+    return false
+  }
+
+  /**
+   * Allow to hook into default values for this node type at node creation.
+   * @param {object} values the current values for the node to create.
+   * @returns an object containing values updated with the default values.
+   */
+  getDefaultValues(values) {
+    return values
+  }
+
+  /**
+   * Returns whether the node is in-error or not.
+   * By default, this is derived from the service type's `isInError`
+   * method, but can be overridden by the node type.
+   * @param {object} context The node's service and application context.
+   * @param {object} context.service The service of the node.
+   * @param {object|null} [context.workspace=null] The owning workspace.
+   * @param {object|null} [context.application=null] The owning automation.
+   * @returns {boolean} - Whether the properties are in-error.
+   */
+  isInError({ service, workspace = null, application = null }) {
+    if (workspace && this.isDeactivated({ workspace })) {
+      return true
+    }
+    return this.serviceType.isInError({ service, workspace, application })
+  }
+
+  /**
+   * Returns the error message we should show when the node is in-error.
+   * By default, this is derived from the service type's `getErrorMessage`
+   * method, but can be overridden by the node type.
+   * @param {object} context The node and its service and application context.
+   * @param {object} context.service The service of the node.
+   * @param {object} context.node The node whose error is being retrieved.
+   * @param {object|null} [context.workspace=null] The owning workspace.
+   * @param {object|null} [context.application=null] The owning automation.
+   * @returns {string|null} The error message, or null when valid.
+   */
+  getErrorMessage({ service, node, workspace = null, application = null }) {
+    const deactivatedReason =
+      workspace && this.isDeactivatedReason({ workspace })
+    if (deactivatedReason) {
+      return deactivatedReason
+    }
+    return this.serviceType.getErrorMessage({ service, workspace, application })
+  }
+
+  /**
+   * Returns whether this individual node is allowed to be deleted.
+   * By default, all nodes (except triggers) are allowed to be deleted.
+   * This can be overridden by the node type to prevent deletion.
+   * @param {object} workflow - The workflow the node belongs to.
+   * @param {object} node - The node for which the deletability is being checked.
+   * @returns {boolean} - Whether the node is allowed to be deleted.
+   */
+  isDeletable({ workflow, node }) {
+    return Boolean(this.getDeleteErrorMessage({ workflow, node }))
+  }
+
+  /**
+   * Returns whether the given node can be duplicated.
+   */
+  isDuplicable({ workflow, node }) {
+    return true
+  }
+
+  /**
+   * Returns the error message we should show when a node cannot be deleted.
+   * By default, this method is empty, but can be overridden by the node type
+   * to provide a custom deletion message.
+   * @param {object} workflow - The workflow the node belongs to.
+   * @param {object} node - The node for which the deletion message is being retrieved.
+   * @returns {string} - The message
+   */
+  getDeleteErrorMessage({ workflow, node }) {
+    return ''
+  }
+
+  /**
+   * Returns whether this individual node is allowed to be replaced.
+   * By default, all nodes are allowed to be replaced.
+   * This can be overridden by the node type to prevent replacement.
+   * @param {object} workflow - The workflow the node belongs to.
+   * @param {object} node - The node for which the replaceability is being checked.
+   * @returns {boolean} - Whether the node is allowed to be replaced.
+   */
+  isReplaceable({ workflow, node }) {
+    return Boolean(this.getReplaceErrorMessage({ workflow, node }))
+  }
+
+  /**
+   * Returns the error message we should show when a node cannot be replaced.
+   * By default, this method is empty, but can be overridden by the node type
+   * to provide a custom replacement message.
+   * @param {object} workflow - The workflow the node belongs to.
+   * @param {object} node - The node for which the replacement message is being retrieved.
+   * @returns {string} - The message.
+   */
+  getReplaceErrorMessage({ workflow, node }) {
+    return ''
+  }
+
+  /**
+   * Returns this node's data type, used by the `getDataSchema` method
+   * to inform the schema about what kind of data type this node returns.
+   *
+   * @returns {string} - The data type of the node, which is 'object' by default.
+   */
+  get dataType() {
+    return 'object'
+  }
+
+  /**
+   * Generates the data schema for the node, used by the data provider.
+   * Constructed by retrieving the service schema for this node's service.
+   * @param automation - The automation the node belongs to.
+   * @param node - The node for which the data schema is being generated.
+   * @returns {object} - The data schema for the node.
+   */
+  getDataSchema({ automation, node }) {
+    if (!node.service) {
+      return null
+    }
+    const serviceSchema = this.serviceType.getDataSchema(node.service)
+    if (serviceSchema) {
+      return {
+        ...serviceSchema,
+        title: this.getLabel({ automation, node }),
+      }
+    }
+    return null
+  }
+
+  /**
+   * Returns the sample data for this node.
+   */
+  getSampleData({ service }) {
+    if (!service) {
+      return null
+    }
+    return this.serviceType.getSampleData(service)
+  }
+
+  /**
+   * The content type of this node's sample data. Nodes returning 'html' get
+   * an extra HTML preview tab in the sample data modal.
+   */
+  getSampleDataContentType({ service }) {
+    if (!service) {
+      return 'json'
+    }
+    return this.serviceType.getSampleDataContentType(service)
+  }
+
+  /**
+   * The HTML document rendered in the sample data modal's HTML tab.
+   */
+  getSampleDataHtml({ service }) {
+    if (!service) {
+      return null
+    }
+    return this.serviceType.getSampleDataHtml(service)
+  }
+
+  getEdges({ node }) {
+    return [{ uid: '', label: '' }]
+  }
+
+  /**
+   * Whether this node type is offered at all. Unlike `isDeactivated`, which
+   * keeps the entry in the add-node menu but disabled with a reason, a type
+   * that is not enabled is omitted from the menu entirely. Types that only make
+   * sense when the instance is configured for them override this.
+   * @returns {boolean}
+   */
+  isEnabled() {
+    return true
+  }
+
+  isDeactivatedReason({ workspace }) {
+    const serviceReason = this.serviceType.isDeactivatedReason({ workspace })
+    if (serviceReason) {
+      return serviceReason
+    }
+    return null
+  }
+
+  isDeactivated({ workspace }) {
+    return !!this.isDeactivatedReason({ workspace })
+  }
+
+  getDeactivatedClickModal({ workspace }) {
+    return this.serviceType.getDeactivatedClickModal({ workspace })
+  }
+}
+
+export class LocalBaserowNodeType extends NodeType {
+  /**
+   * A wrapper around the service form, so the node can pick its integration
+   * first and hand the form the databases it reaches.
+   */
+  get formComponent() {
+    return LocalBaserowNodeServiceForm
+  }
+
+  /**
+   * Responsible for returning contextual data for a node label template.
+   * At the moment we only refer to the table name.
+   *
+   * @param automation - the automation the node belongs to.
+   * @param node - The node for which the label context is being retrieved.
+   * @returns {object} - An object containing the table name.
+   */
+  getLabelContext({ automation, node }) {
+    const integration = this.app.$store.getters[
+      'integration/getIntegrationById'
+    ](automation, node.service?.integration_id)
+    const databases = integration?.context_data?.databases || []
+    const tableSelected = databases
+      .map((database) => database.tables)
+      .flat()
+      .find(({ id }) => id === node.service.table_id)
+
+    return { tableName: tableSelected?.name }
+  }
+
+  /**
+   * If the workflow designer doesn't provide a `label` for the node,
+   * this method is used to generate a default label.
+   * @param automation - The automation the node belongs to.
+   * @param node - The node for which the default label is being generated.
+   * @returns {string} - The default label for the node.
+   */
+  getDefaultLabel({ automation, node }) {
+    const { tableName } = this.getLabelContext({ automation, node })
+    return tableName
+      ? this.app.$i18n.t(this.labelTemplateName, { tableName })
+      : this.name
+  }
+}
+
+export class LocalBaserowSignalTriggerNodeType extends LocalBaserowNodeType {
+  /**
+   * All Local Baserow signal triggers return an array of rows,
+   * so we override the `dataType` method to return 'array'.
+   * @returns {string} - The data type of the node, which is 'array'.
+   */
+  get dataType() {
+    return 'array'
+  }
+}
+
+export class LocalBaserowRowsCreatedTriggerNodeType extends TriggerNodeTypeMixin(
+  LocalBaserowSignalTriggerNodeType
+) {
+  static getType() {
+    return 'local_baserow_rows_created'
+  }
+
+  getOrder() {
+    return 1
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowRowsCreatedLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowRowsCreatedTriggerServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowRowsUpdatedTriggerNodeType extends TriggerNodeTypeMixin(
+  LocalBaserowSignalTriggerNodeType
+) {
+  static getType() {
+    return 'local_baserow_rows_updated'
+  }
+
+  getOrder() {
+    return 2
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowRowsUpdatedLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowRowsUpdatedTriggerServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowFieldsUpdatedTriggerNodeType extends TriggerNodeTypeMixin(
+  LocalBaserowSignalTriggerNodeType
+) {
+  static getType() {
+    return 'local_baserow_fields_updated'
+  }
+
+  getOrder() {
+    return 3
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowFieldsUpdatedLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowFieldsUpdatedTriggerServiceType.getType()
+    )
+  }
+
+  /**
+   * Resolves the names of the watched fields from the service schema, which
+   * carries each field's metadata (including its name). Returns an empty array
+   * when no field is selected, or their metadata isn't available yet.
+   */
+  getFieldNames(node) {
+    const fieldIds = node.service?.field_ids || []
+    if (fieldIds.length === 0) {
+      return []
+    }
+    const properties = node.service?.schema?.items?.properties || {}
+    const nameById = {}
+    for (const property of Object.values(properties)) {
+      if (property?.metadata?.id) {
+        nameById[property.metadata.id] = property.metadata.name
+      }
+    }
+    return fieldIds.map((id) => nameById[id]).filter(Boolean)
+  }
+
+  getDefaultLabel({ automation, node }) {
+    const { tableName } = this.getLabelContext({ automation, node })
+    const fieldIds = node.service?.field_ids || []
+
+    if (fieldIds.length === 0 || !tableName) {
+      return this.app.$i18n.t('nodeType.localBaserowFieldsUpdatedNoFieldLabel')
+    }
+
+    if (fieldIds.length === 1) {
+      return this.app.$i18n.t('nodeType.localBaserowFieldsUpdatedLabel', {
+        fieldName: this.getFieldNames(node)[0],
+        tableName,
+      })
+    }
+
+    return this.app.$i18n.t('nodeType.localBaserowFieldsUpdatedMultipleLabel', {
+      count: fieldIds.length,
+      tableName,
+    })
+  }
+}
+
+export class LocalBaserowRowsDeletedTriggerNodeType extends TriggerNodeTypeMixin(
+  LocalBaserowSignalTriggerNodeType
+) {
+  static getType() {
+    return 'local_baserow_rows_deleted'
+  }
+
+  getOrder() {
+    return 3.5
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowRowsDeletedLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowRowsDeletedTriggerServiceType.getType()
+    )
+  }
+}
+
+export class CorePeriodicTriggerNodeType extends TriggerNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'periodic'
+  }
+
+  getOrder() {
+    return 4
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.periodicTriggerLabel')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', 'periodic')
+  }
+
+  getDefaultLabel({ node }) {
+    if (!node.service) {
+      return this.name
+    }
+
+    const intervalLabels = {
+      MINUTE: this.app.$i18n.t('periodicForm.everyMinute', {
+        minute: node.service.minute,
+      }),
+      HOUR: this.app.$i18n.t('periodicForm.everyHour'),
+      DAY: this.app.$i18n.t('periodicForm.everyDay'),
+      WEEK: this.app.$i18n.t('periodicForm.everyWeek'),
+      MONTH: this.app.$i18n.t('periodicForm.everyMonth'),
+    }
+
+    return intervalLabels[node.service.interval] || this.name
+  }
+}
+
+export class CoreHTTPTriggerNodeType extends TriggerNodeTypeMixin(NodeType) {
+  static getType() {
+    return 'http_trigger'
+  }
+
+  get name() {
+    return this.app.$i18n.t('serviceType.coreHTTPTrigger')
+  }
+
+  get description() {
+    return this.app.$i18n.t('serviceType.coreHTTPTriggerDescription')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreHTTPTriggerServiceType.getType()
+    )
+  }
+
+  getOrder() {
+    return 4
+  }
+
+  getDefaultLabel({ automation, node }) {
+    return this.app.$i18n.t('serviceType.coreHTTPTrigger')
+  }
+}
+
+export class CoreInboundEmailTriggerNodeType extends TriggerNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'email_trigger'
+  }
+
+  get name() {
+    return this.app.$i18n.t('serviceType.inboundEmailTrigger')
+  }
+
+  get description() {
+    return this.app.$i18n.t('serviceType.inboundEmailTriggerDescription')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreInboundEmailTriggerServiceType.getType()
+    )
+  }
+
+  getOrder() {
+    return 4.5
+  }
+
+  /**
+   * Only offered when the instance is configured for inbound email. The
+   * backend derives that from its environment (domain, webhook secret and the
+   * receiver URL its message sweep needs) and publishes the result in the
+   * public settings, so this mirrors the exact gate that would otherwise
+   * refuse to create the node. Without it the trigger is left out of the menu
+   * rather than shown deactivated, so instances that never use inbound email
+   * do not carry a dead entry.
+   */
+  isEnabled() {
+    return (
+      this.app.$store.getters['settings/get']?.inbound_email_enabled === true
+    )
+  }
+
+  getDefaultLabel({ automation, node }) {
+    return this.app.$i18n.t('serviceType.inboundEmailTrigger')
+  }
+}
+
+export class CoreManualTriggerNodeType extends TriggerNodeTypeMixin(NodeType) {
+  static getType() {
+    return 'manual'
+  }
+
+  get name() {
+    return this.app.$i18n.t('serviceType.coreManualTrigger')
+  }
+
+  get description() {
+    return this.app.$i18n.t('serviceType.coreManualTriggerDescription')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreManualTriggerServiceType.getType()
+    )
+  }
+
+  getOrder() {
+    return 5
+  }
+
+  getDefaultLabel({ automation, node }) {
+    return this.app.$i18n.t('serviceType.coreManualTrigger')
+  }
+}
+
+export class LocalBaserowCreateRowActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_create_row'
+  }
+
+  getOrder() {
+    return 1
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowCreateRowLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowCreateRowServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowCreateRowsActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_create_rows'
+  }
+
+  getOrder() {
+    return 2
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowCreateRowsLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowCreateRowsServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowUpdateRowActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_update_row'
+  }
+
+  getOrder() {
+    return 3
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowUpdateRowLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowUpdateRowServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowUpdateRowsActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_update_rows'
+  }
+
+  getOrder() {
+    return 4
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowUpdateRowsLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowUpdateRowsServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowDeleteRowActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_delete_row'
+  }
+
+  getOrder() {
+    return 4
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowDeleteRowLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowDeleteRowServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowGetRowActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_get_row'
+  }
+
+  getOrder() {
+    return 4
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowGetRowLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowGetRowServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowListRowsActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_list_rows'
+  }
+
+  getOrder() {
+    return 5
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowListRowsLabel'
+  }
+
+  get dataType() {
+    return 'array'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowListRowsServiceType.getType()
+    )
+  }
+}
+
+export class LocalBaserowAggregateRowsActionNodeType extends ActionNodeTypeMixin(
+  LocalBaserowNodeType
+) {
+  static getType() {
+    return 'local_baserow_aggregate_rows'
+  }
+
+  getOrder() {
+    return 6
+  }
+
+  get labelTemplateName() {
+    return 'nodeType.localBaserowAggregateRowsLabel'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      LocalBaserowAggregateRowsServiceType.getType()
+    )
+  }
+}
+
+export class CoreHTTPRequestActionNodeType extends ActionNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'http_request'
+  }
+
+  getOrder() {
+    return 6.2
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.httpRequestLabel')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreHTTPRequestServiceType.getType()
+    )
+  }
+}
+
+export class CoreResponseActionNodeType extends ActionNodeTypeMixin(NodeType) {
+  static getType() {
+    return 'response'
+  }
+
+  getOrder() {
+    return 8
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.responseLabel')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', CoreResponseServiceType.getType())
+  }
+}
+
+export class CoreIteratorActionNodeType extends ContainerNodeTypeMixin(
+  ActionNodeTypeMixin(UtilityNodeTypeMixin(NodeType))
+) {
+  static getType() {
+    return 'iterator'
+  }
+
+  getOrder() {
+    return 9
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.iterationLabel')
+  }
+
+  get aliases() {
+    return parseAliases(this.app.$i18n.t('nodeType.iteratorAliases'))
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', CoreIteratorServiceType.getType())
+  }
+
+  /**
+   * Responsible for checking if the router node can be deleted. It can't be
+   * if it has output nodes connected to its edges.
+   * @param workflow - The workflow the router belongs to.
+   * @param node - The router node for which the deletability is being checked.
+   * @returns {string} - An error message if the router cannot be deleted.
+   */
+  getDeleteErrorMessage({ workflow, node }) {
+    const children = this.app.$store.getters[
+      'automationWorkflowNode/getChildren'
+    ](workflow, node)
+    const count = children.length
+    if (count) {
+      return this.app.$i18n.t('nodeType.iteratorWithChildrenNodesDeleteError', {
+        count,
+      })
+    }
+    return ''
+  }
+
+  getBeforeLabel({ workflow, node, position, output }) {
+    if (position === 'child') {
+      return this.app.$i18n.t('workflowNode.beforeLabelRepeat')
+    }
+
+    return super.getBeforeLabel({ workflow, node, position, output })
+  }
+
+  /**
+   * Responsible for checking if the router node can be replaced. It can't be
+   * if it has output nodes connected to its edges.
+   * @param workflow - The workflow the router belongs to.
+   * @param node - The router node for which the replaceability is being checked.
+   * @returns {string} - An error message if the router cannot be replaced.
+   */
+  getReplaceErrorMessage({ workflow, node }) {
+    const children = this.app.$store.getters[
+      'automationWorkflowNode/getChildren'
+    ](workflow, node)
+    const count = children.length
+    if (count) {
+      return this.app.$i18n.t(
+        'nodeType.iteratorWithChildrenNodesReplaceError',
+        {
+          count,
+        }
+      )
+    }
+    return ''
+  }
+
+  isDuplicable({ workflow, node }) {
+    return false
+  }
+}
+
+export class CoreCSVFileReaderActionNodeType extends ActionNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'csv_file_reader'
+  }
+
+  getOrder() {
+    return 9
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.csvFileReaderLabel')
+  }
+
+  get dataType() {
+    return 'array'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreCSVFileReaderServiceType.getType()
+    )
+  }
+}
+
+export class CoreStartWorkflowActionNodeType extends ActionNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'start_workflow'
+  }
+
+  getOrder() {
+    return 6.1
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      CoreStartWorkflowServiceType.getType()
+    )
+  }
+
+  getDefaultLabel({ automation, node }) {
+    const workspace =
+      automation?.workspace || this.app.$store.getters['workspace/getSelected']
+    const workflowId = node.service?.workflow_id
+
+    if (!workspace?.id || !workflowId) {
+      return this.name
+    }
+
+    const automations = this.app.$store.getters[
+      'application/getAllOfWorkspace'
+    ](workspace).filter((application) => application.type === 'automation')
+
+    const workflow = automations
+      .flatMap((automation) =>
+        this.app.$store.getters['automationWorkflow/getWorkflows'](automation)
+      )
+      .find((workflow) => workflow.id === workflowId)
+
+    return workflow
+      ? this.app.$i18n.t('nodeType.startWorkflowLabel', {
+          workflowName: workflow.name,
+        })
+      : this.name
+  }
+}
+
+export class CoreSMTPEmailActionNodeType extends ActionNodeTypeMixin(NodeType) {
+  static getType() {
+    return 'smtp_email'
+  }
+
+  getOrder() {
+    return 6.3
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.smtpEmailLabel')
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', CoreSMTPEmailServiceType.getType())
+  }
+}
+
+export class CoreRouterActionNodeType extends ActionNodeTypeMixin(
+  UtilityNodeTypeMixin(NodeType)
+) {
+  static getType() {
+    return 'router'
+  }
+
+  /**
+   * Router nodes cannot be moved around the workflow, due to complications
+   * with managing their output nodes. This will be improved in the future,
+   * but for now, this node type is fixed.
+   * @returns {boolean} - Whether the node can be moved.
+   */
+  get isFixed() {
+    return true
+  }
+
+  getBeforeLabel({ workflow, node, position, output }) {
+    if (output.length > 0) {
+      return this.app.$i18n.t('workflowNode.beforeLabelCondition')
+    }
+    return this.app.$i18n.t('workflowNode.beforeLabelConditionDefault')
+  }
+
+  getOrder() {
+    return 9
+  }
+
+  getDefaultLabel({ node }) {
+    if (!node.service) return this.name
+    return node.service.edges.length
+      ? this.app.$i18n.t('nodeType.routerLabel', {
+          edgeCount: this.getEdges({ node }).length,
+        })
+      : this.name
+  }
+
+  /**
+   * Append the branch that was taken during the run, e.g. "Router (Default)",
+   * so the history shows which edge the workflow followed.
+   * @param nodeHistory - The history entry of the router node's run.
+   * @returns {string} - The label for the history entry.
+   */
+  getHistoryLabel({ nodeHistory }) {
+    return this.app.$i18n.t('nodeType.routerHistoryLabel', {
+      label: super.getHistoryLabel({ nodeHistory }),
+      edge:
+        nodeHistory.edge_label ||
+        this.app.$i18n.t('nodeType.defaultEdgeLabelFallback'),
+    })
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', CoreRouterServiceType.getType())
+  }
+
+  /**
+   * Allow to hook into default values for this node type at node creation.
+   * The fallback edge is deliberately omitted as the goal is to replicate
+   * what the API returns when creating a router node.
+   * @param {object} values the current values for the node to create.
+   * @returns an object containing values updated with the default values.
+   */
+  getDefaultValues(values) {
+    return {
+      ...values,
+      service: {
+        edges: [
+          {
+            uid: uuid(),
+            order: 0,
+            condition: '',
+            label: this.app.$i18n.t('routerForm.edgeDefaultName'),
+          },
+        ],
+      },
+    }
+  }
+
+  /**
+   * Responsible for checking if the router node can be deleted. It can't be
+   * if it has output nodes connected to its edges.
+   * @param workflow - The workflow the router belongs to.
+   * @param node - The router node for which the deletability is being checked.
+   * @returns {string} - An error message if the router cannot be deleted.
+   */
+  getDeleteErrorMessage({ workflow, node }) {
+    const outputCount = this.getOutputNodes({ workflow, router: node }).length
+    if (outputCount) {
+      return this.app.$i18n.t('nodeType.routerWithOutputNodesDeleteError', {
+        outputCount,
+      })
+    }
+    return ''
+  }
+
+  /**
+   * Responsible for checking if the router node can be replaced. It can't be
+   * if it has output nodes connected to its edges.
+   * @param workflow - The workflow the router belongs to.
+   * @param node - The router node for which the replaceability is being checked.
+   * @returns {string} - An error message if the router cannot be replaced.
+   */
+  getReplaceErrorMessage({ workflow, node }) {
+    const outputCount = this.getOutputNodes({ workflow, router: node }).length
+    if (outputCount) {
+      return this.app.$i18n.t('nodeType.routerWithOutputNodesReplaceError', {
+        outputCount,
+      })
+    }
+    return ''
+  }
+
+  /**
+   * Responsible for finding the output nodes coming out of this router's edges.
+   * @param workflow - The workflow the router belongs to.
+   * @param router - The router node for which the output nodes are being retrieved.
+   * @returns {Array} - An array of output nodes that are connected to the router's edges.
+   */
+  getOutputNodes({ workflow, router }) {
+    return this.app.$store.getters['automationWorkflowNode/getNextNodes'](
+      workflow,
+      router
+    )
+  }
+
+  /**
+   * Responsible for retrieving the edges of the router node. This will include
+   * the user-created edges as well as a fallback edge with an empty uid.
+   * @param node - The router node for which the edges are being retrieved.
+   * @returns {array} - An array of edges, each with a uid and label.
+   */
+  getEdges({ node }) {
+    if (!node.service) return []
+    return [
+      ...node.service.edges,
+      {
+        uid: '', // The fallback edge has no uid.
+        condition: '',
+        label:
+          node.service.default_edge_label ||
+          this.app.$i18n.t('nodeType.defaultEdgeLabelFallback'),
+      },
+    ]
+  }
+
+  isDuplicable({ workflow, node }) {
+    return false
+  }
+}
+
+export class CoreGotoActionNodeType extends ActionNodeTypeMixin(
+  UtilityNodeTypeMixin(NodeType)
+) {
+  static getType() {
+    return 'goto'
+  }
+
+  getOrder() {
+    return 11
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.gotoNodeLabel')
+  }
+
+  get aliases() {
+    return parseAliases(this.app.$i18n.t('nodeType.gotoAliases'))
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', CoreGotoServiceType.getType())
+  }
+
+  /**
+   * Once a destination node is selected, append its label to the default
+   * label, e.g. "Go to node → List rows", so the jump target is visible at a
+   * glance without opening the node.
+   * @param automation - The automation the node belongs to.
+   * @param node - The Go to node for which the default label is generated.
+   * @returns {string} - The default label for the node.
+   */
+  getDefaultLabel({ automation, node }) {
+    const destinationServiceId = node.service?.destination_service_id
+    if (!destinationServiceId) {
+      return this.name
+    }
+
+    const workflow = this.app.$store.getters['automationWorkflow/getById'](
+      automation,
+      node.workflow
+    )
+    const destinationNode = this.app.$store.getters[
+      'automationWorkflowNode/findByServiceId'
+    ](workflow, destinationServiceId)
+    if (!destinationNode) {
+      return this.name
+    }
+
+    const destinationNodeType = this.app.$registry.get(
+      'node',
+      destinationNode.type
+    )
+    return this.app.$i18n.t('nodeType.gotoNodeLabelWithDestination', {
+      destination: destinationNodeType.getLabel({
+        automation,
+        node: destinationNode,
+      }),
+    })
+  }
+
+  /**
+   * Resolve the label of the node this "Go to node" entry jumped to, so the
+   * history reads "Go to node → <destination>".
+   *
+   * The destination's stored label is resolved by the backend. When the
+   * destination has no custom label, we fall back to the generic name of
+   * its node type.
+   * @param nodeHistory - The history entry of the Go to node's run.
+   * @returns {string|null} - The destination's label, or null if unresolvable.
+   */
+  getHistoryDestinationLabel({ nodeHistory }) {
+    if (nodeHistory.destination_label) {
+      return nodeHistory.destination_label
+    }
+
+    const destinationType = nodeHistory.destination_node_type
+    if (!destinationType) return null
+
+    if (!this.app.$registry.exists('node', destinationType)) return null
+    return this.app.$registry.get('node', destinationType).name
+  }
+
+  /**
+   * Append the node the workflow jumped to, e.g. "Go to node → List rows".
+   * A skipped run means the condition resolved to false and no jump was
+   * followed, so the destination is left out to avoid implying otherwise.
+   * @param nodeHistory - The history entry of the Go to node's run.
+   * @returns {string} - The label for the history entry.
+   */
+  getHistoryLabel({ nodeHistory }) {
+    const label = super.getHistoryLabel({ nodeHistory })
+    if (nodeHistory.status === 'skipped') return label
+    const destination = this.getHistoryDestinationLabel({ nodeHistory })
+    if (!destination) return label
+    return this.app.$i18n.t('nodeType.gotoHistoryLabel', {
+      label,
+      destination,
+    })
+  }
+
+  /**
+   * The node this "Go to node" jumps to, as long as the jump is still valid.
+   * Validity mirrors the backend `validate_goto_destination` (same level,
+   * backward jump only, non-trigger).
+   *
+   * @param {Object} workflow The workflow the node belongs to.
+   * @param {Object} node The Go to node to resolve the destination for.
+   * @returns {Object|null} The destination node, or null when the stored
+   *   destination is unset, missing from the workflow, or no longer valid.
+   */
+  getValidDestination({ workflow, node }) {
+    const destinationServiceId = node.service?.destination_service_id
+    if (destinationServiceId == null) {
+      return null
+    }
+    const destinationNode = this.app.$store.getters[
+      'automationWorkflowNode/findByServiceId'
+    ](workflow, destinationServiceId)
+    const isValid = isValidGotoDestination({
+      gotoNode: node,
+      destinationNode,
+      ancestorsOf: (n) =>
+        this.app.$store.getters['automationWorkflowNode/getAncestors'](
+          workflow,
+          n
+        ),
+      previousNodesOf: (n) =>
+        this.app.$store.getters['automationWorkflowNode/getPreviousNodes'](
+          workflow,
+          n
+        ),
+      isTrigger: (n) => this.app.$registry.get('node', n.type).isTrigger,
+    })
+    return isValid ? destinationNode : null
+  }
+
+  /**
+   * The valid jump targets for this "Go to" node, shaped for the generic
+   * CoreGotoServiceForm's `destinations` prop. As the service form can't
+   * refer to automation nodes, the node-graph lookups and label resolution
+   * happen here and are passed into the form as data.
+   *
+   * The nodes are taken in graph order so the dropdown reads in the same order
+   * as the editor. `buildGotoDestinations` preserves the order it's given.
+   */
+  getDestinations({ workflow, node, automation }) {
+    return buildGotoDestinations({
+      gotoNode: node,
+      nodes:
+        this.app.$store.getters['automationWorkflowNode/getNodesInOrder'](
+          workflow
+        ),
+      ancestorsOf: (n) =>
+        this.app.$store.getters['automationWorkflowNode/getAncestors'](
+          workflow,
+          n
+        ),
+      previousNodesOf: (n) =>
+        this.app.$store.getters['automationWorkflowNode/getPreviousNodes'](
+          workflow,
+          n
+        ),
+      isTrigger: (n) => this.app.$registry.get('node', n.type).isTrigger,
+      nameOf: (n) =>
+        this.app.$registry
+          .get('node', n.type)
+          .getLabel({ automation, node: n }),
+    })
+  }
+
+  /**
+   * Declares a link from this Go to node to its destination node, as long as
+   * the jump is still valid. The link is surfaced as a paired marker on both
+   * cards. The store is reconciled after a move, but re-checking here also
+   * avoids surfacing a stale link during the brief window before that
+   * reconciliation runs.
+   */
+  getConnections({ workflow, node }) {
+    const destinationNode = this.getValidDestination({ workflow, node })
+    if (!destinationNode) {
+      return []
+    }
+    return [{ destinationNodeId: destinationNode.id }]
+  }
+
+  /**
+   * Mirrors the backend `clear_invalidated_links`: a move can take this node's
+   * destination off its path or to a different level, invalidating the jump.
+   * The backend clears it, but the acting client is excluded from its own
+   * realtime broadcast, so the store reconciles through this hook.
+   */
+  afterMove({ workflow, node }) {
+    if (node.service?.destination_service_id == null) {
+      return null
+    }
+    if (this.getValidDestination({ workflow, node })) {
+      return null
+    }
+    return {
+      service: { ...node.service, destination_service_id: null },
+    }
+  }
+}
+
+export class AIAgentActionNodeType extends ActionNodeTypeMixin(NodeType) {
+  static getType() {
+    return 'ai_agent'
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.aiAgent')
+  }
+
+  get iconClass() {
+    return 'iconoir-sparks'
+  }
+
+  get serviceType() {
+    return this.app.$registry.get('service', AIAgentServiceType.getType())
+  }
+
+  getOrder() {
+    return 8
+  }
+}
+
+export class SlackWriteMessageActionNodeType extends ActionNodeTypeMixin(
+  NodeType
+) {
+  static getType() {
+    return 'slack_write_message'
+  }
+
+  getOrder() {
+    return 90
+  }
+
+  get name() {
+    return this.app.$i18n.t('nodeType.slackWriteMessageName')
+  }
+
+  getDefaultLabel({ node }) {
+    if (!node.service) return this.name
+    return node.service.channel.length
+      ? this.app.$i18n.t('nodeType.slackWriteMessageLabel', {
+          channel: node.service.channel,
+        })
+      : this.name
+  }
+
+  get serviceType() {
+    return this.app.$registry.get(
+      'service',
+      SlackWriteMessageServiceType.getType()
+    )
+  }
+}

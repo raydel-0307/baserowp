@@ -1,0 +1,519 @@
+from typing import Any, Dict, Optional
+
+from django.contrib.auth.models import AbstractUser
+from django.utils.translation import gettext_lazy as _
+
+from rest_framework.exceptions import PermissionDenied
+
+from baserow.contrib.automation.automation_dispatch_context import (
+    AutomationDispatchContext,
+)
+from baserow.contrib.automation.history.constants import HistoryStatusChoices
+from baserow.contrib.automation.nodes.exceptions import (
+    AutomationNodeMisconfiguredService,
+    AutomationNodeNotReplaceable,
+)
+from baserow.contrib.automation.nodes.models import AutomationNode
+from baserow.contrib.automation.nodes.types import AutomationNodeDict
+from baserow.contrib.automation.workflows.models import AutomationWorkflow
+from baserow.core.graph.types import GraphPointPositionType
+from baserow.core.integrations.handler import IntegrationHandler
+from baserow.core.models import Workspace
+from baserow.core.registry import (
+    CustomFieldsRegistryMixin,
+    EasyImportExportMixin,
+    Instance,
+    InstanceWithFormulaMixin,
+    ModelInstanceMixin,
+    ModelRegistryMixin,
+    PublicCustomFieldsInstanceMixin,
+    Registry,
+)
+from baserow.core.services.exceptions import (
+    ServiceImproperlyConfiguredDispatchException,
+)
+from baserow.core.services.handler import ServiceHandler
+from baserow.core.services.mixins import ServiceBackedTypeMixin
+from baserow.core.services.models import Service
+from baserow.core.services.registries import ServiceTypeSubClass, service_type_registry
+from baserow.core.services.types import DispatchResult
+from baserow.core.trash.registries import TrashOperationType
+
+
+class AutomationNodeType(
+    ServiceBackedTypeMixin,
+    PublicCustomFieldsInstanceMixin,
+    InstanceWithFormulaMixin,
+    EasyImportExportMixin,
+    ModelInstanceMixin,
+    Instance,
+):
+    display_name = _("Unnamed node")
+
+    service_type = None
+    service_field_help_text = "The service associated with this automation node."
+    parent_property_name = "workflow"
+    id_mapping_name = "automation_workflow_nodes"
+
+    # Whether this node type is a trigger. Triggers start workflows.
+    is_workflow_trigger = False
+
+    # Whether this node type is an action.
+    # Actions are executed as part of workflows.
+    is_workflow_action = False
+
+    is_container = False
+
+    class SerializedDict(AutomationNodeDict): ...
+
+    def is_deactivated(self, workspace: Workspace) -> bool:
+        """
+        Returns whether this automation node type is deactivated for the workspace.
+        """
+
+        return False
+
+    def raise_if_deactivated(self, workspace: Workspace) -> None:
+        if self.is_deactivated(workspace):
+            raise PermissionDenied("This automation node type is deactivated.")
+
+    @property
+    def allowed_fields(self):
+        return super().allowed_fields + [
+            "label",
+            "service",
+        ]
+
+    def before_delete(self, node: AutomationNode) -> None:
+        """
+        A hook called just before a node is deleted. Can be
+        overridden by subclasses to implement specific logic.
+
+        :param node: The node instance to about to be deleted.
+        """
+
+    def before_replace(self, node: AutomationNode, new_node_type: Instance) -> None:
+        """
+        A hook called just before a node is replaced. Can be
+        overridden by subclasses to implement specific logic.
+
+        :param node: The node instance to about to be replaced.
+        :param new_node_type: The new node type that will
+            replace the current one.
+        """
+
+        if not node.get_type().is_replaceable_with(new_node_type):
+            raise AutomationNodeNotReplaceable(
+                "Automation nodes can only be updated with a type of the same "
+                "category. Triggers cannot be updated with actions, and vice-versa."
+            )
+
+    def before_move(
+        self,
+        node: AutomationNode,
+        reference_node: AutomationNode | None,
+        position: GraphPointPositionType,
+        output: str,
+    ):
+        """Called before the node is moved."""
+
+    def before_create(
+        self,
+        workflow: AutomationWorkflow,
+        reference_node: AutomationNode | None,
+        position: GraphPointPositionType,
+        output: str,
+    ):
+        """
+        A hook called just before a node is created. Can be
+        overridden by subclasses to implement specific logic.
+        """
+
+    def after_create(self, node: AutomationNode) -> None:
+        """
+        A hook called just after a node is created. Can be
+        overridden by subclasses to implement specific logic.
+
+        :param node: The node instance that was just created.
+        """
+
+    def after_move(
+        self, user: AbstractUser, workflow: AutomationWorkflow
+    ) -> Any | None:
+        """
+        A hook called after any node is moved within `workflow`. A node type
+        can override this to reconcile state that the move may have invalidated
+        (for example cross-level references between nodes), returning an opaque,
+        JSON-serializable payload describing the modifications it made so
+        `revert_move` can undo them. Returns None (the default)
+        when the type made no changes.
+
+        :param user: The user that performed the move.
+        :param workflow: The workflow the moved node belongs to.
+        :return: A JSON-serializable payload describing the modifications made,
+            or None if nothing changed.
+        """
+
+        return None
+
+    def revert_move(self, user: AbstractUser, modifications: Any) -> None:
+        """
+        Reverses the modifications previously returned by `after_move`,
+        used when a node move is undone.
+
+        :param user: The user undoing the move.
+        :param modifications: The payload returned by `after_move`.
+        """
+
+    def get_service_type(self) -> Optional[ServiceTypeSubClass]:
+        return (
+            service_type_registry.get(self.service_type) if self.service_type else None
+        )
+
+    def get_history_destination_node(
+        self, node: AutomationNode
+    ) -> Optional[AutomationNode]:
+        """
+        Returns the node that execution jumped to from the given node during a
+        run, or None when this node type does not redirect execution.
+
+        Most nodes simply hand off to their natural next node and so have no
+        explicit destination. Node types that jump elsewhere in the graph (e.g.
+        the "Go to" node) override this so run histories can show where
+        execution went.
+
+        :param node: The node instance to resolve the destination for.
+        :return: The destination node, or None.
+        """
+
+        return None
+
+    def get_history_status(self, dispatch_result: DispatchResult) -> str:
+        """
+        Returns the status the node history should be marked with after a
+        successful dispatch. Most node types always did something, so they
+        report a success. Node types whose dispatch can legitimately be a
+        no-op (e.g. a "Go to" node whose condition resolved to false) override
+        this to report a skip instead, so run histories don't suggest that
+        something happened.
+
+        :param dispatch_result: The result of the node's dispatch.
+        :return: The history status to store on the node history.
+        """
+
+        return HistoryStatusChoices.SUCCESS
+
+    def is_replaceable_with(self, other_node_type: "AutomationNodeType") -> bool:
+        """
+        Determines if this node type can be replaced with another node type.
+
+        :param other_node_type: The other node type to check against.
+        :return: True if this node type can be replaced with the other, False otherwise.
+        """
+
+        return (
+            self.is_workflow_trigger == other_node_type.is_workflow_trigger
+            and self.is_workflow_action == other_node_type.is_workflow_action
+        )
+
+    def export_prepared_values(self, node: AutomationNode) -> Dict[Any, Any]:
+        """
+        Return a serializable dict of prepared values for the node attributes.
+
+        It is called by undo/redo ActionHandler to store the values in a way that
+        could be restored later.
+
+        :param node: The node instance to export values for.
+        :return: A dict of prepared values.
+        """
+
+        values = {key: getattr(node, key) for key in self.allowed_fields}
+        values["service"] = service_type_registry.get(
+            self.service_type
+        ).export_prepared_values(node.service.specific)
+        values["workflow"] = node.workflow_id
+        return values
+
+    def serialize_property(
+        self,
+        node: AutomationNode,
+        prop_name: str,
+        import_export_config=None,
+        files_zip=None,
+        storage=None,
+        cache=None,
+    ):
+        if prop_name == "service":
+            service = node.service.specific
+            return service.get_type().export_serialized(
+                service,
+                import_export_config=import_export_config,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+
+        return super().serialize_property(
+            node,
+            prop_name,
+            import_export_config=import_export_config,
+            files_zip=files_zip,
+            storage=storage,
+            cache=cache,
+        )
+
+    def deserialize_property(
+        self,
+        prop_name: str,
+        value: Any,
+        id_mapping: Dict[str, Any],
+        files_zip=None,
+        storage=None,
+        cache=None,
+        **kwargs,
+    ) -> Any:
+        """
+        Responsible for deserializing a property of the node type.
+
+        :param prop_name: the name of the property being transformed.
+        :param value: the value of this property.
+        :param id_mapping: the id mapping dict.
+        :return: the deserialized version for this property.
+        """
+
+        if prop_name == "service" and value:
+            serialized_service = value
+            workflow = kwargs.get("workflow")
+            integration = IntegrationHandler().get_integration_for_import(
+                serialized_service.get("integration_id", None),
+                id_mapping,
+                application_id=workflow.automation_id if workflow else None,
+            )
+
+            return ServiceHandler().import_service(
+                integration,
+                serialized_service,
+                id_mapping,
+                storage=storage,
+                cache=cache,
+                files_zip=files_zip,
+                # We don't migrate formulas here but later after the node import
+                import_export_config=kwargs.get("import_export_config"),
+            )
+        return super().deserialize_property(
+            prop_name,
+            value,
+            id_mapping,
+            files_zip=files_zip,
+            storage=storage,
+            cache=cache,
+            **kwargs,
+        )
+
+    def import_serialized(
+        self,
+        parent: Any,
+        serialized_values: Dict[str, Any],
+        id_mapping: Dict[str, Dict[str, Any]],
+        **kwargs,
+    ):
+        if "automation_edge_outputs" not in id_mapping:
+            id_mapping["automation_edge_outputs"] = {}
+
+        return super().import_serialized(
+            parent,
+            serialized_values,
+            id_mapping,
+            workflow=parent,
+            **kwargs,
+        )
+
+    def check_service_belongs_to_workflow(
+        self,
+        workflow: AutomationWorkflow,
+        service: Service,
+        prepared_service_values: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Checks that the node's service reads only through what its workflow's
+        automation may use: an integration of the automation, and a table of the
+        automation's workspace.
+
+        :param workflow: The workflow the node belongs to.
+        :param service: The node's service.
+        :param prepared_service_values: The service values about to be saved, which
+            take precedence over the service's current ones.
+        :raises AutomationNodeMisconfiguredService: When the integration or the
+            table belongs elsewhere.
+        """
+
+        values = prepared_service_values or {}
+        integration = (
+            values["integration"]
+            if "integration" in values
+            else (service.integration if service.integration_id else None)
+        )
+        if integration is not None and not IntegrationHandler().is_integration_usable(
+            integration, application_id=workflow.automation_id
+        ):
+            raise AutomationNodeMisconfiguredService(
+                f"The integration with ID {integration.id} is not related to the "
+                f"automation {workflow.automation_id}."
+            )
+
+        table = (
+            values["table"]
+            if "table" in values
+            else (service.table if getattr(service, "table_id", None) else None)
+        )
+        if table is not None:
+            workspace = workflow.automation.get_workspace()
+            if workspace is None or table.database.workspace_id != workspace.id:
+                raise AutomationNodeMisconfiguredService(
+                    f"The table with ID {table.id} is not related to the "
+                    f"automation {workflow.automation_id}."
+                )
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: AutomationNode = None,
+    ) -> Dict[str, Any]:
+        """
+        Responsible for preparing the node's service. By default,
+        the only step is to pass any `service` data into the service.
+
+        :param values: The full node values to prepare.
+        :param user: The user on whose behalf the change is made.
+        :param instance: A `AutomationNode` instance.
+        :return: The modified node values, prepared.
+        """
+
+        from baserow.contrib.automation.nodes.handler import AutomationNodeHandler
+
+        service_type = service_type_registry.get(self.service_type)
+
+        if not instance:
+            # If we haven't received a node instance, we're preparing
+            # as part of creating a new node. If this happens, we need
+            # to create a new service.
+            service = ServiceHandler().create_service(service_type)
+
+        else:
+            service = instance.service.specific
+
+        # If we received any service values, prepare them.
+        service_values = values.pop("service", None) or {}
+        workflow = instance.workflow if instance else values.get("workflow", None)
+        prepared_service_values = service_type.prepare_values(
+            service_values, user, service if instance else None
+        )
+        if workflow:
+            self.check_service_belongs_to_workflow(
+                workflow, service, prepared_service_values
+            )
+
+        # Update the service instance with any prepared service values.
+        ServiceHandler().update_service(
+            service_type, service, **prepared_service_values
+        )
+
+        values["service"] = service
+
+        if (reference_node_id := values.get("reference_node_id", None)) is not None:
+            values["reference_node"] = AutomationNodeHandler().get_node(
+                reference_node_id
+            )
+
+        return values
+
+    def get_pytest_params(self, pytest_data_fixture) -> Dict[str, Any]: ...
+
+    def raise_if_misconfigured(self, automation_node: AutomationNode) -> None:
+        """
+        Refuses a node whose saved configuration cannot run. Nothing to refuse by
+        default.
+
+        :param automation_node: The node to check.
+        :raises ServiceImproperlyConfiguredDispatchException: When it cannot run.
+        """
+
+    def dispatch(
+        self,
+        automation_node: AutomationNode,
+        dispatch_context: AutomationDispatchContext,
+    ) -> DispatchResult:
+        if self.is_deactivated(
+            automation_node.workflow.get_original().automation.workspace
+        ):
+            raise ServiceImproperlyConfiguredDispatchException(
+                "This node type is not available for this workspace."
+            )
+
+        return ServiceHandler().dispatch_service(
+            automation_node.service.specific,
+            dispatch_context,
+            application_id=automation_node.workflow.automation_id,
+        )
+
+    def validate_jump_destination(
+        self,
+        automation_node: AutomationNode,
+        destination_service_id: int,
+    ) -> None:
+        """
+        Hook for node types whose dispatch can request a jump to another node
+        (by returning a destination_service_id on the DispatchResult).
+
+        The runner calls this only when the jump is about to be followed, i.e.
+        never while simulating, where jumps are suppressed so a backward jump
+        doesn't loop the path leading to the simulated node. The node type can
+        then re-validate the destination against the live graph and raise
+        ServiceImproperlyConfiguredDispatchException if the link is no longer a
+        valid jump.
+
+        The default is a no-op, as most node types never request a jump.
+
+        :param automation_node: The node that requested the jump.
+        :param destination_service_id: The service the jump targets.
+        :raises ServiceImproperlyConfiguredDispatchException: If the jump is no
+            longer valid against the current graph.
+        """
+
+
+class AutomationNodeTypeRegistry(
+    Registry,
+    ModelRegistryMixin,
+    CustomFieldsRegistryMixin,
+):
+    """Contains all registered automation node types."""
+
+    name = "automation_node_type"
+
+
+class ReplaceAutomationNodeTrashOperationType(TrashOperationType):
+    """
+    The replace-automation-node trash operation is used when an automation node is
+    replaced with another node type. This operation type exists to ensure that extra
+    steps are followed when the node is restored from its trashed state.
+    """
+
+    type = "replace_automation_node"
+
+    """
+    This trash operation type is 'managed'. We don't want users to interact with
+    it in the workspace trash, the system is responsible for it.
+    """
+    managed = True
+
+    """
+    In this trash operation type we don't want to send any created or deleted signals.
+    We need to be precise with our realtime signals, so at a strategic time we use
+    the `replace` signal instead.
+    """
+    send_post_restore_created_signal = False
+    send_post_trash_deleted_signal = False
+
+
+automation_node_type_registry = AutomationNodeTypeRegistry()

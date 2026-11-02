@@ -1,0 +1,543 @@
+import { MockServer } from '@baserow/test/fixtures/mockServer'
+import MockAdapter from 'axios-mock-adapter'
+import { mountSuspended } from '@nuxt/test-utils/runtime'
+import RecordSelectorElement from '@baserow/modules/builder/components/elements/components/RecordSelectorElement.vue'
+import flushPromises from 'flush-promises'
+import { reactive } from 'vue'
+
+// Ignore `notifyIf` and `notifyIf404` function calls
+vi.mock('@baserow/modules/core/utils/error.js')
+
+describe('RecordSelectorElement', () => {
+  let testApp = null
+  let store = null
+  let mockServer = null
+  let mock = null
+
+  beforeEach(() => {
+    testApp = useNuxtApp()
+    const { $store, $client, $registry } = useNuxtApp()
+    store = $store
+    mock = new MockAdapter($client, { onNoMatch: 'throwException' })
+    mockServer = new MockServer(mock, $store)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    mock.restore()
+  })
+
+  const mountComponent = ({ props = {}, slots = {}, provide = {} }) => {
+    return mountSuspended(RecordSelectorElement, {
+      props,
+      slots,
+      global: { provide },
+    })
+  }
+
+  test.each([
+    ['id', { id: 42 }, 42],
+    ['_id', { _id: 43 }, 43],
+    ['zero id', { id: 0, _id: 43 }, 0],
+    ['id precedence', { id: 42, _id: 43 }, 42],
+    ['null id fallback', { id: null, _id: 43 }, 43],
+  ])('selects imported records using %s', async (_name, record, expectedId) => {
+    const page = {
+      id: 1,
+      dataSources: [{ id: 1, type: 'csv_file_reader' }],
+      elements: [],
+    }
+    const sharedPage = { id: 2, dataSources: [], elements: [], shared: true }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+    }
+    const element = reactive({
+      id: 1,
+      type: 'record_selector',
+      data_source_id: 1,
+      items_per_page: 5,
+      page_id: page.id,
+    })
+    const mode = 'public'
+    await store.dispatch('element/forceCreate', { page, element })
+    mockServer.mock
+      .onPost('builder/domains/published/data-source/1/dispatch/')
+      .reply(200, {
+        results: [{ ...record, name: 'Imported record' }],
+        has_next_page: false,
+      })
+
+    const wrapper = await mountComponent({
+      props: { element },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        mode,
+        applicationContext: { builder, page, mode, element },
+        element,
+        workspace: {},
+      },
+    })
+
+    await wrapper.find('.ab-dropdown__selected').trigger('click')
+    await flushPromises()
+    await wrapper.find('.ab-dropdownitem__item-link').trigger('click')
+    await flushPromises()
+
+    expect(
+      wrapper.findComponent({ name: 'ABDropdown' }).emitted('update:modelValue')
+    ).toEqual([[expectedId]])
+    expect(wrapper.find('.ab-dropdown__selected-text').text()).toMatchSnapshot()
+    wrapper.unmount()
+  })
+
+  test('does not paginate if API returns 400/404', async () => {
+    const page = {
+      id: 1,
+      dataSources: [
+        {
+          id: 1,
+          type: 'local_baserow_list_rows',
+          table_id: 1,
+          schema: {
+            type: 'array',
+            items: {
+              properties: {
+                field_1: {
+                  metadata: { primary: true },
+                  title: 'Name',
+                },
+                field_2: { metadata: {}, title: 'Other' },
+              },
+            },
+          },
+        },
+      ],
+      elements: [],
+    }
+    const sharedPage = {
+      id: 2,
+      dataSources: [],
+      elements: [],
+      shared: true,
+    }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+    }
+    const workspace = {}
+    const mode = 'public'
+    const element = {
+      id: 1,
+      type: 'record_selector',
+      data_source_id: page.dataSources[0].id,
+      items_per_page: 5,
+      page_id: page.id,
+    }
+    store.dispatch('element/forceCreate', { page, element })
+
+    const wrapper = await mountComponent({
+      props: {
+        element,
+      },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        mode,
+        applicationContext: { builder, page, mode, element },
+        element,
+        workspace,
+      },
+    })
+
+    // A mock server that mimics the data source dispatch endpoints.
+    // The first time it is called it returns a successful message, but the
+    // second time it returns a 400 response.
+    const url = `builder/domains/published/data-source/${page.dataSources[0].id}/dispatch/`
+    mockServer.mock
+      .onPost(url)
+      .replyOnce(200, {
+        results: [
+          { id: 1, order: 1, Name: 'First' },
+          { id: 2, order: 1, Name: 'Second' },
+          { id: 3, order: 1, Name: 'Third' },
+          { id: 4, order: 1, Name: 'Fourth' },
+          { id: 5, order: 1, Name: 'Fifth' },
+        ],
+        has_next_page: true,
+      })
+      .onPost(url)
+      .reply(400, { message: 'Bad Request' })
+
+    // The first time we trigger a next page, the server responds with 200
+    // therefore we should be able to fetch more content
+    await wrapper
+      .findAllComponents({ name: 'ABDropdown' })
+      .at(0)
+      .find('.ab-dropdown__selected')
+      .trigger('click')
+    await flushPromises()
+    expect(wrapper.element).toMatchSnapshot()
+    expect(mockServer.mock.history.post.length).toBe(1)
+
+    // Then we trigger a few scroll events in the record selector element and
+    // confirm that the API is only called once
+    await wrapper
+      .findAllComponents({ name: 'ABDropdown' })
+      .at(0)
+      .find('.select__items')
+      .trigger('scroll')
+    await flushPromises()
+    expect(wrapper.element).toMatchSnapshot()
+    expect(mockServer.mock.history.post.length).toBe(2)
+
+    await wrapper
+      .findAllComponents({ name: 'ABDropdown' })
+      .at(0)
+      .find('.select__items')
+      .trigger('scroll')
+    await flushPromises()
+    expect(wrapper.element).toMatchSnapshot()
+    expect(mockServer.mock.history.post.length).toBe(2)
+  })
+
+  test.skip('resolves suffix formulas', async () => {
+    const page = {
+      id: 1,
+      dataSources: [
+        {
+          id: 1,
+          type: 'local_baserow_list_rows',
+          table_id: 1,
+          schema: {
+            type: 'array',
+            items: {
+              properties: {
+                field_1: {
+                  metadata: { primary: true },
+                  title: 'Name',
+                },
+                field_2: { metadata: {}, title: 'Other' },
+              },
+            },
+          },
+        },
+      ],
+      elements: [],
+    }
+    const sharedPage = {
+      id: 2,
+      dataSources: [],
+      elements: [],
+      shared: true,
+    }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+      selectedElement: null,
+    }
+    const workspace = {}
+    const mode = 'public'
+    const element = {
+      id: 1,
+      type: 'record_selector',
+      data_source_id: page.dataSources[0].id,
+      items_per_page: 5,
+      option_name_suffix: { formula: "'Suffix'", mode: 'simple' },
+      page_id: page.id,
+    }
+    store.dispatch('element/forceCreate', { page, element })
+
+    const wrapper = await mountComponent({
+      props: {
+        element,
+      },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        mode,
+        applicationContext: { builder, page, mode, element },
+        element,
+        workspace,
+      },
+    })
+
+    // A simple mock server that return ids and some fields
+    const url = `builder/domains/published/data-source/${page.dataSources[0].id}/dispatch/`
+    mockServer.mock.onPost(url).reply(200, {
+      results: [
+        { id: 1, order: 1, Name: 'First', Other: 'One' },
+        { id: 2, order: 1, Name: 'Second', Other: 'Two' },
+      ],
+      has_next_page: false,
+    })
+
+    // Check that the literal string was added to all items in the record selector
+    await wrapper
+      .findAllComponents({ name: 'ABDropdown' })
+      .at(0)
+      .find('.ab-dropdown__selected')
+      .trigger('click')
+
+    await flushPromises()
+
+    expect(wrapper.element).toMatchSnapshot()
+
+    expect(wrapper.find("span[title='First - Suffix']").exists()).toBeTruthy()
+    expect(wrapper.find("span[title='Second - Suffix']").exists()).toBeTruthy()
+
+    // Set a formula for suffix and check it was properly resolved
+    store.dispatch('element/forceUpdate', {
+      builder,
+      page,
+      element,
+      values: {
+        option_name_suffix: { formula: "get('current_record.field_2')" },
+      },
+    })
+    await flushPromises()
+    await wrapper
+      .findAllComponents({ name: 'ABDropdown' })
+      .at(0)
+      .find('.ab-dropdown__selected')
+      .trigger('click')
+    await flushPromises()
+    expect(wrapper.element).toMatchSnapshot()
+    expect(wrapper.find("span[title='First - One']").exists()).toBeTruthy()
+    expect(wrapper.find("span[title='Second - Two']").exists()).toBeTruthy()
+  })
+
+  test('uses the service type id property for record ids', async () => {
+    const page = {
+      id: 1,
+      dataSources: [
+        {
+          id: 1,
+          type: 'local_baserow_list_rows',
+          table_id: 1,
+          schema: {
+            type: 'array',
+            items: {
+              properties: {
+                field_1: {
+                  metadata: { primary: true },
+                  title: 'Name',
+                },
+              },
+            },
+          },
+        },
+      ],
+      elements: [],
+    }
+    const sharedPage = {
+      id: 2,
+      dataSources: [],
+      elements: [],
+      shared: true,
+    }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+    }
+    const workspace = {}
+    const mode = 'public'
+    const element = {
+      id: 1,
+      type: 'record_selector',
+      data_source_id: page.dataSources[0].id,
+      items_per_page: 5,
+      page_id: page.id,
+    }
+    store.dispatch('element/forceCreate', { page, element })
+
+    const serviceType = testApp.$registry.get(
+      'service',
+      'local_baserow_list_rows'
+    )
+    vi.spyOn(serviceType, 'getIdProperty').mockReturnValue('__idx__')
+
+    const wrapper = await mountComponent({
+      props: {
+        element,
+      },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        mode,
+        applicationContext: { builder, page, mode, element },
+        element,
+        workspace,
+      },
+    })
+
+    expect(wrapper.vm.getId({ __idx__: 10, Name: 'First' })).toBe(10)
+  })
+
+  test('refreshes the selected value after local default record name resolution', async () => {
+    const page = {
+      id: 1,
+      dataSources: [
+        {
+          id: 1,
+          type: 'local_baserow_list_rows',
+          table_id: 1,
+          schema: {
+            type: 'array',
+            items: {
+              properties: {
+                field_1: {
+                  metadata: { primary: true },
+                  title: 'Name',
+                },
+              },
+            },
+          },
+        },
+      ],
+      elements: [],
+    }
+    const sharedPage = {
+      id: 2,
+      dataSources: [],
+      elements: [],
+      shared: true,
+    }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+    }
+    const workspace = {}
+    const mode = 'public'
+    const element = {
+      id: 1,
+      type: 'record_selector',
+      data_source_id: page.dataSources[0].id,
+      items_per_page: 5,
+      page_id: page.id,
+      multiple: false,
+    }
+    store.dispatch('element/forceCreate', { page, element })
+
+    const serviceType = testApp.$registry.get(
+      'service',
+      'local_baserow_list_rows'
+    )
+    vi.spyOn(serviceType, 'getRecordNameFromId').mockReturnValue('Group A')
+
+    const wrapper = await mountComponent({
+      props: {
+        element,
+      },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        mode,
+        applicationContext: { builder, page, mode, element },
+        element,
+        workspace,
+      },
+    })
+
+    wrapper.vm.inputValue = 'Group A'
+    await flushPromises()
+    await wrapper.vm.updateDefaultRecordNames('Group A')
+    await flushPromises()
+
+    expect(wrapper.vm.selectedValueDisplay).toBe('Group A')
+    expect(wrapper.vm.$refs.recordSelectorDropdown.hasValue()).toBe(true)
+    expect(mock.history.get).toHaveLength(0)
+  })
+
+  test('resolves default record names with the page mode when the display mode is forced', async () => {
+    const page = {
+      id: 1,
+      dataSources: [
+        {
+          id: 1,
+          type: 'local_baserow_list_rows',
+          table_id: 1,
+          schema: {
+            type: 'array',
+            items: {
+              properties: {
+                field_1: {
+                  metadata: { primary: true },
+                  title: 'Name',
+                },
+              },
+            },
+          },
+        },
+      ],
+      elements: [],
+    }
+    const sharedPage = {
+      id: 2,
+      dataSources: [],
+      elements: [],
+      shared: true,
+    }
+    const builder = {
+      id: 1,
+      theme: { primary_color: '#ccc' },
+      pages: [sharedPage, page],
+    }
+    const workspace = {}
+    const element = {
+      id: 1,
+      type: 'record_selector',
+      data_source_id: page.dataSources[0].id,
+      items_per_page: 5,
+      page_id: page.id,
+      multiple: false,
+      default_value: { formula: "'2'", mode: 'simple' },
+    }
+    store.dispatch('element/forceCreate', { page, element })
+
+    // Only the editor endpoint is mocked. The published endpoint would throw
+    // because of `onNoMatch: 'throwException'`.
+    mockServer.mock
+      .onGet('builder/data-source/1/record-names/')
+      .reply(200, { 2: 'Banana' })
+
+    const wrapper = await mountComponent({
+      props: {
+        element,
+      },
+      provide: {
+        builder,
+        currentPage: page,
+        elementPage: page,
+        // Inside a repeat element the editor renders the non-editable
+        // repetitions with a forced `public` display mode...
+        mode: 'public',
+        // ...while the page itself is still being edited.
+        applicationContext: { builder, page, mode: 'editing', element },
+        element,
+        workspace,
+      },
+    })
+
+    // Record name lookups are grouped during a short grace delay before the
+    // request is sent.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    await flushPromises()
+
+    expect(mock.history.get.map(({ url, params }) => [url, params])).toEqual([
+      ['builder/data-source/1/record-names/', { record_ids: '2' }],
+    ])
+    expect(wrapper.find('.ab-dropdown__selected-text').text()).toBe('Banana')
+  })
+})

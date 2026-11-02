@@ -1,0 +1,245 @@
+from typing import Dict, Generator, Iterable, List, Optional, Set, Tuple
+
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import AbstractUser
+from django.db.models import Q, QuerySet
+
+from baserow.core.cache import local_cache
+from baserow.core.models import Workspace
+from baserow_premium.application_user_usage.constants import (
+    DEFAULT_APPLICATION_USERS_LIMIT,
+)
+from baserow_premium.application_user_usage.utils import (
+    get_instance_wide_application_user_count,
+)
+from baserow_premium.license.cache import (
+    get_cached_instance_wide_licenses,
+    set_cached_instance_wide_licenses,
+)
+from baserow_premium.license.exceptions import InvalidLicenseError
+from baserow_premium.license.models import License
+from baserow_premium.license.registries import LicenseType, SeatUsageSummary
+
+User = get_user_model()
+LICENSE_CACHE_KEY_PREFIX = "license"
+
+
+class LicensePlugin:
+    """
+    A collection of methods used to query for what licenses a user has access to and
+    hence which features they can use.
+    """
+
+    def __init__(self, cache_queries: bool = False):
+        self.cache_queries = cache_queries
+        self.queried_licenses_per_user = {}
+
+    def user_has_feature(
+        self,
+        feature: str,
+        user: AbstractUser,
+        workspace: Workspace,
+    ) -> bool:
+        return True
+
+    def instance_has_feature(
+        self,
+        feature: str,
+    ) -> bool:
+        return True
+
+    def workspace_has_feature(self, feature: str, workspace: Workspace) -> bool:
+        return True
+
+    def user_has_feature_instance_wide(self, feature: str, user: AbstractUser) -> bool:
+        return True
+
+    def _has_license_feature_only_for_specific_workspace(
+        self, feature: str, user: AbstractUser, workspace: Workspace
+    ) -> bool:
+        return True
+
+    def get_active_instance_wide_license_types(
+        self, user: Optional[AbstractUser]
+    ) -> Generator[LicenseType, None, None]:
+        from .registries import license_type_registry
+
+        yield from license_type_registry.get_all()
+
+    def get_active_instance_wide_licenses(
+        self, user: Optional[User]
+    ) -> Generator[License, None, None]:
+        """
+        For the provided user returns the active licenses they have instance wide.
+        If no user is provided then returns any licenses that are globally active for
+        every single user in the instance.
+
+        :param user: The user to lookup active instance wide licenses for.
+        """
+
+        yield from self._get_active_instance_wide_licenses(
+            user.id if user is not None else None
+        )
+
+    def _get_active_instance_wide_licenses(
+        self, user_id: Optional[int]
+    ) -> Generator[License, None, None]:
+        # When no specific user is requested, the result is shared across
+        # requests and cached in Redis to skip the DB query and RSA verify.
+        use_shared_cache = user_id is None and not self.cache_queries
+        if use_shared_cache:
+            cached = get_cached_instance_wide_licenses()
+            if cached is not None:
+                yield from cached
+                return
+
+        if self.cache_queries and user_id in self.queried_licenses_per_user:
+            available_licenses = self.queried_licenses_per_user[user_id]
+        else:
+            available_license_q = Q(cached_untrusted_instance_wide=True)
+            if user_id is not None:
+                available_license_q |= Q(users__user_id__in=[user_id])
+
+            def _get_available_licenses():
+                return License.objects.filter(available_license_q).distinct()
+
+            available_licenses = local_cache.get(
+                f"{LICENSE_CACHE_KEY_PREFIX}_{user_id}_instance_wide_licenses",
+                _get_available_licenses,
+            )
+
+        active_licenses = []
+        for available_license in available_licenses:
+            try:
+                if available_license.is_active:
+                    active_licenses.append(available_license)
+            except InvalidLicenseError:
+                pass
+
+        if use_shared_cache:
+            # Prime ``payload`` so consumers of the cached list don't re-run
+            # RSA signature verification after an unpickle.
+            for lic in active_licenses:
+                _ = lic.payload
+            set_cached_instance_wide_licenses(active_licenses)
+
+        yield from active_licenses
+
+        if self.cache_queries:
+            self.queried_licenses_per_user[user_id] = available_licenses
+
+    def get_active_specific_licenses_only_for_workspace(
+        self, user: AbstractUser, workspace: Workspace
+    ) -> Generator[LicenseType, None, None]:
+        """
+        Generates all the licenses for a specific workspace that a user has. Should not
+        return any instance-wide licenses the user has.
+
+        Provided as an overridable hook incase querying for only one specific workspace
+        can be optimized. By default just defers to the `get_per_workspace_licenses`
+        function.
+
+        :param user: The user to get active licenses in the workspace for.
+        :param workspace: The workspace to check to see any specific active licenses are
+            enabled for.
+        :return: A generator which produces the license types that the user has enabled
+            for the workspace.
+        """
+
+        per_workspace_licenses = self.get_active_per_workspace_licenses(user)
+        for active_license in per_workspace_licenses.get(workspace.id, set()):
+            yield active_license
+
+    def get_active_per_workspace_licenses(
+        self, user: AbstractUser
+    ) -> Dict[int, Set[LicenseType]]:
+        """
+        For the provided user returns the active licenses they have active per
+        workspace. Does not take into account any instance wide licenses the user
+        might have and only active licenses for specific workspaces.
+
+        :param user: The user to lookup active per workspace licenses for.
+        """
+
+        return {}
+
+    def get_active_workspace_licenses(
+        self,
+        workspace: Workspace,
+    ) -> Generator[LicenseType, None, None]:
+        """
+        For the provided workspace returns which licenses are active.
+        """
+
+        yield from license_type_registry.get_all()
+
+    def get_workspaces_to_periodically_update_seats_taken_for(self) -> QuerySet:
+        """
+        Should return a queryset of all the workspaces that should have their
+        seats_taken attribute periodically updated by the nightly usage job when
+        enabled.
+        """
+
+        return Workspace.objects.filter(template__isnull=True)
+
+    def get_seat_usage_for_workspace(
+        self, workspace: Workspace
+    ) -> Optional[SeatUsageSummary]:
+        """
+        Returns for the most important (the license type with the highest order) active
+        license type on a workspace the seat usage summary for that workspace.
+
+        If it doesn't make sense for that license type to have usage at the workspace
+        level None will be returned.
+        """
+
+        return None
+
+    def get_application_user_usage_and_limit_for_workspace(
+        self, workspace: Workspace
+    ) -> Tuple[int, Optional[int]]:
+        """
+        Returns the application user usage and limit for the given workspace as a
+        `(usage, limit)` tuple.
+        Returns None as limit to grant unlimited application users for self-hosted instances.
+        """
+
+        return (
+            get_instance_wide_application_user_count(),
+            None,
+        )
+
+    def is_application_user_limit_instance_wide(self) -> bool:
+        """
+        Whether the application user limit applies to the instance as a whole, like
+        the license based limit of a self-hosted install, rather than to each
+        workspace separately, like a per workspace subscription quota.
+        """
+
+        return True
+
+    def get_application_user_usage_and_limit_for_workspaces(
+        self, workspaces: Iterable[Workspace]
+    ) -> Dict[int, Tuple[int, Optional[int]]]:
+        """
+        Bulk variant of `get_application_user_usage_and_limit_for_workspace` for
+        callers that check many workspaces at once, like the periodic application
+        user limit check.
+        """
+
+        usage = get_instance_wide_application_user_count()
+        return {
+            workspace.id: (usage, None)
+            for workspace in workspaces
+        }
+
+    def get_seat_usage_for_specific_users(
+        self, user_ids: List[int]
+    ) -> Optional[SeatUsageSummary]:
+        """
+        Returns for the most important (the license type with the highest order) active
+        license type for specific users the seat usage.
+        """
+
+        return None
+

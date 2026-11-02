@@ -1,0 +1,119 @@
+{{ if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "baserow.global.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- $asgi := include "baserow.fullname" (index .Subcharts "baserow-backend-asgi") }}
+  {{- $wsgi := include "baserow.fullname" (index .Subcharts "baserow-backend-wsgi") }}
+  {{- $frontend := include "baserow.fullname" (index .Subcharts "baserow-frontend") }}
+  {{- $backendDomain := include "baserow.global.backendDomain" . }}
+  {{- $sharedDomain := eq $backendDomain .Values.global.baserow.domain }}
+  rules:
+    {{- if not $sharedDomain }}
+    - host: {{ $backendDomain | quote }}
+      http:
+        paths:
+          {{- range list "/ws/" "/mcp" "/assistant/" "/api/chat-runs/" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $asgi }}
+                port:
+                  number: 80
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $wsgi }}
+                port:
+                  number: 80
+    {{- end }}
+    - host: {{ .Values.global.baserow.domain | quote }}
+      http:
+        paths:
+          {{- if $sharedDomain }}
+          - path: /mcp
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $asgi }}
+                port:
+                  number: 80
+          {{- /* Keep before /api/: the bundled Caddy matches paths in listed order. */}}
+          {{- range list "/ws/" "/mcp/" "/assistant/" "/api/chat-runs/" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $asgi }}
+                port:
+                  number: 80
+          {{- end }}
+          {{- range list "/api/" "/oauth/" "/.well-known/oauth-authorization-server" "/.well-known/oauth-protected-resource" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $wsgi }}
+                port:
+                  number: 80
+          {{- end }}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $frontend }}
+                port:
+                  number: 80
+    {{- range .Values.global.baserow.applicationBuilderDomains }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $frontend }}
+                port:
+                  number: 80
+    {{- end }}
+    {{- if .Values.minio.enabled }}
+    - host: {{ .Values.global.baserow.objectsDomain | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "common.names.fullname" .Subcharts.minio }}
+                port:
+                  number: 9000
+    {{- end }}
+    {{- if .Values.ingress.catchAll.enabled }}
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $frontend }}
+                port:
+                  number: 80
+    {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{ end }}

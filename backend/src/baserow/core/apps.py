@@ -1,0 +1,800 @@
+from django.apps import AppConfig
+from django.conf import settings
+from django.db.models import Q
+from django.db.models.signals import post_migrate, pre_migrate
+
+from health_check.storage.backends import DefaultFileStorageHealthCheck
+
+from baserow.cachalot_patch import clear_cachalot_cache
+
+
+class CoreConfig(AppConfig):
+    name = "baserow.core"
+
+    def ready(self):
+        import pydantic_ai
+
+        # Otherwise the first uninstrumented agent run prints a Logfire promo to stderr.
+        pydantic_ai.BANNER_ENABLED = False
+
+        # Patch Django's DecimalField to have lenient conversion
+        # regarding NaN values
+        from django.db.models import DecimalField
+
+        from baserow.core.fields import LenientDecimalField
+
+        DecimalField.to_python = LenientDecimalField.to_python
+
+        from baserow.core.action.registries import (
+            action_scope_registry,
+            action_type_registry,
+        )
+        from baserow.core.trash.registries import trash_item_type_registry
+        from baserow.core.trash.trash_types import (
+            ApplicationTrashableItemType,
+            WorkspaceTrashableItemType,
+        )
+
+        trash_item_type_registry.register(WorkspaceTrashableItemType())
+        trash_item_type_registry.register(ApplicationTrashableItemType())
+        from .agents.trash_types import AgentTrashableItemType
+
+        trash_item_type_registry.register(AgentTrashableItemType())
+
+        from baserow.core.formula.registries import formula_runtime_function_registry
+        from baserow.core.formula.runtime_formula_types import (
+            RuntimeAbs,
+            RuntimeAdd,
+            RuntimeAnd,
+            RuntimeAt,
+            RuntimeAvg,
+            RuntimeCapitalize,
+            RuntimeConcat,
+            RuntimeContains,
+            RuntimeDateTimeFormat,
+            RuntimeDay,
+            RuntimeDivide,
+            RuntimeDurationFormat,
+            RuntimeEncodeUri,
+            RuntimeEncodeUriComponent,
+            RuntimeEqual,
+            RuntimeFromJson,
+            RuntimeGenerateUUID,
+            RuntimeGet,
+            RuntimeGetProperty,
+            RuntimeGreaterThan,
+            RuntimeGreaterThanOrEqual,
+            RuntimeHour,
+            RuntimeIf,
+            RuntimeIsEmpty,
+            RuntimeIsEven,
+            RuntimeIsOdd,
+            RuntimeJoin,
+            RuntimeLength,
+            RuntimeLessThan,
+            RuntimeLessThanOrEqual,
+            RuntimeLower,
+            RuntimeMarkdownToHtml,
+            RuntimeMinus,
+            RuntimeMinute,
+            RuntimeMonth,
+            RuntimeMultiply,
+            RuntimeNotEqual,
+            RuntimeNow,
+            RuntimeNull,
+            RuntimeNumberFormat,
+            RuntimeOr,
+            RuntimeRandomBool,
+            RuntimeRandomFloat,
+            RuntimeRandomInt,
+            RuntimeRange,
+            RuntimeReplace,
+            RuntimeReverse,
+            RuntimeRound,
+            RuntimeSecond,
+            RuntimeSplit,
+            RuntimeStrip,
+            RuntimeSum,
+            RuntimeToArray,
+            RuntimeToDatetime,
+            RuntimeToday,
+            RuntimeToDuration,
+            RuntimeToJson,
+            RuntimeUpper,
+            RuntimeYear,
+        )
+
+        formula_runtime_function_registry.register(RuntimeConcat())
+        formula_runtime_function_registry.register(RuntimeGet())
+        formula_runtime_function_registry.register(RuntimeAdd())
+        formula_runtime_function_registry.register(RuntimeMinus())
+        formula_runtime_function_registry.register(RuntimeMultiply())
+        formula_runtime_function_registry.register(RuntimeDivide())
+        formula_runtime_function_registry.register(RuntimeEqual())
+        formula_runtime_function_registry.register(RuntimeNotEqual())
+        formula_runtime_function_registry.register(RuntimeLessThan())
+        formula_runtime_function_registry.register(RuntimeLessThanOrEqual())
+        formula_runtime_function_registry.register(RuntimeGreaterThan())
+        formula_runtime_function_registry.register(RuntimeGreaterThanOrEqual())
+        formula_runtime_function_registry.register(RuntimeUpper())
+        formula_runtime_function_registry.register(RuntimeLower())
+        formula_runtime_function_registry.register(RuntimeCapitalize())
+        formula_runtime_function_registry.register(RuntimeRound())
+        formula_runtime_function_registry.register(RuntimeAbs())
+        formula_runtime_function_registry.register(RuntimeIsEven())
+        formula_runtime_function_registry.register(RuntimeIsOdd())
+        formula_runtime_function_registry.register(RuntimeDateTimeFormat())
+        formula_runtime_function_registry.register(RuntimeDay())
+        formula_runtime_function_registry.register(RuntimeMonth())
+        formula_runtime_function_registry.register(RuntimeYear())
+        formula_runtime_function_registry.register(RuntimeHour())
+        formula_runtime_function_registry.register(RuntimeMinute())
+        formula_runtime_function_registry.register(RuntimeSecond())
+        formula_runtime_function_registry.register(RuntimeNow())
+        formula_runtime_function_registry.register(RuntimeToday())
+        formula_runtime_function_registry.register(RuntimeGetProperty())
+        formula_runtime_function_registry.register(RuntimeRandomInt())
+        formula_runtime_function_registry.register(RuntimeRandomFloat())
+        formula_runtime_function_registry.register(RuntimeRandomBool())
+        formula_runtime_function_registry.register(RuntimeGenerateUUID())
+        formula_runtime_function_registry.register(RuntimeIf())
+        formula_runtime_function_registry.register(RuntimeAnd())
+        formula_runtime_function_registry.register(RuntimeOr())
+        formula_runtime_function_registry.register(RuntimeReplace())
+        formula_runtime_function_registry.register(RuntimeLength())
+        formula_runtime_function_registry.register(RuntimeContains())
+        formula_runtime_function_registry.register(RuntimeReverse())
+        formula_runtime_function_registry.register(RuntimeJoin())
+        formula_runtime_function_registry.register(RuntimeSplit())
+        formula_runtime_function_registry.register(RuntimeIsEmpty())
+        formula_runtime_function_registry.register(RuntimeStrip())
+        formula_runtime_function_registry.register(RuntimeEncodeUri())
+        formula_runtime_function_registry.register(RuntimeEncodeUriComponent())
+        formula_runtime_function_registry.register(RuntimeMarkdownToHtml())
+        formula_runtime_function_registry.register(RuntimeSum())
+        formula_runtime_function_registry.register(RuntimeAvg())
+        formula_runtime_function_registry.register(RuntimeAt())
+        formula_runtime_function_registry.register(RuntimeToArray())
+        formula_runtime_function_registry.register(RuntimeRange())
+        formula_runtime_function_registry.register(RuntimeToJson())
+        formula_runtime_function_registry.register(RuntimeFromJson())
+        formula_runtime_function_registry.register(RuntimeNull())
+        formula_runtime_function_registry.register(RuntimeNumberFormat())
+        formula_runtime_function_registry.register(RuntimeToDuration())
+        formula_runtime_function_registry.register(RuntimeDurationFormat())
+        formula_runtime_function_registry.register(RuntimeToDatetime())
+
+        from baserow.core.permission_manager import (
+            AllowIfTemplatePermissionManagerType,
+            BasicPermissionManagerType,
+            CorePermissionManagerType,
+            StaffOnlyPermissionManagerType,
+            StaffOnlySettingOperationPermissionManagerType,
+            WorkspaceMemberOnlyPermissionManagerType,
+            WorkspaceRoleAvailabilityPermissionManagerType,
+        )
+        from baserow.core.registries import (
+            email_context_registry,
+            object_scope_type_registry,
+            operation_type_registry,
+            permission_manager_type_registry,
+        )
+
+        from .emails_context_types import CoreEmailContextType
+
+        email_context_registry.register(CoreEmailContextType())
+
+        permission_manager_type_registry.register(
+            WorkspaceRoleAvailabilityPermissionManagerType()
+        )
+        permission_manager_type_registry.register(CorePermissionManagerType())
+        permission_manager_type_registry.register(StaffOnlyPermissionManagerType())
+        permission_manager_type_registry.register(BasicPermissionManagerType())
+        permission_manager_type_registry.register(
+            WorkspaceMemberOnlyPermissionManagerType()
+        )
+        permission_manager_type_registry.register(
+            StaffOnlySettingOperationPermissionManagerType()
+        )
+        permission_manager_type_registry.register(
+            AllowIfTemplatePermissionManagerType()
+        )
+
+        from .object_scopes import (
+            ApplicationObjectScopeType,
+            CoreObjectScopeType,
+            WorkspaceInvitationObjectScopeType,
+            WorkspaceObjectScopeType,
+            WorkspaceUserObjectScopeType,
+        )
+        from .snapshots.object_scopes import SnapshotObjectScopeType
+
+        object_scope_type_registry.register(CoreObjectScopeType())
+        object_scope_type_registry.register(ApplicationObjectScopeType())
+        object_scope_type_registry.register(WorkspaceObjectScopeType())
+        object_scope_type_registry.register(WorkspaceInvitationObjectScopeType())
+        object_scope_type_registry.register(SnapshotObjectScopeType())
+        object_scope_type_registry.register(WorkspaceUserObjectScopeType())
+
+        from baserow.core.registries import subject_type_registry
+
+        from .agents.subjects import AgentSubjectType
+        from .subjects import AnonymousUserSubjectType, UserSubjectType
+        from .user_sources.subjects import UserSourceUserSubjectType
+
+        subject_type_registry.register(UserSubjectType())
+        subject_type_registry.register(AnonymousUserSubjectType())
+        subject_type_registry.register(UserSourceUserSubjectType())
+        subject_type_registry.register(AgentSubjectType())
+
+        from .agents.operations import (
+            CreateAgentOperationType,
+            DeleteAgentOperationType,
+            ListAgentsWorkspaceOperationType,
+            UpdateAgentOperationType,
+        )
+        from .ai_provider.operations import ManageAIProvidersOperationType
+        from .notifications.operations import (
+            ClearNotificationsOperationType,
+            ListNotificationsOperationType,
+            MarkNotificationAsReadOperationType,
+        )
+        from .operations import (
+            CreateApplicationsWorkspaceOperationType,
+            CreateInvitationsWorkspaceOperationType,
+            CreateWorkspaceOperationType,
+            DeleteApplicationOperationType,
+            DeleteWorkspaceInvitationOperationType,
+            DeleteWorkspaceOperationType,
+            DeleteWorkspaceUserOperationType,
+            DuplicateApplicationOperationType,
+            ExportWorkspaceOperationType,
+            ListApplicationsWorkspaceOperationType,
+            ListInvitationsWorkspaceOperationType,
+            ListWorkspacesOperationType,
+            ListWorkspaceUsersWorkspaceOperationType,
+            OrderApplicationsOperationType,
+            ReadApplicationOperationType,
+            ReadInvitationWorkspaceOperationType,
+            ReadWorkspaceOperationType,
+            RestoreApplicationOperationType,
+            RestoreWorkspaceOperationType,
+            UpdateApplicationOperationType,
+            UpdateSettingsOperationType,
+            UpdateWorkspaceInvitationType,
+            UpdateWorkspaceOperationType,
+            UpdateWorkspaceUserOperationType,
+        )
+        from .snapshots.operations import (
+            CreateSnapshotApplicationOperationType,
+            DeleteApplicationSnapshotOperationType,
+            ListSnapshotsApplicationOperationType,
+            RestoreApplicationSnapshotOperationType,
+        )
+        from .trash.operations import (
+            EmptyApplicationTrashOperationType,
+            EmptyWorkspaceTrashOperationType,
+            ReadApplicationTrashOperationType,
+            ReadWorkspaceTrashOperationType,
+        )
+
+        operation_type_registry.register(ClearNotificationsOperationType())
+        operation_type_registry.register(ListNotificationsOperationType())
+        operation_type_registry.register(MarkNotificationAsReadOperationType())
+        operation_type_registry.register(CreateApplicationsWorkspaceOperationType())
+        operation_type_registry.register(CreateWorkspaceOperationType())
+        operation_type_registry.register(CreateInvitationsWorkspaceOperationType())
+        operation_type_registry.register(DeleteWorkspaceInvitationOperationType())
+        operation_type_registry.register(DeleteWorkspaceOperationType())
+        operation_type_registry.register(ListApplicationsWorkspaceOperationType())
+        operation_type_registry.register(ListInvitationsWorkspaceOperationType())
+        operation_type_registry.register(ReadInvitationWorkspaceOperationType())
+        operation_type_registry.register(ListWorkspacesOperationType())
+        operation_type_registry.register(UpdateWorkspaceInvitationType())
+        operation_type_registry.register(ReadWorkspaceOperationType())
+        operation_type_registry.register(ExportWorkspaceOperationType())
+        operation_type_registry.register(UpdateWorkspaceOperationType())
+        operation_type_registry.register(ListWorkspaceUsersWorkspaceOperationType())
+        operation_type_registry.register(OrderApplicationsOperationType())
+        operation_type_registry.register(UpdateWorkspaceUserOperationType())
+        operation_type_registry.register(DeleteWorkspaceUserOperationType())
+        operation_type_registry.register(UpdateApplicationOperationType())
+        operation_type_registry.register(DuplicateApplicationOperationType())
+        operation_type_registry.register(DeleteApplicationOperationType())
+        operation_type_registry.register(UpdateSettingsOperationType())
+        operation_type_registry.register(ManageAIProvidersOperationType())
+        operation_type_registry.register(CreateSnapshotApplicationOperationType())
+        operation_type_registry.register(DeleteApplicationSnapshotOperationType())
+        operation_type_registry.register(ListSnapshotsApplicationOperationType())
+        operation_type_registry.register(RestoreApplicationSnapshotOperationType())
+        operation_type_registry.register(ReadWorkspaceTrashOperationType())
+        operation_type_registry.register(ReadApplicationTrashOperationType())
+        operation_type_registry.register(EmptyApplicationTrashOperationType())
+        operation_type_registry.register(EmptyWorkspaceTrashOperationType())
+        operation_type_registry.register(RestoreApplicationOperationType())
+        operation_type_registry.register(RestoreWorkspaceOperationType())
+        operation_type_registry.register(ReadApplicationOperationType())
+        operation_type_registry.register(ListAgentsWorkspaceOperationType())
+        operation_type_registry.register(CreateAgentOperationType())
+        operation_type_registry.register(UpdateAgentOperationType())
+        operation_type_registry.register(DeleteAgentOperationType())
+
+        from baserow.core.actions import (
+            AcceptWorkspaceInvitationActionType,
+            CreateApplicationActionType,
+            CreateInitialWorkspaceActionType,
+            CreateWorkspaceActionType,
+            CreateWorkspaceInvitationActionType,
+            DeleteApplicationActionType,
+            DeleteWorkspaceActionType,
+            DeleteWorkspaceInvitationActionType,
+            DuplicateApplicationActionType,
+            ExportApplicationsActionType,
+            ImportApplicationsActionType,
+            InstallTemplateActionType,
+            LeaveWorkspaceActionType,
+            OrderApplicationsActionType,
+            OrderWorkspacesActionType,
+            RejectWorkspaceInvitationActionType,
+            UpdateApplicationActionType,
+            UpdateWorkspaceActionType,
+            UpdateWorkspaceInvitationActionType,
+        )
+
+        action_type_registry.register(CreateWorkspaceActionType())
+        action_type_registry.register(DeleteWorkspaceActionType())
+        action_type_registry.register(UpdateWorkspaceActionType())
+        action_type_registry.register(OrderWorkspacesActionType())
+        action_type_registry.register(CreateApplicationActionType())
+        action_type_registry.register(UpdateApplicationActionType())
+        action_type_registry.register(DeleteApplicationActionType())
+        action_type_registry.register(OrderApplicationsActionType())
+        action_type_registry.register(DuplicateApplicationActionType())
+        action_type_registry.register(InstallTemplateActionType())
+        action_type_registry.register(CreateWorkspaceInvitationActionType())
+        action_type_registry.register(DeleteWorkspaceInvitationActionType())
+        action_type_registry.register(AcceptWorkspaceInvitationActionType())
+        action_type_registry.register(RejectWorkspaceInvitationActionType())
+        action_type_registry.register(UpdateWorkspaceInvitationActionType())
+        action_type_registry.register(LeaveWorkspaceActionType())
+        action_type_registry.register(CreateInitialWorkspaceActionType())
+        action_type_registry.register(ExportApplicationsActionType())
+        action_type_registry.register(ImportApplicationsActionType())
+
+        from baserow.core.snapshots.actions import (
+            CreateSnapshotActionType,
+            DeleteSnapshotActionType,
+            RestoreSnapshotActionType,
+        )
+
+        action_type_registry.register(CreateSnapshotActionType())
+        action_type_registry.register(DeleteSnapshotActionType())
+        action_type_registry.register(RestoreSnapshotActionType())
+
+        from baserow.core.user_templates.actions import (
+            CreateUserTemplateActionType,
+            DeleteUserTemplateActionType,
+            UpdateUserTemplateActionType,
+        )
+
+        action_type_registry.register(CreateUserTemplateActionType())
+        action_type_registry.register(UpdateUserTemplateActionType())
+        action_type_registry.register(DeleteUserTemplateActionType())
+
+        from baserow.core.trash.actions import (
+            EmptyTrashActionType,
+            RestoreFromTrashActionType,
+        )
+
+        action_type_registry.register(EmptyTrashActionType())
+        action_type_registry.register(RestoreFromTrashActionType())
+
+        from baserow.core.trash.registries import (
+            DefaultTrashOperationType,
+            trash_operation_type_registry,
+        )
+
+        trash_operation_type_registry.register(DefaultTrashOperationType())
+
+        from baserow.core.mcp.actions import (
+            ConnectMCPOAuthClientActionType,
+            CreateMCPEndpointActionType,
+            DeleteMCPEndpointActionType,
+            DisconnectMCPOAuthClientActionType,
+            UpdateMCPEndpointActionType,
+            UpdateMCPEndpointToolsActionType,
+        )
+
+        action_type_registry.register(CreateMCPEndpointActionType())
+        action_type_registry.register(UpdateMCPEndpointActionType())
+        action_type_registry.register(UpdateMCPEndpointToolsActionType())
+        action_type_registry.register(DeleteMCPEndpointActionType())
+        action_type_registry.register(ConnectMCPOAuthClientActionType())
+        action_type_registry.register(DisconnectMCPOAuthClientActionType())
+
+        from baserow.core.user.actions import (
+            CancelUserDeletionActionType,
+            ChangeEmailActionType,
+            ChangeUserPasswordActionType,
+            CreateUserActionType,
+            ResetUserPasswordActionType,
+            ScheduleUserDeletionActionType,
+            SendChangeEmailConfirmationActionType,
+            SendResetUserPasswordActionType,
+            SendVerifyEmailAddressActionType,
+            SignInUserActionType,
+            UpdateUserActionType,
+            VerifyEmailAddressActionType,
+        )
+
+        action_type_registry.register(CreateUserActionType())
+        action_type_registry.register(UpdateUserActionType())
+        action_type_registry.register(ScheduleUserDeletionActionType())
+        action_type_registry.register(CancelUserDeletionActionType())
+        action_type_registry.register(SignInUserActionType())
+        action_type_registry.register(ChangeUserPasswordActionType())
+        action_type_registry.register(SendResetUserPasswordActionType())
+        action_type_registry.register(ResetUserPasswordActionType())
+        action_type_registry.register(SendVerifyEmailAddressActionType())
+        action_type_registry.register(VerifyEmailAddressActionType())
+        action_type_registry.register(SendChangeEmailConfirmationActionType())
+        action_type_registry.register(ChangeEmailActionType())
+
+        from baserow.core.admin.users.actions import (
+            AdminDisableTwoFactorAuthActionType,
+        )
+        from baserow.core.two_factor_auth.actions import (
+            ConfigureTwoFactorAuthActionType,
+            DisableTwoFactorAuthActionType,
+        )
+
+        action_type_registry.register(ConfigureTwoFactorAuthActionType())
+        action_type_registry.register(DisableTwoFactorAuthActionType())
+        action_type_registry.register(AdminDisableTwoFactorAuthActionType())
+
+        from baserow.core.action.scopes import (
+            AllWorkspacesActionScopeType,
+            ApplicationActionScopeType,
+            RootActionScopeType,
+            WorkspaceActionScopeType,
+        )
+
+        action_scope_registry.register(RootActionScopeType())
+        action_scope_registry.register(WorkspaceActionScopeType())
+        action_scope_registry.register(AllWorkspacesActionScopeType())
+        action_scope_registry.register(ApplicationActionScopeType())
+
+        from baserow.core.jobs.registries import job_type_registry
+
+        from .job_types import (
+            DuplicateApplicationJobType,
+            ExportApplicationsJobType,
+            ImportApplicationsJobType,
+            InstallTemplateJobType,
+        )
+        from .snapshots.job_types import CreateSnapshotJobType, RestoreSnapshotJobType
+        from .user_templates.job_types import CreateUserTemplateJobType
+
+        job_type_registry.register(DuplicateApplicationJobType())
+        job_type_registry.register(InstallTemplateJobType())
+        job_type_registry.register(CreateSnapshotJobType())
+        job_type_registry.register(RestoreSnapshotJobType())
+        job_type_registry.register(ExportApplicationsJobType())
+        job_type_registry.register(ImportApplicationsJobType())
+        job_type_registry.register(CreateUserTemplateJobType())
+
+        from baserow.api.notifications.user_data_types import (
+            UnreadUserNotificationsCountPermissionsDataType,
+        )
+        from baserow.api.user.registries import user_data_registry
+        from baserow.api.user.user_data_types import GlobalPermissionsDataType
+
+        user_data_registry.register(GlobalPermissionsDataType())
+        user_data_registry.register(UnreadUserNotificationsCountPermissionsDataType())
+
+        from baserow.core.preference_types import (
+            AllWorkspacesSortByPreferenceType,
+            AllWorkspacesViewModePreferenceType,
+            RecentlyViewedViewModePreferenceType,
+            WorkspaceRecentlyViewedViewModePreferenceType,
+        )
+        from baserow.core.user.registries import user_preference_type_registry
+
+        user_preference_type_registry.register(AllWorkspacesSortByPreferenceType())
+        user_preference_type_registry.register(AllWorkspacesViewModePreferenceType())
+        user_preference_type_registry.register(RecentlyViewedViewModePreferenceType())
+        user_preference_type_registry.register(
+            WorkspaceRecentlyViewedViewModePreferenceType()
+        )
+
+        from baserow.core.auth_provider.auth_provider_types import (
+            PasswordAuthProviderType,
+        )
+        from baserow.core.registries import auth_provider_type_registry
+
+        auth_provider_type_registry.register(PasswordAuthProviderType())
+
+        from baserow.core.two_factor_auth.registries import (
+            TOTPAuthProviderType,
+            two_factor_auth_type_registry,
+        )
+
+        two_factor_auth_type_registry.register(TOTPAuthProviderType())
+
+        from baserow.core.captcha.provider_types import (
+            CloudflareTurnstileCaptchaProviderType,
+        )
+        from baserow.core.captcha.registries import captcha_provider_registry
+
+        captcha_provider_registry.register(CloudflareTurnstileCaptchaProviderType())
+
+        from baserow.api.settings.registries import settings_data_registry
+        from baserow.core.captcha.settings_data_type import CaptchaSettingsDataType
+
+        settings_data_registry.register(CaptchaSettingsDataType())
+
+        import baserow.core.notifications.receivers  # noqa: F401
+        import baserow.core.notifications.tasks  # noqa: F401
+        from baserow.core.notification_types import (
+            BaserowVersionUpgradeNotificationType,
+            WorkspaceInvitationAcceptedNotificationType,
+            WorkspaceInvitationCreatedNotificationType,
+            WorkspaceInvitationRejectedNotificationType,
+        )
+        from baserow.core.notifications.registries import notification_type_registry
+
+        notification_type_registry.register(
+            WorkspaceInvitationAcceptedNotificationType()
+        )
+        notification_type_registry.register(
+            WorkspaceInvitationCreatedNotificationType()
+        )
+        notification_type_registry.register(
+            WorkspaceInvitationRejectedNotificationType()
+        )
+        notification_type_registry.register(BaserowVersionUpgradeNotificationType())
+
+        from baserow.core.abuse_reports.actions import SubmitAbuseReportActionType
+        from baserow.core.abuse_reports.notification_types import (
+            AbuseReportCreatedNotificationType,
+        )
+
+        action_type_registry.register(SubmitAbuseReportActionType())
+        notification_type_registry.register(AbuseReportCreatedNotificationType())
+
+        from baserow.core.generative_ai.generative_ai_model_types import (
+            AnthropicGenerativeAIModelType,
+            BedrockGenerativeAIModelType,
+            GoogleGenerativeAIModelType,
+            GroqGenerativeAIModelType,
+            MistralGenerativeAIModelType,
+            OllamaGenerativeAIModelType,
+            OpenAIGenerativeAIModelType,
+            OpenRouterGenerativeAIModelType,
+            XaiGenerativeAIModelType,
+            ZaiGenerativeAIModelType,
+        )
+        from baserow.core.generative_ai.registries import (
+            generative_ai_model_type_registry,
+        )
+
+        generative_ai_model_type_registry.register(OpenAIGenerativeAIModelType())
+        generative_ai_model_type_registry.register(AnthropicGenerativeAIModelType())
+        generative_ai_model_type_registry.register(BedrockGenerativeAIModelType())
+        generative_ai_model_type_registry.register(GoogleGenerativeAIModelType())
+        generative_ai_model_type_registry.register(GroqGenerativeAIModelType())
+        generative_ai_model_type_registry.register(XaiGenerativeAIModelType())
+        generative_ai_model_type_registry.register(ZaiGenerativeAIModelType())
+        generative_ai_model_type_registry.register(MistralGenerativeAIModelType())
+        generative_ai_model_type_registry.register(OllamaGenerativeAIModelType())
+        generative_ai_model_type_registry.register(OpenRouterGenerativeAIModelType())
+
+        # Must import the Posthog signal, otherwise it won't work.
+        import baserow.core.posthog  # noqa: F403, F401
+
+        self._setup_health_checks()
+
+        # Clear the key after migration so we will trigger a new template sync.
+        post_migrate.connect(start_sync_templates_task_after_migrate, sender=self)
+        # Create all operations from registry
+        post_migrate.connect(sync_operations_after_migrate, sender=self)
+
+        if settings.CACHALOT_ENABLED:
+            pre_migrate.connect(lambda *a, **kw: clear_cachalot_cache(), sender=self)
+
+        if settings.SENTRY_DSN:
+            from baserow.core.sentry import patch_user_model_str
+
+            patch_user_model_str()
+
+        import baserow.core.last_viewed.receivers  # noqa: F401
+        import baserow.core.mcp.receivers  # noqa: F401
+        import baserow.core.receivers  # noqa: F401
+        import baserow.core.user_templates.receivers  # noqa: F401
+        from baserow.core.telemetry.telemetry import setup_logging
+
+        setup_logging()
+
+        # Must run after setup_logging so the notice reaches the configured
+        # sink and the OpenTelemetry log exporter.
+        from baserow.config.helpers import log_ai_provider_env_deprecations
+
+        log_ai_provider_env_deprecations()
+
+    def _setup_health_checks(self):
+        from health_check.plugins import plugin_dir
+
+        from baserow.core.integrations.object_scopes import IntegrationObjectScopeType
+        from baserow.core.registries import (
+            object_scope_type_registry,
+            operation_type_registry,
+        )
+
+        from .health.custom_health_checks import (
+            DebugModeHealthCheck,
+            HerokuExternalFileStorageConfiguredHealthCheck,
+        )
+
+        object_scope_type_registry.register(IntegrationObjectScopeType())
+
+        from baserow.core.integrations.operations import (
+            CreateIntegrationOperationType,
+            DeleteIntegrationOperationType,
+            ListIntegrationsApplicationOperationType,
+            OrderIntegrationsOperationType,
+            ReadIntegrationOperationType,
+            RestoreIntegrationOperationType,
+            UpdateIntegrationOperationType,
+        )
+
+        operation_type_registry.register(CreateIntegrationOperationType())
+        operation_type_registry.register(UpdateIntegrationOperationType())
+        operation_type_registry.register(DeleteIntegrationOperationType())
+        operation_type_registry.register(ListIntegrationsApplicationOperationType())
+        operation_type_registry.register(ReadIntegrationOperationType())
+        operation_type_registry.register(OrderIntegrationsOperationType())
+        operation_type_registry.register(RestoreIntegrationOperationType())
+
+        from baserow.core.action.registries import action_type_registry
+        from baserow.core.integrations.actions import (
+            CreateIntegrationActionType,
+            DeleteIntegrationActionType,
+            MoveIntegrationActionType,
+            UpdateIntegrationActionType,
+        )
+        from baserow.core.integrations.trash_types import IntegrationTrashableItemType
+        from baserow.core.trash.registries import trash_item_type_registry
+
+        trash_item_type_registry.register(IntegrationTrashableItemType())
+
+        action_type_registry.register(CreateIntegrationActionType())
+        action_type_registry.register(UpdateIntegrationActionType())
+        action_type_registry.register(DeleteIntegrationActionType())
+        action_type_registry.register(MoveIntegrationActionType())
+
+        from baserow.core.user_sources.object_scopes import UserSourceObjectScopeType
+
+        object_scope_type_registry.register(UserSourceObjectScopeType())
+
+        from baserow.core.user_sources.operations import (
+            AuthenticateUserSourceOperationType,
+            CreateUserSourceOperationType,
+            DeleteUserSourceOperationType,
+            ListUserSourcesApplicationOperationType,
+            LoginUserSourceOperationType,
+            OrderUserSourcesOperationType,
+            ReadUserSourceOperationType,
+            RestoreUserSourceOperationType,
+            UpdateUserSourceOperationType,
+        )
+
+        operation_type_registry.register(CreateUserSourceOperationType())
+        operation_type_registry.register(DeleteUserSourceOperationType())
+        operation_type_registry.register(ListUserSourcesApplicationOperationType())
+        operation_type_registry.register(OrderUserSourcesOperationType())
+        operation_type_registry.register(ReadUserSourceOperationType())
+        operation_type_registry.register(UpdateUserSourceOperationType())
+        operation_type_registry.register(AuthenticateUserSourceOperationType())
+        operation_type_registry.register(LoginUserSourceOperationType())
+        operation_type_registry.register(RestoreUserSourceOperationType())
+
+        from baserow.core.user_sources.actions import (
+            CreateUserSourceActionType,
+            DeleteUserSourceActionType,
+            MoveUserSourceActionType,
+            UpdateUserSourceActionType,
+        )
+        from baserow.core.user_sources.trash_types import UserSourceTrashableItemType
+
+        trash_item_type_registry.register(UserSourceTrashableItemType())
+
+        action_type_registry.register(CreateUserSourceActionType())
+        action_type_registry.register(UpdateUserSourceActionType())
+        action_type_registry.register(DeleteUserSourceActionType())
+        action_type_registry.register(MoveUserSourceActionType())
+
+        from baserow.core.mcp.operations import (
+            CreateMCPEndpointOperationType,
+            DeleteMCPEndpointOperationType,
+            ReadMCPEndpointOperationType,
+            UpdateMCPEndpointOperationType,
+        )
+
+        operation_type_registry.register(CreateMCPEndpointOperationType())
+        operation_type_registry.register(ReadMCPEndpointOperationType())
+        operation_type_registry.register(UpdateMCPEndpointOperationType())
+        operation_type_registry.register(DeleteMCPEndpointOperationType())
+
+        from baserow.core.mcp.object_scopes import MCPEndpointObjectScopeType
+
+        object_scope_type_registry.register(MCPEndpointObjectScopeType())
+
+        plugin_dir.register(DebugModeHealthCheck)
+        if getattr(settings, "HEROKU_ENABLED", False):
+            plugin_dir.register(HerokuExternalFileStorageConfiguredHealthCheck)
+        plugin_dir.register(DefaultFileStorageHealthCheck)
+
+        from baserow.config.streaming import register_async_stream_path
+        from baserow.core.chat_runs.health_checks import ChatRunsHealthCheck
+        from baserow.core.chat_runs.pages import ChatRunsPageType
+        from baserow.ws.registries import page_registry
+
+        plugin_dir.register(ChatRunsHealthCheck)
+        page_registry.register(ChatRunsPageType())
+        register_async_stream_path("api:chat_runs:stream", methods=("GET",))
+
+        import baserow.core.import_export.tasks  # noqa: F403, F401
+        import baserow.core.integrations.receivers  # noqa: F403, F401
+        import baserow.core.integrations.ws.signals  # noqa: F403, F401
+        import baserow.core.user_sources.ws.signals  # noqa: F403, F401
+
+        # pgvector extension setup. Because the extension is optional, we must
+        # dynamically check if it's available and adjust the models accordingly.
+        from baserow.core.pgvector import try_migrate_vector_fields
+
+        post_migrate.connect(
+            try_migrate_vector_fields,
+            sender=self,
+            dispatch_uid="baserow_core_pgvector_post_migrate",
+        )
+
+
+# noinspection PyPep8Naming
+def start_sync_templates_task_after_migrate(sender, **kwargs):
+    from baserow.core.tasks import sync_templates_task
+
+    if settings.BASEROW_TRIGGER_SYNC_TEMPLATES_AFTER_MIGRATION and not settings.TESTS:
+        print(
+            "Submitting the sync templates task to run asynchronously in "
+            "celery after the migration..."
+        )
+        sync_templates_task.delay()
+
+
+def sync_operations_after_migrate(sender, **kwargs):
+    apps = kwargs.get("apps", None)
+
+    if apps is not None:
+        try:
+            Operation = apps.get_model("core", "Operation")
+        except LookupError:
+            print("Skipping operation creation as Operation model does not exist.")
+        else:
+            # Pluck out the `type` from each registered operation type.
+            from baserow.core.registries import operation_type_registry
+
+            all_operation_types = [o.type for o in operation_type_registry.get_all()]
+
+            # Create all the operations that are registered in the registry.
+            operations = [Operation(name=optype) for optype in all_operation_types]
+            inserted_count = Operation.objects.bulk_create(
+                operations, ignore_conflicts=True
+            )
+            print(f"Created {len(inserted_count)} operations...")
+
+            # Delete any existing operations which aren't in the registry.
+            _, deletions = Operation.objects.filter(
+                ~Q(name__in=all_operation_types)
+            ).delete()
+            ops_deleted = deletions.get("core.Operation", 0)
+            print(f"Deleted {ops_deleted} un-registered operations...")

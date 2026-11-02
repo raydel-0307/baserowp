@@ -1,0 +1,697 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 1`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="DD/MM/YYYY"
+              type="text"
+              value=""
+            />
+            <!--v-if-->
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 2`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="MM/DD/YYYY"
+              type="text"
+              value=""
+            />
+            <!--v-if-->
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 3`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="YYYY-MM-DD"
+              type="text"
+              value=""
+            />
+            <!--v-if-->
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 4`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="DD/MM/YYYY"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="HH:mm"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 5`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="DD/MM/YYYY"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="hh:mm A"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 6`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="MM/DD/YYYY"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="HH:mm"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 7`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="MM/DD/YYYY"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="hh:mm A"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 8`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="YYYY-MM-DD"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="HH:mm"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;
+
+exports[`DateTimePickerElement > placeholder corresponds to date and time formats 9`] = `
+<div
+  class="control ab-form-group"
+  data-form-error="false"
+>
+  
+  <!--v-if-->
+  <div
+    class="control__wrapper"
+  >
+    <div
+      class="control__elements"
+    >
+      <div
+        class="control__elements-wrapper"
+      >
+        
+        <!--v-if-->
+        <div
+          class="ab-form-group__children"
+        >
+          
+          <div
+            class="ab-datetime-picker__wrapper"
+          >
+            <i
+              class="ab-icon iconoir-calendar ab-datetime-picker__icon"
+              title=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--date"
+              placeholder="YYYY-MM-DD"
+              type="text"
+              value=""
+            />
+            <input
+              class="ab-input ab-datetime-picker__input ab-datetime-picker__input--time"
+              placeholder="hh:mm A"
+              type="text"
+              value=""
+            />
+            <div
+              class="flex-grow-1"
+            />
+            <!--v-if-->
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__calendar--context context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+            <teleport-stub
+              to="body"
+            >
+              <div
+                class="ab-datetime-picker__clock context visibility-hidden"
+              >
+                <!--v-if-->
+              </div>
+            </teleport-stub>
+          </div>
+          
+          <!--v-if-->
+        </div>
+        
+      </div>
+      <!--v-if-->
+      
+      
+    </div>
+    <!--v-if-->
+  </div>
+  
+</div>
+`;

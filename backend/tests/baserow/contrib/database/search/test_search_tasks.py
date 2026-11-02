@@ -1,0 +1,220 @@
+from unittest.mock import patch
+
+from django.db import OperationalError
+
+import pytest
+from celery.exceptions import Retry
+from freezegun import freeze_time
+from kombu.exceptions import OperationalError as BrokerError
+
+from baserow.contrib.database.rows.handler import RowHandler
+from baserow.contrib.database.search.handler import SearchHandler
+from baserow.contrib.database.search.models import PendingSearchValueUpdate
+from baserow.contrib.database.search.registries import (
+    SearchDataUpdaterType,
+    search_data_updater_registry,
+)
+from baserow.contrib.database.search.search_data_updater_types import (
+    FullTextSearchDataUpdaterType,
+)
+from baserow.contrib.database.search.tasks import (
+    periodic_check_pending_search_data,
+    schedule_update_search_data,
+    update_search_data,
+)
+from baserow.contrib.database.table.handler import TableHandler
+
+pytestmark = pytest.mark.enable_signals(
+    "baserow.contrib.database.search.tasks.schedule_update_search_data.delay",
+    "baserow.contrib.database.search.tasks.update_search_data.delay",
+)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_periodic_check_pending_search_data(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table = data_fixture.create_database_table(database=database)
+    field = data_fixture.create_text_field(table=table)
+
+    row1, row2, row3 = (
+        RowHandler()
+        .force_create_rows(
+            user,
+            table,
+            [
+                {field.db_column: "Row 1"},
+                {field.db_column: "Row 2"},
+                {field.db_column: "Row 3"},
+            ],
+        )
+        .created_rows
+    )
+
+    # (Fake) search updates to delete
+    PendingSearchValueUpdate.objects.bulk_create(
+        [
+            PendingSearchValueUpdate(
+                field_id=field.id, row_id=row1.id, deletion_workspace_id=workspace.id
+            ),
+            PendingSearchValueUpdate(
+                field_id=field.id, row_id=row2.id, deletion_workspace_id=workspace.id
+            ),
+            PendingSearchValueUpdate(
+                field_id=field.id, row_id=row3.id, deletion_workspace_id=workspace.id
+            ),
+        ]
+    )
+
+    workspace_search_table = SearchHandler.get_workspace_search_table_model(
+        workspace.id
+    )
+    assert workspace_search_table.objects.count() == 3
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 3
+
+    periodic_check_pending_search_data()
+
+    # After processing, the search table should be empty and pending updates marked for
+    # deletion should be deleted
+    assert workspace_search_table.objects.count() == 0
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 0
+
+    # Too-old pending updates should be deleted, without creating a search value
+    with freeze_time("2024-01-01 00:00:00"):
+        PendingSearchValueUpdate.objects.create(field_id=field.id, row_id=1)
+
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 1
+    assert workspace_search_table.objects.count() == 0
+
+    periodic_check_pending_search_data()
+
+    # The pending update is removed and nothing is created in the search table
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 0
+    assert workspace_search_table.objects.count() == 0
+
+    # If there are valid pending updates for a table, it should re-schedule the task
+    # and add them
+    PendingSearchValueUpdate.objects.create(field_id=field.id, row_id=1)
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 1
+    assert workspace_search_table.objects.count() == 0
+
+    periodic_check_pending_search_data()
+
+    # The task is called for the table with pending updates and the search value
+    # is created accordingly
+    assert PendingSearchValueUpdate.objects_and_trash.count() == 0
+    assert workspace_search_table.objects.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_schedule_update_search_data_retries_on_transient_connection_error(
+    data_fixture,
+):
+    table = data_fixture.create_database_table()
+    field = data_fixture.create_text_field(table=table)
+
+    def failing_get_table(self, table_id, *args, **kwargs):
+        raise OperationalError("server closed the connection unexpectedly")
+
+    # A transient connection drop must be turned into a Celery retry instead of
+    # failing the task outright (which is what happened before autoretry_for).
+    with patch.object(TableHandler, "get_table", failing_get_table):
+        with pytest.raises(Retry) as exc_info:
+            schedule_update_search_data.apply(
+                args=[table.id], kwargs={"field_ids": [field.id]}
+            )
+
+    assert isinstance(exc_info.value.exc, OperationalError)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_periodic_check_continues_after_transient_error_on_one_table(data_fixture):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    database = data_fixture.create_database_application(workspace=workspace)
+    table1 = data_fixture.create_database_table(database=database)
+    field1 = data_fixture.create_text_field(table=table1)
+    table2 = data_fixture.create_database_table(database=database)
+    field2 = data_fixture.create_text_field(table=table2)
+
+    PendingSearchValueUpdate.objects.create(field_id=field1.id, row_id=1)
+    PendingSearchValueUpdate.objects.create(field_id=field2.id, row_id=1)
+
+    scheduled = []
+
+    def flaky_schedule(table_id):
+        # The first table hits a transient connection error, the second succeeds.
+        scheduled.append(table_id)
+        if len(scheduled) == 1:
+            raise OperationalError("server closed the connection unexpectedly")
+
+    with patch(
+        "baserow.contrib.database.search.tasks.schedule_update_search_data",
+        side_effect=flaky_schedule,
+    ):
+        # Should not raise: the transient error on the first table is swallowed so
+        # the remaining tables are still processed.
+        periodic_check_pending_search_data()
+
+    assert len(scheduled) == 2
+
+
+class RecordingSearchDataUpdaterType(SearchDataUpdaterType):
+    type = "recording"
+
+    def __init__(self):
+        super().__init__()
+        self.queued = []
+        self.scheduled = []
+
+    def get_queued_field_ids(self, table, field_ids):
+        return field_ids
+
+    def queue_pending_updates(self, field_ids, row_ids=None, **values):
+        self.queued.append((field_ids, row_ids))
+
+    def schedule(self, table_id, new_pending_updates=True):
+        self.scheduled.append(table_id)
+
+
+@pytest.fixture
+def recording_search_data_updater_type():
+    before = search_data_updater_registry.registry.copy()
+    updater_type = RecordingSearchDataUpdaterType()
+    search_data_updater_registry.register(updater_type)
+    yield updater_type
+    search_data_updater_registry.registry = before
+
+
+@pytest.mark.django_db(transaction=True)
+def test_failing_broker_doesnt_prevent_other_types_from_queuing_changes(
+    data_fixture, recording_search_data_updater_type
+):
+    table = data_fixture.create_database_table()
+    field = data_fixture.create_text_field(table=table)
+
+    with patch.object(
+        update_search_data, "apply_async", side_effect=BrokerError("broker is down")
+    ):
+        schedule_update_search_data(table.id, field_ids=[field.id])
+
+    assert PendingSearchValueUpdate.objects.filter(field_id=field.id).exists()
+    assert recording_search_data_updater_type.queued == [([field.id], None)]
+    assert recording_search_data_updater_type.scheduled == [table.id]
+
+
+@pytest.mark.django_db
+def test_changes_while_the_update_task_runs_make_it_run_again(data_fixture):
+    table = data_fixture.create_database_table()
+    updater_type = search_data_updater_registry.get(FullTextSearchDataUpdaterType.type)
+    lock = update_search_data.generate_lock(
+        update_search_data.name, task_args=[table.id]
+    )
+    update_search_data.aquire_lock(lock, "running-task-id")
+    try:
+        updater_type.schedule(table.id, new_pending_updates=True)
+    finally:
+        update_search_data.unlock(lock)
+
+    assert updater_type._get_reschedule_flag(table.id).is_set()

@@ -1,0 +1,1028 @@
+import uuid
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+from django.test import override_settings
+from django.urls import reverse
+from django.utils.timezone import now
+
+import pytest
+from freezegun import freeze_time
+from rest_framework.status import (
+    HTTP_202_ACCEPTED,
+    HTTP_204_NO_CONTENT,
+    HTTP_400_BAD_REQUEST,
+)
+
+from baserow.contrib.automation.automation_dispatch_context import (
+    AutomationDispatchContext,
+)
+from baserow.contrib.automation.nodes.exceptions import (
+    AutomationNodeMisconfiguredService,
+)
+from baserow.contrib.automation.nodes.registries import automation_node_type_registry
+from baserow.contrib.automation.nodes.service import AutomationNodeService
+from baserow.contrib.automation.workflows.constants import WorkflowState
+from baserow.contrib.automation.workflows.service import AutomationWorkflowService
+from baserow.contrib.integrations.core.constants import (
+    PERIODIC_INTERVAL_DAY,
+)
+from baserow.contrib.integrations.core.models import CorePeriodicService
+from baserow.contrib.integrations.core.service_types import (
+    CorePeriodicTriggerServiceType,
+)
+from baserow.core.formula.types import BASEROW_FORMULA_MODE_RAW, BaserowFormulaObject
+from baserow.core.handler import CoreHandler
+from baserow.core.services.exceptions import (
+    InvalidContextContentDispatchException,
+    ServiceImproperlyConfiguredDispatchException,
+)
+from baserow.core.services.registries import service_type_registry
+from baserow.core.services.types import DispatchResult
+from tests.baserow.contrib.automation.api.utils import get_api_kwargs
+
+API_URL_BASE = "api:automation:nodes"
+API_URL_MOVE = f"{API_URL_BASE}:move"
+
+
+def test_automation_node_type_is_replaceable_with():
+    trigger_node_type = automation_node_type_registry.get("local_baserow_rows_created")
+    update_trigger_node_type = automation_node_type_registry.get(
+        "local_baserow_rows_updated"
+    )
+    action_node_type = automation_node_type_registry.get("local_baserow_create_row")
+    update_action_node_type = automation_node_type_registry.get(
+        "local_baserow_update_row"
+    )
+
+    assert trigger_node_type.is_replaceable_with(update_trigger_node_type)
+    assert not trigger_node_type.is_replaceable_with(update_action_node_type)
+    assert action_node_type.is_replaceable_with(update_action_node_type)
+    assert not action_node_type.is_replaceable_with(update_trigger_node_type)
+
+
+def test_local_baserow_fields_updated_trigger_node_type_is_registered():
+    node_type = automation_node_type_registry.get("local_baserow_fields_updated")
+
+    assert node_type.is_workflow_trigger is True
+    assert node_type.service_type == "local_baserow_fields_updated"
+
+
+@pytest.mark.django_db
+def test_local_baserow_fields_updated_node_creates_field_updated_service(data_fixture):
+    from baserow.contrib.integrations.local_baserow.models import (
+        LocalBaserowFieldsUpdated,
+    )
+
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user, create_trigger=False)
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_fields_updated"
+    )
+
+    assert isinstance(node.service.specific, LocalBaserowFieldsUpdated)
+
+
+@pytest.mark.django_db
+def test_core_response_node_defaults_status_code_to_raw_204(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+    node_type = automation_node_type_registry.get("response")
+
+    values = node_type.prepare_values({"workflow": workflow}, user)
+
+    assert values["service"].specific.status_code == BaserowFormulaObject.create(
+        "204", mode=BASEROW_FORMULA_MODE_RAW
+    )
+
+
+@pytest.mark.django_db
+def test_core_response_node_preserves_provided_status_code(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+    node_type = automation_node_type_registry.get("response")
+    status_code = BaserowFormulaObject.create("201", mode=BASEROW_FORMULA_MODE_RAW)
+
+    values = node_type.prepare_values(
+        {"workflow": workflow, "service": {"status_code": status_code}}, user
+    )
+
+    assert values["service"].specific.status_code == status_code
+
+
+@pytest.mark.django_db
+@patch(
+    "baserow.contrib.automation.workflows.service.AutomationWorkflowHandler.async_start_workflow"
+)
+def test_automation_service_trigger_node_type_on_event(
+    mock_async_start_workflow, data_fixture
+):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    original_workflow = data_fixture.create_automation_workflow(
+        user,
+        automation=data_fixture.create_automation_application(
+            workspace=table.database.workspace
+        ),
+        trigger_service_kwargs={"table": table},
+    )
+    workflow = data_fixture.create_automation_workflow(
+        user,
+        automation=data_fixture.create_automation_application(workspace=None),
+        state=WorkflowState.LIVE,
+        trigger_service_kwargs={"table": table},
+    )
+    workflow.automation.published_from = original_workflow
+    workflow.automation.save()
+    trigger = workflow.get_trigger()
+
+    service = trigger.service.specific
+    service_queryset = service.get_type().model_class.objects.filter(table=table)
+    event_payload = [
+        {
+            "id": 1,
+            "order": "1.00000000000000000000",
+            f"field_1": "Community Engagement",
+        },
+        {
+            "id": 2,
+            "order": "2.00000000000000000000",
+            f"field_1": "Construction",
+        },
+    ]
+
+    trigger.get_type().on_event(service_queryset, event_payload, user=user)
+    mock_async_start_workflow.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_automation_node_type_create_row_prepare_values_with_instance(data_fixture):
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user, type="local_baserow_create_row"
+    )
+
+    values = {"service": {}}
+    result = node.get_type().prepare_values(values, user, instance=node)
+    assert result == {"service": node.service}
+
+
+@pytest.mark.django_db
+def test_automation_node_type_create_row_prepare_values_without_instance(data_fixture):
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user, type="local_baserow_create_row"
+    )
+
+    values = {"service": {}, "workflow": node.workflow}
+    result = node.get_type().prepare_values(values, user)
+
+    # Since we didn't pass in a service, a new service is created
+    new_service = result["service"]
+    assert isinstance(new_service, type(node.service))
+    assert new_service.id != node.service.id
+
+
+@patch("baserow.contrib.automation.nodes.registries.ServiceHandler.dispatch_service")
+@pytest.mark.django_db
+def test_automation_node_type_create_row_dispatch(mock_dispatch, data_fixture):
+    mock_dispatch_result = MagicMock()
+    mock_dispatch.return_value = mock_dispatch_result
+
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user, type="local_baserow_create_row"
+    )
+
+    dispatch_context = AutomationDispatchContext(node.workflow, None)
+    result = node.get_type().dispatch(node, dispatch_context)
+
+    assert result == mock_dispatch_result
+    mock_dispatch.assert_called_once_with(
+        node.service.specific,
+        dispatch_context,
+        application_id=node.workflow.automation_id,
+    )
+
+
+@pytest.mark.django_db
+def test_automation_node_type_local_baserow_rows_created_prepare_values_with_instance(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user, create_trigger=False)
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_rows_created"
+    )
+
+    values = {"service": {}}
+    result = node.get_type().prepare_values(values, user, instance=node)
+    assert result == {"service": node.service}
+
+
+@pytest.mark.django_db
+def test_service_node_type_local_baserow_rows_created_prepare_values_without_instance(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user, create_trigger=False)
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_rows_created"
+    )
+
+    values = {"service": {}, "workflow": node.workflow}
+    result = node.get_type().prepare_values(values, user)
+
+    # Since we didn't pass in a service, a new service is created
+    new_service = result["service"]
+    assert isinstance(new_service, type(node.service))
+    assert new_service.id != node.service.id
+
+
+@pytest.mark.django_db
+def test_automation_node_type_update_row_prepare_values_with_instance(data_fixture):
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user, type="local_baserow_update_row"
+    )
+
+    values = {"service": {}}
+    result = node.get_type().prepare_values(values, user, instance=node)
+    assert result == {"service": node.service}
+
+
+@patch("baserow.contrib.automation.nodes.registries.ServiceHandler.dispatch_service")
+@pytest.mark.django_db
+def test_automation_node_type_update_row_dispatch(mock_dispatch, data_fixture):
+    mock_dispatch_result = MagicMock()
+    mock_dispatch.return_value = mock_dispatch_result
+
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user,
+        type="local_baserow_update_row",
+        service_kwargs={"row_id": "'1'"},
+    )
+
+    dispatch_context = AutomationDispatchContext(node.workflow, None)
+    result = node.get_type().dispatch(node, dispatch_context)
+
+    assert result == mock_dispatch_result
+    mock_dispatch.assert_called_once_with(
+        node.service.specific,
+        dispatch_context,
+        application_id=node.workflow.automation_id,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "row_id,exception,message",
+    [
+        (
+            "",
+            ServiceImproperlyConfiguredDispatchException,
+            "A row ID is required to update a row.",
+        ),
+        (
+            "  ",
+            ServiceImproperlyConfiguredDispatchException,
+            "A row ID is required to update a row.",
+        ),
+        (
+            "'0'",
+            ServiceImproperlyConfiguredDispatchException,
+            "The row with id 0 does not exist.",
+        ),
+        (
+            "''",
+            InvalidContextContentDispatchException,
+            'Value error for "row_id": The value is required',
+        ),
+    ],
+)
+def test_automation_node_type_update_row_dispatch_without_a_row_to_update(
+    data_fixture, row_id, exception, message
+):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+    integration = data_fixture.create_local_baserow_integration(
+        application=workflow.automation, user=user
+    )
+    table, fields, rows = data_fixture.build_table(
+        database=data_fixture.create_database_application(
+            workspace=workflow.automation.workspace
+        ),
+        user=user,
+        columns=[("Name", "text")],
+        rows=[["Horse"]],
+    )
+    service = data_fixture.create_local_baserow_upsert_row_service(
+        table=table, integration=integration, row_id=row_id
+    )
+    service.field_mappings.create(field=fields[0], value="'Cow'", enabled=True)
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_update_row", service=service
+    )
+
+    dispatch_context = AutomationDispatchContext(node.workflow, None)
+    with pytest.raises(exception) as exc:
+        node.get_type().dispatch(node, dispatch_context)
+    assert str(exc.value) == message
+
+    assert [r.id for r in table.get_model().objects.all()] == [rows[0].id]
+
+
+@pytest.mark.django_db
+def test_automation_node_type_delete_row_prepare_values_with_instance(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_delete_row"
+    )
+
+    values = {"service": {}}
+    result = node.get_type().prepare_values(values, user, instance=node)
+    assert result == {"service": node.service}
+
+
+@pytest.mark.django_db
+def test_automation_node_type_delete_row_prepare_values_without_instance(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+
+    node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_delete_row"
+    )
+    another_node = data_fixture.create_automation_node(
+        workflow=workflow, type="local_baserow_delete_row"
+    )
+
+    values = {
+        "service": {},
+        "workflow": node.workflow,
+    }
+    result = node.get_type().prepare_values(values, user)
+
+    # Since we didn't pass in a service, a new service is created
+    new_service = result["service"]
+
+    assert isinstance(new_service, type(node.service))
+    assert new_service.id != node.service.id
+
+
+@patch("baserow.contrib.automation.nodes.registries.ServiceHandler.dispatch_service")
+@pytest.mark.django_db
+def test_automation_node_type_delete_row_dispatch(mock_dispatch, data_fixture):
+    mock_dispatch_result = MagicMock()
+    mock_dispatch.return_value = mock_dispatch_result
+
+    user = data_fixture.create_user()
+    node = data_fixture.create_automation_node(
+        user=user, type="local_baserow_delete_row"
+    )
+
+    dispatch_context = AutomationDispatchContext(node.workflow, None)
+    result = node.get_type().dispatch(node, dispatch_context)
+
+    assert result == mock_dispatch_result
+    mock_dispatch.assert_called_once_with(
+        node.service.specific,
+        dispatch_context,
+        application_id=node.workflow.automation_id,
+    )
+
+
+@pytest.mark.django_db
+@patch(
+    "baserow.contrib.automation.workflows.service.AutomationWorkflowHandler.async_start_workflow"
+)
+def test_on_event_excludes_disabled_workflows(mock_async_start_workflow, data_fixture):
+    """
+    Ensure that the AutomationTriggerNodeType::on_event() excludes any disabled
+    workflows.
+    """
+
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+
+    # Create a Node + workflow that is disabled
+    original_workflow = data_fixture.create_automation_workflow()
+    workflow = data_fixture.create_automation_workflow(
+        state=WorkflowState.DISABLED, trigger_service_kwargs={"table": table}
+    )
+    workflow.automation.published_from = original_workflow
+    workflow.automation.save()
+
+    trigger = workflow.get_trigger()
+
+    service_queryset = trigger.service.get_type().model_class.objects.filter(
+        table=table
+    )
+
+    event_payload = [
+        {
+            "id": 1,
+            "order": "1.00000000000000000000",
+            f"field_1": "Community Engagement",
+        },
+        {
+            "id": 2,
+            "order": "2.00000000000000000000",
+            f"field_1": "Construction",
+        },
+    ]
+
+    trigger.get_type().on_event(service_queryset, event_payload, user=user)
+
+    mock_async_start_workflow.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "node_type",
+    [
+        node_type.type
+        for node_type in automation_node_type_registry.get_all()
+        if node_type.is_workflow_trigger
+    ],
+)
+def test_trigger_cant_be_moved(node_type, api_client, data_fixture):
+    node_type = automation_node_type_registry.get(node_type)
+
+    user, token = data_fixture.create_user_and_token()
+    workflow = data_fixture.create_automation_workflow(user, trigger_type=node_type)
+    trigger = workflow.get_trigger()
+    node_after = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow, label="before"
+    )
+    response = api_client.post(
+        reverse(API_URL_MOVE, kwargs={"node_id": trigger.id}),
+        {"reference_node_id": node_after.id, "position": "south", "output": ""},
+        **get_api_kwargs(token),
+    )
+    assert response.status_code == HTTP_400_BAD_REQUEST
+    assert response.json() == {
+        "error": "ERROR_AUTOMATION_NODE_NOT_MOVABLE",
+        "detail": "Trigger nodes cannot be moved.",
+    }
+
+
+@pytest.mark.django_db
+def test_duplicating_router_node(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+
+    core_router_with_edges = data_fixture.create_core_router_action_node_with_edges(
+        workflow=workflow,
+    )
+    router = core_router_with_edges.router
+    edge1_output = core_router_with_edges.edge1_output
+    edge2_output = core_router_with_edges.edge2_output
+    fallback_output_node = core_router_with_edges.fallback_output_node
+
+    workflow.assert_reference(
+        {
+            "0": "local_baserow_rows_created",
+            "local_baserow_rows_created": {"next": {"": ["router"]}},
+            "router": {
+                "next": {
+                    "Default": ["fallback node"],
+                    "Do that": ["output edge 2"],
+                    "Do this": ["output edge 1"],
+                }
+            },
+            "fallback node": {},
+            "output edge 1": {},
+            "output edge 2": {},
+        }
+    )
+
+    AutomationNodeService().duplicate_node(user, router.id)
+
+    workflow.assert_reference(
+        {
+            "0": "local_baserow_rows_created",
+            "local_baserow_rows_created": {"next": {"": ["router"]}},
+            "router": {
+                "next": {
+                    "Default": ["router-"],
+                    "Do that": ["output edge 2"],
+                    "Do this": ["output edge 1"],
+                }
+            },
+            "router-": {"next": {"Default": ["fallback node"]}},
+            "fallback node": {},
+            "output edge 1": {},
+            "output edge 2": {},
+        }
+    )
+
+
+@pytest.mark.django_db
+def test_moving_router_node_allowed_with_next_on_default_edge(api_client, data_fixture):
+    node_type = automation_node_type_registry.get("router")
+
+    user, token = data_fixture.create_user_and_token()
+    workflow = data_fixture.create_automation_workflow(user)
+    trigger = workflow.get_trigger()
+    before_node = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow, label="before"
+    )
+    node = data_fixture.create_automation_node(
+        workflow=workflow,
+        type=node_type.type,
+    )
+    after_node = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow,
+        label="after",
+        reference_node=node,
+    )
+    response = api_client.post(
+        reverse(API_URL_MOVE, kwargs={"node_id": node.id}),
+        {"reference_node_id": trigger.id, "position": "south", "output": ""},
+        **get_api_kwargs(token),
+    )
+
+    assert response.status_code == HTTP_202_ACCEPTED
+
+
+@pytest.mark.django_db
+def test_moving_router_node_not_allowed_with_next_on_edge(api_client, data_fixture):
+    user, token = data_fixture.create_user_and_token()
+    workflow = data_fixture.create_automation_workflow(user)
+    trigger = workflow.get_trigger()
+    before_node = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow, label="before"
+    )
+    router = data_fixture.create_core_router_action_node(
+        workflow=workflow,
+    )
+    edge1 = data_fixture.create_core_router_service_edge(
+        service=router.service,
+        label="Do this",
+        condition="'true'",
+        output_label="output edge 1",
+    )
+    after_node = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow, label="after", reference_node=router, output=edge1.uid
+    )
+    response = api_client.post(
+        reverse(API_URL_MOVE, kwargs={"node_id": router.id}),
+        {"reference_node_id": trigger.id, "position": "south", "output": ""},
+        **get_api_kwargs(token),
+    )
+
+    assert response.status_code == HTTP_400_BAD_REQUEST
+    assert response.json() == {
+        "error": "ERROR_AUTOMATION_NODE_NOT_MOVABLE",
+        "detail": "Router nodes cannot be moved if they "
+        "have one or more output nodes associated with them.",
+    }
+
+
+@pytest.mark.django_db
+def test_trigger_node_dispatch_returns_event_payload_if_not_simulated(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    workflow = data_fixture.create_automation_workflow(
+        state=WorkflowState.LIVE, trigger_service_kwargs={"table": table}
+    )
+
+    trigger = workflow.get_trigger().specific
+
+    dispatch_context = AutomationDispatchContext(workflow, None, event_payload="foo")
+
+    result = trigger.get_type().dispatch(trigger, dispatch_context)
+
+    assert result == DispatchResult(data="foo", status=200, output_uid="")
+
+
+@pytest.mark.django_db
+def test_trigger_node_dispatch_returns_null_without_event_payload(data_fixture):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(
+        state=WorkflowState.LIVE, trigger_type="manual"
+    )
+    trigger = workflow.get_trigger().specific
+    dispatch_context = AutomationDispatchContext(workflow, None)
+
+    result = trigger.get_type().dispatch(trigger, dispatch_context)
+
+    assert result == DispatchResult(data=None, status=200, output_uid="")
+
+
+@pytest.mark.django_db
+def test_trigger_node_dispatch_returns_sample_data_if_simulated(data_fixture):
+    user = data_fixture.create_user()
+    table = data_fixture.create_database_table(user=user)
+    workflow = data_fixture.create_automation_workflow(
+        state=WorkflowState.LIVE,
+        trigger_service_kwargs={
+            "table": table,
+            "sample_data": {"data": {"foo": "bar"}},
+        },
+    )
+
+    trigger = workflow.get_trigger()
+
+    dispatch_context = AutomationDispatchContext(
+        workflow, None, simulate_until_node=trigger
+    )
+    # If we don't reset this value, the trigger is considered as updatable and will
+    # be dispatched.
+    dispatch_context.update_sample_data_for = []
+
+    result = trigger.get_type().dispatch(workflow.get_trigger(), dispatch_context)
+
+    assert result == DispatchResult(data={"foo": "bar"}, status=200, output_uid="")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_core_http_trigger_node(api_client, data_fixture):
+    user, _ = data_fixture.create_user_and_token()
+    workspace = data_fixture.create_workspace(user=user)
+    automation = data_fixture.create_automation_application(
+        user=user, workspace=workspace
+    )
+    workflow = data_fixture.create_automation_workflow(
+        user=user, automation=automation, state=WorkflowState.LIVE, create_trigger=False
+    )
+    integration = data_fixture.create_local_baserow_integration(
+        user=user, application=automation
+    )
+
+    trigger_node = data_fixture.create_core_http_trigger_node(
+        workflow=workflow,
+        service_kwargs={"is_public": True},
+    )
+
+    database = data_fixture.create_database_application(user=user, workspace=workspace)
+    table, fields, _ = data_fixture.build_table(
+        user=user,
+        database=database,
+        columns=[("Name", "text")],
+        rows=[],
+    )
+    action_service = data_fixture.create_local_baserow_upsert_row_service(
+        table=table,
+        integration=integration,
+    )
+    action_service.field_mappings.create(
+        field=fields[0],
+        value=f"concat('foo: ', get('previous_node.{trigger_node.id}.body.foo'))",
+    )
+    data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow,
+        service=action_service,
+    )
+
+    url = reverse("api:http_trigger", kwargs={"webhook_uid": trigger_node.service.uid})
+
+    resp = api_client.post(url, {"foo": "bar sky"}, format="json")
+
+    assert resp.status_code == HTTP_204_NO_CONTENT
+
+    model = table.get_model()
+    rows = model.objects.all()
+    assert len(rows) == 1
+    assert getattr(rows[0], f"field_{fields[0].id}") == "foo: bar sky"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_core_http_trigger_node_duplicating_application_sets_unique_uid(data_fixture):
+    user = data_fixture.create_user()
+
+    workflow = data_fixture.create_automation_workflow(
+        user=user, state=WorkflowState.LIVE, create_trigger=False
+    )
+    trigger_node = data_fixture.create_core_http_trigger_node(
+        user=user, workflow=workflow
+    )
+    assert isinstance(trigger_node.service.uid, uuid.UUID)
+
+    duplicated_automation = CoreHandler().duplicate_application(
+        user, workflow.automation
+    )
+    duplicated_service = (
+        duplicated_automation.workflows.get()
+        .automation_workflow_nodes.get()
+        .specific.service.specific
+    )
+
+    assert isinstance(duplicated_service.uid, uuid.UUID)
+    assert str(duplicated_service.uid) != str(trigger_node.service.uid)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_core_http_trigger_node_duplicating_workflow_sets_unique_uid(data_fixture):
+    user = data_fixture.create_user()
+
+    workflow = data_fixture.create_automation_workflow(
+        user=user, state=WorkflowState.LIVE, create_trigger=False
+    )
+    trigger_node = data_fixture.create_core_http_trigger_node(
+        user=user, workflow=workflow
+    )
+    assert isinstance(trigger_node.service.uid, uuid.UUID)
+
+    duplicated_workflow = AutomationWorkflowService().duplicate_workflow(user, workflow)
+    duplicated_service = (
+        duplicated_workflow.automation_workflow_nodes.get().specific.service.specific
+    )
+
+    assert isinstance(duplicated_service.uid, uuid.UUID)
+    assert str(duplicated_service.uid) != str(trigger_node.service.uid)
+
+
+@pytest.mark.django_db
+def test_periodic_trigger_node_on_event_only_updates_dispatched_services(data_fixture):
+    """
+    Given a workspace with:
+    - Automation
+        - Workflow A (draft): scheduled for today at noon
+        - Workflow B (live): scheduled for today at noon
+        - Workflow C: (live): scheduled for today at 9am.
+
+    Technically, services A, B1 (draft) and B2 (live) and C1 (draft) and C2 (live) are
+    all "due". This test is to ensure that when `CorePeriodicTriggerNodeType` calls
+    `on_event`, only the services B2+C2 have their two dates updated.
+    """
+
+    user = data_fixture.create_user()
+    automation = data_fixture.create_automation_application(user=user)
+
+    workflow_a = data_fixture.create_automation_workflow(
+        automation=automation,
+        state=WorkflowState.DRAFT,
+        create_trigger=False,
+    )
+    trigger_node_a = data_fixture.create_core_periodic_trigger_node(
+        workflow=workflow_a,
+        service_kwargs={
+            "interval": PERIODIC_INTERVAL_DAY,
+            "hour": 12,
+            "minute": 0,
+            "last_periodic_run": None,
+            "next_run_at": None,
+        },
+    )
+
+    workflow_b1 = data_fixture.create_automation_workflow(
+        automation=automation, create_trigger=False
+    )
+    trigger_node_b1 = data_fixture.create_core_periodic_trigger_node(
+        workflow=workflow_b1,
+        service_kwargs={
+            "interval": PERIODIC_INTERVAL_DAY,
+            "hour": 12,
+            "minute": 0,
+            "last_periodic_run": None,
+            "next_run_at": None,
+        },
+    )
+    workflow_b2 = data_fixture.create_automation_workflow(
+        state=WorkflowState.LIVE, create_trigger=False
+    )
+    trigger_node_b2 = data_fixture.create_core_periodic_trigger_node(
+        workflow=workflow_b2,
+        service_kwargs={
+            "interval": PERIODIC_INTERVAL_DAY,
+            "hour": 12,
+            "minute": 0,
+            "last_periodic_run": datetime(2026, 3, 3, 12, 0, 0),
+            "next_run_at": datetime(2026, 3, 4, 12, 0, 0),
+        },
+    )
+    workflow_b2.automation.published_from = workflow_b1
+    workflow_b2.automation.save()
+
+    workflow_c1 = data_fixture.create_automation_workflow(
+        automation=automation,
+        state=WorkflowState.DRAFT,
+        create_trigger=False,
+    )
+    trigger_node_c1 = data_fixture.create_core_periodic_trigger_node(
+        workflow=workflow_c1,
+        service_kwargs={
+            "interval": PERIODIC_INTERVAL_DAY,
+            "hour": 9,
+            "minute": 0,
+            "last_periodic_run": None,
+            "next_run_at": None,
+        },
+    )
+
+    workflow_c2 = data_fixture.create_automation_workflow(
+        automation=automation,
+        state=WorkflowState.DRAFT,
+        create_trigger=False,
+    )
+    trigger_node_c2 = data_fixture.create_core_periodic_trigger_node(
+        workflow=workflow_c2,
+        service_kwargs={
+            "interval": PERIODIC_INTERVAL_DAY,
+            "hour": 9,
+            "minute": 0,
+            "last_periodic_run": datetime(2026, 3, 4, 9, 0, 0),
+            "next_run_at": datetime(2026, 3, 5, 12, 0, 0),
+        },
+    )
+
+    with freeze_time("2026-03-04 12:00:00"):
+        current_time = now()
+        services_due = list(
+            CorePeriodicTriggerServiceType().get_periodic_services_that_are_due(
+                current_time
+            )
+        )
+        service_type_registry.get(
+            CorePeriodicTriggerServiceType.type
+        ).call_periodic_services_that_are_due()
+        services_dispatched = CorePeriodicService.objects.filter(
+            last_periodic_run=now()
+        )
+
+        assert services_due == [
+            # Due because: it's got no last/next runs, even though it's in draft.
+            trigger_node_a.service,
+            # Due because: it's got no last/next runs, even though it's in draft.
+            trigger_node_b1.service,
+            # Due because: its next run is now, and it's published.
+            trigger_node_b2.service,
+            # Due because: it's got no last/next runs, even though it's in draft.
+            trigger_node_c1.service,
+        ]
+
+        # `trigger_node_b2` is the only due service which we've found to be
+        # appropriate for dispatching (its workflow is live/published).
+        assert list(services_dispatched) == [trigger_node_b2.service]
+
+
+@pytest.mark.parametrize(
+    "node_type",
+    [pytest.param(nt, id=nt.type) for nt in automation_node_type_registry.get_all()],
+)
+def test_automation_node_type_has_display_name(node_type):
+    from django.utils.translation import gettext_lazy as _
+
+    assert node_type.display_name != _("Unnamed element"), (
+        f"{type(node_type).__name__}.display_name is still the default 'Unnamed element'"
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "INBOUND_EMAIL_DOMAIN",
+        "INBOUND_EMAIL_WEBHOOK_SECRET",
+        "INBOUND_EMAIL_RECEIVER_URL",
+    ],
+)
+def test_inbound_email_trigger_deactivated_when_any_setting_is_missing(missing):
+    from baserow.contrib.automation.nodes.registries import (
+        automation_node_type_registry,
+    )
+
+    values = {
+        "INBOUND_EMAIL_DOMAIN": "inbound.example.com",
+        "INBOUND_EMAIL_WEBHOOK_SECRET": "s",
+        # Without the receiver URL the sweep cannot delete handed-over messages
+        # and the mail server's disk would grow forever, so the trigger stays off.
+        "INBOUND_EMAIL_RECEIVER_URL": "http://email-receiver:8880",
+        missing: "",
+    }
+    node_type = automation_node_type_registry.get("email_trigger")
+    with override_settings(**values):
+        assert node_type.is_deactivated(None) is True
+
+
+@override_settings(
+    INBOUND_EMAIL_DOMAIN="inbound.example.com",
+    INBOUND_EMAIL_WEBHOOK_SECRET="s",
+    INBOUND_EMAIL_RECEIVER_URL="http://email-receiver:8880",
+)
+def test_inbound_email_trigger_active_when_configured():
+    from baserow.contrib.automation.nodes.registries import (
+        automation_node_type_registry,
+    )
+
+    node_type = automation_node_type_registry.get("email_trigger")
+    assert node_type.is_deactivated(None) is False
+
+
+@pytest.mark.django_db
+@override_settings(INBOUND_EMAIL_DOMAIN="", INBOUND_EMAIL_WEBHOOK_SECRET="")
+def test_create_inbound_email_trigger_blocked_when_unconfigured(data_fixture):
+    from rest_framework.exceptions import PermissionDenied
+
+    from baserow.contrib.automation.nodes.registries import (
+        automation_node_type_registry,
+    )
+    from baserow.contrib.automation.nodes.service import AutomationNodeService
+
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+
+    node_type = automation_node_type_registry.get("email_trigger")
+    with pytest.raises(PermissionDenied):
+        AutomationNodeService().create_node(user, node_type, workflow)
+
+
+def _create_table_of_another_workspace(data_fixture, user):
+    """
+    Returns a table the user can read, in a workspace other than the one of the
+    automation, with an integration of that workspace authorized as the user.
+    """
+
+    builder = data_fixture.create_builder_application(user=user)
+    integration = data_fixture.create_local_baserow_integration(
+        application=builder, authorized_user=user
+    )
+    table = data_fixture.create_database_table(
+        database=data_fixture.create_database_application(workspace=builder.workspace)
+    )
+    field = data_fixture.create_text_field(table=table, primary=True, name="Name")
+    table.get_model().objects.create(**{field.db_column: "Secret"})
+    return table, integration
+
+
+@pytest.mark.django_db
+def test_automation_node_type_dispatch_refuses_integration_of_another_application(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user)
+    table, integration = _create_table_of_another_workspace(data_fixture, user)
+    node = data_fixture.create_automation_node(
+        workflow=workflow,
+        type="local_baserow_list_rows",
+        reference_node_id=workflow.get_trigger().id,
+        service_kwargs={"integration": integration, "table": table},
+    )
+
+    with pytest.raises(ServiceImproperlyConfiguredDispatchException) as exc:
+        node.get_type().dispatch(node, AutomationDispatchContext(workflow, None))
+
+    assert str(exc.value) == (
+        "The integration used by this service belongs to another application."
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("with_integration", [True, False])
+@patch(
+    "baserow.contrib.automation.workflows.handler.AutomationWorkflowHandler.async_start_workflow"
+)
+def test_automation_trigger_node_type_on_event_skips_service_of_another_workspace(
+    mock_async_start_workflow, data_fixture, with_integration
+):
+    user = data_fixture.create_user()
+    table, integration = _create_table_of_another_workspace(data_fixture, user)
+    workflow = data_fixture.create_automation_workflow(
+        user,
+        state=WorkflowState.LIVE,
+        trigger_type="local_baserow_rows_created",
+        trigger_service_kwargs={
+            "table": table,
+            "integration": integration if with_integration else None,
+        },
+    )
+    trigger = workflow.get_trigger()
+    service = trigger.service.specific
+
+    trigger.get_type().on_event(
+        service.get_type().model_class.objects.filter(table=table), [], user=user
+    )
+
+    mock_async_start_workflow.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_automation_trigger_node_type_rejects_table_of_another_workspace(
+    data_fixture,
+):
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(
+        user, trigger_type="local_baserow_rows_created"
+    )
+    trigger = workflow.get_trigger()
+    table, _ = _create_table_of_another_workspace(data_fixture, user)
+
+    with pytest.raises(AutomationNodeMisconfiguredService) as exc:
+        AutomationNodeService().update_node(
+            user,
+            trigger.id,
+            service={
+                "type": "local_baserow_rows_created",
+                "integration_id": None,
+                "table_id": table.id,
+            },
+        )
+
+    assert str(exc.value) == (
+        f"The table with ID {table.id} is not related to the automation "
+        f"{workflow.automation_id}."
+    )
+    trigger.service.refresh_from_db()
+    assert trigger.service.specific.table_id != table.id

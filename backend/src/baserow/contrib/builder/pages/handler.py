@@ -1,0 +1,1104 @@
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+from zipfile import ZipFile
+
+from django.core.files.storage import Storage
+from django.db import IntegrityError, transaction
+from django.db.models import QuerySet
+
+from baserow.contrib.builder.compat.graph_migrator import (
+    ElementToMigrate,
+    PageGraphMigrator,
+)
+from baserow.contrib.builder.constants import IMPORT_SERIALIZED_IMPORTING
+from baserow.contrib.builder.data_sources.handler import DataSourceHandler
+from baserow.contrib.builder.elements.handler import ElementHandler
+from baserow.contrib.builder.elements.permission_manager import (
+    ElementVisibilityPermissionManager,
+)
+from baserow.contrib.builder.elements.types import ElementDictSubClass
+from baserow.contrib.builder.formula_importer import import_formula
+from baserow.contrib.builder.models import Builder
+from baserow.contrib.builder.pages.constants import (
+    ILLEGAL_PATH_SAMPLE_CHARACTER,
+    PAGE_PATH_PARAM_PREFIX,
+    PATH_PARAM_REGEX,
+    QUERY_PARAM_EXACT_MATCH_REGEX,
+)
+from baserow.contrib.builder.pages.exceptions import (
+    DuplicatePageParams,
+    DuplicatePathParamsInPath,
+    InvalidQueryParamName,
+    PageDoesNotExist,
+    PageNotInBuilder,
+    PagePathNotUnique,
+    PathParamNotDefined,
+    PathParamNotInPath,
+    SharedPageIsReadOnly,
+)
+from baserow.contrib.builder.pages.models import Page
+from baserow.contrib.builder.pages.types import (
+    PagePathParams,
+    PageQueryParam,
+    PageQueryParams,
+)
+from baserow.contrib.builder.types import PageDict
+from baserow.contrib.builder.workflow_actions.handler import (
+    BuilderWorkflowActionHandler,
+)
+from baserow.core.cache import global_cache
+from baserow.core.exceptions import IdDoesNotExist
+from baserow.core.psycopg import is_unique_violation_error
+from baserow.core.registries import ImportExportConfig
+from baserow.core.storage import ExportZipFile
+from baserow.core.telemetry.utils import baserow_trace_handler
+from baserow.core.user_sources.handler import UserSourceHandler
+from baserow.core.user_sources.user_source_user import UserSourceUser
+from baserow.core.user_sources.utils import remap_user_source_roles
+from baserow.core.utils import ChildProgressBuilder, MirrorDict, find_unused_name
+
+BUILDER_PAGE_IS_PUBLISHED_CACHE_TTL_SECONDS = 60 * 60
+
+
+@baserow_trace_handler
+class PageHandler:
+    def get_page(self, page_id: int, base_queryset: Optional[QuerySet] = None) -> Page:
+        """
+        Gets a page by ID.
+
+        :param page_id: The ID of the page
+        :param base_queryset: Can be provided to already filter or apply performance
+            improvements to the queryset when it's being executed
+        :raises PageDoesNotExist: If the page doesn't exist
+        :return: The model instance of the Page
+        """
+
+        if base_queryset is None:
+            base_queryset = Page.objects
+
+        try:
+            return base_queryset.select_related("builder__workspace").get(id=page_id)
+        except Page.DoesNotExist:
+            raise PageDoesNotExist()
+
+    def get_shared_page(self, builder: Builder) -> Page:
+        """
+        Returns the shared page for the given builder.
+        """
+
+        return Page.objects.select_related("builder__workspace").get(
+            builder=builder, shared=True
+        )
+
+    def get_pages(self, builder, base_queryset: Optional[QuerySet] = None):
+        """
+        Returns all the page in the current builder.
+        """
+
+        if base_queryset is None:
+            base_queryset = Page.objects.all()
+
+        return base_queryset.filter(builder=builder).select_related(
+            "builder__workspace"
+        )
+
+    def create_shared_page(self, builder: Builder) -> Page:
+        """
+        Creates the shared page of the given builder.
+
+        :param builder: The ID of the builder we want to create the shared page.
+        :return: The model instance of the shared Page
+        """
+
+        return self.create_page(
+            builder, name="__shared__", path="__shared__", shared=True
+        )
+
+    def invalidate_page_cache(self, page):
+        ElementVisibilityPermissionManager.invalidate_builder_element_visibility_cache(
+            page.builder_id
+        )
+
+    def create_page(
+        self,
+        builder: Builder,
+        name: str,
+        path: str,
+        path_params: PagePathParams = None,
+        query_params: PageQueryParam = None,
+        shared: bool = False,
+    ) -> Page:
+        """
+        Creates a new page.
+
+        :param builder: The builder the page belongs to
+        :param name: The name of the page
+        :param path: The path of the page
+        :param path_params: The params of the path provided
+        :param query_params: The query params of the page provided
+        :param shared: If this is the shared page. They should be only one shared page
+          per builder application.
+        :return: The newly created page instance
+        """
+
+        last_order = Page.get_last_order(builder)
+        path_params = path_params or []
+        query_params = query_params or []
+
+        self.is_page_path_valid(path, path_params, raises=True)
+        self.is_page_path_unique(builder, path, raises=True)
+
+        try:
+            page = Page.objects.create(
+                builder=builder,
+                name=name,
+                order=last_order,
+                path=path,
+                path_params=path_params,
+                query_params=query_params,
+                shared=shared,
+                graph={},
+            )
+        except IntegrityError as e:
+            if "unique constraint" in e.args[0] and "path" in e.args[0]:
+                raise PagePathNotUnique(path=path, builder_id=builder.id)
+            raise e
+
+        self.invalidate_page_cache(page)
+
+        return page
+
+    def delete_page(self, page: Page):
+        """
+        Deletes the page provided.
+
+        :param page: The page that must be deleted
+        """
+
+        if page.shared:
+            raise SharedPageIsReadOnly()
+
+        page_id = page.id
+        page.delete()
+
+        self.invalidate_page_cache(page)
+        transaction.on_commit(lambda: self.invalidate_page_public_cache(page_id))
+
+    def update_page(self, page: Page, **kwargs) -> Page:
+        """
+        Updates fields of a page.
+
+        :param page: The page that should be updated
+        :param kwargs: The fields that should be updated with their corresponding value
+        :return: The updated page
+        """
+
+        if page.shared:
+            raise SharedPageIsReadOnly()
+
+        if "path" in kwargs or "path_params" in kwargs:
+            path = kwargs.get("path", page.path)
+            path_params = kwargs.get("path_params", page.path_params)
+
+            self.is_page_path_valid(path, path_params, raises=True)
+            self.is_page_path_unique(
+                page.builder,
+                path,
+                base_queryset=Page.objects_and_trash.exclude(
+                    id=page.id
+                ),  # We don't want to conflict with the current page
+                raises=True,
+            )
+        if "query_params" in kwargs:
+            query_params = kwargs.get("query_params")
+            self.validate_query_params(
+                kwargs.get("path", page.path),
+                kwargs.get("path_params", page.path_params),
+                query_params,
+            )
+
+        for key, value in kwargs.items():
+            setattr(page, key, value)
+
+        try:
+            page.save()
+        except IntegrityError as e:
+            if is_unique_violation_error(e) and "path" in e.args[0]:
+                raise PagePathNotUnique(path=page.path, builder_id=page.builder_id)
+            raise e
+
+        self.invalidate_page_cache(page)
+
+        return page
+
+    def order_pages(
+        self, builder: Builder, order: List[int], base_qs=None
+    ) -> List[int]:
+        """
+        Assigns a new order to the pages in a builder application.
+        You can provide a base_qs for pre-filter the pages affected by this change.
+
+        :param builder: The builder that the pages belong to
+        :param order: The new order of the pages
+        :param base_qs: A QS that can have filters already applied
+        :raises PageNotInBuilder: If the page is not part of the provided builder
+        :return: The new order of the pages
+        """
+
+        if base_qs is None:
+            base_qs = Page.objects_without_shared.filter(builder=builder)
+
+        try:
+            full_order = Page.order_objects(base_qs, order)
+        except IdDoesNotExist as error:
+            raise PageNotInBuilder(error.not_existing_id)
+
+        return full_order
+
+    @classmethod
+    def get_page_public_records_cache_key(
+        cls, page_id: int, user: UserSourceUser, record_name: str
+    ):
+        """
+        Generates the cache key used by the public elements, data sources and workflow
+        actions endpoints. Anonymous and authenticated visitors always get separate
+        cache keys, and authenticated visitors are further separated by role.
+        Callers must authorize authenticated actors against the page before reading
+        this cache; role-based sharing is only valid among actors allowed to access
+        that page.
+
+        Authenticated visitors without a role must not share a key with anonymous
+        visitors: they see different records (e.g. elements restricted to logged-in
+        users), so a shared key would leak one audience's records to the other.
+
+        :param page_id: the ID of the public page being requested.
+        :param user: the `UserSourceUser` performing the HTTP request.
+        :param record_name: one of "elements", "data_sources" or "workflow_actions".
+            Used to differentiate between public view endpoints.
+        :return: the cache key.
+        """
+
+        # Anonymous is the only actor that gets an empty auth segment, so an
+        # authenticated visitor can never share a key with an anonymous one -
+        # even with a blank or missing role. `getattr` guards actors (e.g. a
+        # Django User) that have no `role` attribute at all rather than raising.
+        if user.is_anonymous:
+            auth = ""
+        else:
+            auth = f"_auth_{getattr(user, 'role', '')}"
+        return f"ab_public_page_{page_id}{auth}_{record_name}_records"
+
+    @classmethod
+    def get_page_public_cache_invalidate_key(cls, page_id: int) -> str:
+        """
+        Returns the key invalidating every public cache of a published page: whether
+        it's published and its records for every audience.
+
+        :param page_id: the ID of the public page.
+        :return: the invalidation key.
+        """
+
+        return f"ab_public_page_{page_id}_public_cache"
+
+    @classmethod
+    def invalidate_page_public_cache(cls, page_id: int):
+        """
+        Invalidates every public cache of a published page, so that the next public
+        request reads the page from the database again.
+
+        :param page_id: the ID of the public page.
+        """
+
+        global_cache.invalidate(
+            invalidate_key=cls.get_page_public_cache_invalidate_key(page_id)
+        )
+
+    def is_published_page(self, public_page_id: int) -> bool:
+        """
+        Returns whether this public page ID points to a published domain
+        application or not.
+
+        :param public_page_id: The ID of the public page.
+        :return: whether this public page ID is published or not.
+        """
+
+        return global_cache.get(
+            f"ab_public_page_{public_page_id}_published",
+            default=lambda: self._is_published_application_page(public_page_id),
+            invalidate_key=self.get_page_public_cache_invalidate_key(public_page_id),
+            timeout=BUILDER_PAGE_IS_PUBLISHED_CACHE_TTL_SECONDS,
+        )
+
+    def _is_published_application_page(self, public_page_id: int) -> bool:
+        """
+        Given a *public* page ID, is responsible for returning the published domain
+        application it's associated with.
+
+        :param public_page_id: The ID of the public page.
+        :return: The published domain application associated with the public page.
+        """
+
+        return (
+            Builder.objects.filter(page__id=public_page_id)
+            .exclude(published_from=None)
+            .exists()
+        )
+
+    def duplicate_page(
+        self, page: Page, progress_builder: Optional[ChildProgressBuilder] = None
+    ):
+        """
+        Duplicates an existing page instance.
+
+        :param page: The page that is being duplicated
+        :param progress_builder: A progress object that can be used to report progress
+        :raises ValueError: When the provided page is not an instance of Page.
+        :return: The duplicated page
+        """
+
+        if page.shared:
+            raise SharedPageIsReadOnly()
+
+        start_progress, export_progress, import_progress = 10, 30, 60
+        progress = ChildProgressBuilder.build(progress_builder, child_total=100)
+        progress.increment(by=start_progress)
+
+        builder = page.builder
+
+        exported_page = self.export_page(page)
+
+        # Set a unique name for the page to import back as a new one.
+        exported_page["name"] = self.find_unused_page_name(builder, page.name)
+        exported_page["path"] = self.find_unused_page_path(builder, page.path)
+        exported_page["order"] = Page.get_last_order(builder)
+
+        progress.increment(by=export_progress)
+
+        id_mapping = defaultdict(lambda: MirrorDict())
+        id_mapping["builder_pages"] = MirrorDict()
+        id_mapping["builder_elements"] = {}
+        id_mapping["builder_workflow_actions"] = {}
+
+        shared_data_sources = DataSourceHandler().get_data_sources(
+            page=page.builder.shared_page
+        )
+        # Populate data_sources id_mapping with existing data sources as we want
+        # to keep the same Id for these.
+        id_mapping["builder_data_sources"] = {
+            ds.id: ds.id for ds in shared_data_sources
+        }
+
+        new_page_clone = self.import_page(
+            builder,
+            exported_page,
+            progress=progress.create_child_builder(represents_progress=import_progress),
+            id_mapping=id_mapping,
+            # Service types read `is_duplicate` to keep ids the mapping does
+            # not remap, such as the workflow an action starts or the table it
+            # writes to. A duplicate stays on this instance, so those ids still
+            # refer to the right objects; a file import would drop them.
+            import_export_config=ImportExportConfig(
+                include_permission_data=True,
+                reduce_disk_space_usage=False,
+                exclude_sensitive_data=False,
+                is_duplicate=True,
+            ),
+        )
+
+        return new_page_clone
+
+    def find_unused_page_name(self, builder: Builder, proposed_name: str) -> str:
+        """
+        Finds an unused name for a page in a builder.
+
+        :param builder: The builder that the page belongs to.
+        :param proposed_name: The name that is proposed to be used.
+        :return: A unique name to use.
+        """
+
+        existing_pages_names = list(
+            Page.objects_and_trash.filter(builder=builder).values_list(
+                "name", flat=True
+            )
+        )
+        return find_unused_name([proposed_name], existing_pages_names, max_length=255)
+
+    def find_unused_page_path(self, builder: Builder, proposed_path: str) -> str:
+        """
+        Find an unused path for a page in a builder.
+
+        :param builder: The builder that the page belongs to.
+        :param proposed_path: The path that is proposed to be used.
+        :return: A unique path to use
+        """
+
+        page_path = proposed_path
+        if page_path.endswith("/"):
+            page_path = page_path[:-1]
+
+        existing_paths = list(
+            Page.objects_and_trash.filter(builder=builder).values_list(
+                "path", flat=True
+            )
+        )
+        return find_unused_name(
+            [page_path], existing_paths, max_length=255, suffix="/{0}"
+        )
+
+    def is_page_path_valid(
+        self, path: str, path_params: PagePathParams, raises: bool = False
+    ) -> bool:
+        """
+        Checks if a path object is constructed correctly. If there is a mismatch
+        between the path itself and the path params for example, it becomes an invalid
+        path.
+
+        :param path: The path in question
+        :param path_params: The param definitions of the path provided
+        :param raises: If true, raises exceptions instead of returning a boolean
+        :raises PathParamNotInPath: If the path param is not in the path
+        :raises PathParamNotDefined: If a param in the path was not defined as a path
+            param in the path_params provided
+        :return: If the path is valid
+        """
+
+        path_param_names = [p["name"] for p in path_params]
+
+        # Make sure all path params are also in the path
+        for path_param_name in path_param_names:
+            if f"{PAGE_PATH_PARAM_PREFIX}{path_param_name}" not in path:
+                if raises:
+                    raise PathParamNotInPath(path, path_param_name)
+                return False
+
+        path_params_in_path = PATH_PARAM_REGEX.findall(path)
+        unique_path_params_in_path = set(path_params_in_path)
+
+        if len(unique_path_params_in_path) != len(path_params_in_path):
+            duplicate_path_param_names = [
+                name
+                for name in path_param_names
+                if name not in unique_path_params_in_path
+            ]
+            if raises:
+                raise DuplicatePathParamsInPath(path, duplicate_path_param_names)
+            return False
+
+        for path_param_in_path in path_params_in_path:
+            param_name = path_param_in_path[1:]
+
+            if param_name not in path_param_names:
+                if raises:
+                    raise PathParamNotDefined(path, param_name, path_param_names)
+                return False
+
+        return True
+
+    def validate_query_params(
+        self, path: str, path_params: PagePathParams, query_params: PageQueryParams
+    ) -> bool:
+        """
+        Validates the query parameters of a page.
+
+        :param path: The path of the page.
+        :param path_params: The path parameters defined for the page.
+        :param query_params: The query parameters to validate.
+        :raises InvalidQueryParamName: If a query parameter name doesn't match the
+            required format.
+        :raises DuplicatePageParams: If a query parameter is defined multiple times
+            or clashes with path parameters.
+        :return: True if validation passes.
+        """
+
+        # Extract path param names for checking duplicates
+        path_param_names = [p["name"] for p in path_params]
+
+        # Get list of query param names
+        query_param_names = [p["name"] for p in query_params]
+
+        # Check for duplicates within query params
+        seen_params = set()
+        for param_name in query_param_names:
+            # Validate query param name format using regex
+            if not QUERY_PARAM_EXACT_MATCH_REGEX.match(param_name):
+                raise InvalidQueryParamName(query_param_name=param_name)
+
+            # Check if param name already seen or conflicts with path param
+            if param_name in seen_params or param_name in path_param_names:
+                raise DuplicatePageParams(
+                    param=param_name,
+                    query_param_names=query_param_names,
+                    path_param_names=path_param_names,
+                )
+
+            seen_params.add(param_name)
+
+        return True
+
+    def is_page_path_unique(
+        self,
+        builder: Builder,
+        path: str,
+        base_queryset: QuerySet = None,
+        raises: bool = False,
+    ) -> bool:
+        """
+        Checks if a page path is unique.
+
+        :param builder: The builder that the page belongs to
+        :param path: The path it is trying to set
+        :param raises: If true will raise an exception when the path isn't unique
+        :return: If the path is unique
+        """
+
+        if self.get_page_with_clashing_path(builder, path, base_queryset) is None:
+            return True
+        if raises:
+            raise PagePathNotUnique(path=path, builder_id=builder.id)
+        return False
+
+    def get_page_with_clashing_path(
+        self,
+        builder: Builder,
+        path: str,
+        base_queryset: QuerySet | None = None,
+    ) -> Page | None:
+        """
+        Finds the page whose path clashes with the given path. Paths clash when
+        they only differ in the names of their parameters.
+
+        :param builder: The builder that the page belongs to.
+        :param path: The path to look for.
+        :param base_queryset: The pages to search, trashed ones included by default.
+        :return: The clashing page, or None if the path is free.
+        """
+
+        queryset = Page.objects_and_trash if base_queryset is None else base_queryset
+        pages = queryset.filter(builder=builder).only("id", "name", "path", "trashed")
+
+        path_generalised = self.generalise_path(path)
+        for page in pages:
+            if self.generalise_path(page.path) == path_generalised:
+                return page
+        return None
+
+    def generalise_path(self, path: str) -> str:
+        """
+        Returns a generalised version of a path. This can be useful if we are trying to
+        understand if 2 paths are equivalent even if their path params have different
+        names.
+
+        For 2 paths to be equivalent they need to have the same static parts of the path
+        and the same amount and position of path parameters.
+
+        Equivalent:
+        /product/:id, /product/:new
+        /product/:id/hello/:new, /product/:new/hello/:id
+
+        Not equivalent:
+        /product/:id, /product/:id/:new
+        /product/:id/hello/:new, /product/:id/:new/hello
+
+        By replacing all the path parameters in the path with an illegal path character
+        we can make sure that we can match 2 paths and, they will be the same string if
+        they are indeed a duplicate given the above rules.
+
+        :param path: The path that is being generalised
+        :return: The generalised path
+        """
+
+        return PATH_PARAM_REGEX.sub(ILLEGAL_PATH_SAMPLE_CHARACTER, path)
+
+    def export_page(
+        self,
+        page: Page,
+        import_export_config: Optional[ImportExportConfig] = None,
+        files_zip: Optional[ExportZipFile] = None,
+        storage: Optional[Storage] = None,
+        cache: Optional[Dict[str, any]] = None,
+    ) -> PageDict:
+        """
+        Serializes the given page.
+
+        :param page: The instance to serialize.
+        :param files_zip: A zip file to store files in necessary.
+        :param storage: Storage to use.
+        :return: The serialized version.
+        """
+
+        # Get serialized version of all elements of the current page
+        serialized_elements = [
+            ElementHandler().export_element(
+                e,
+                import_export_config=import_export_config,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+            for e in ElementHandler().get_elements(page=page)
+        ]
+
+        # Get serialized versions of all workflow actions of the current page
+        serialized_workflow_actions = [
+            BuilderWorkflowActionHandler().export_workflow_action(
+                wa,
+                import_export_config=import_export_config,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+            for wa in BuilderWorkflowActionHandler().get_workflow_actions(page=page)
+        ]
+
+        # Get serialized version of all data_sources for the current page
+        serialized_data_sources = [
+            DataSourceHandler().export_data_source(
+                ds,
+                import_export_config=import_export_config,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+            for ds in DataSourceHandler().get_data_sources(page=page)
+        ]
+
+        return PageDict(
+            id=page.id,
+            name=page.name,
+            order=page.order,
+            path=page.path,
+            graph=page.graph,
+            path_params=page.path_params,
+            query_params=page.query_params,
+            shared=page.shared,
+            elements=serialized_elements,
+            data_sources=serialized_data_sources,
+            workflow_actions=serialized_workflow_actions,
+            visibility=page.visibility,
+            role_type=page.role_type,
+            roles=page.roles,
+        )
+
+    def _ops_count_for_import_page(
+        self,
+        serialized_pages: List[Dict[str, Any]],
+    ) -> int:
+        """
+        Count number of steps for the operation. Used to track task progress.
+        """
+
+        return (
+            len(serialized_pages["elements"])
+            + len(serialized_pages["data_sources"])
+            + len(serialized_pages["workflow_actions"])
+            + 1
+        )
+
+    def heal_corrupted_graph(self, page: Page) -> Dict[str, Any]:
+        """
+        Reconcile ``page.graph`` with the element rows that actually exist,
+        repairing every known graph corruption class (orphans, stale points,
+        self-references, dangling references, cycles, converging references,
+        invalid children edges and detached points). The page owns the graph,
+        so this is the single healing entry point; the element-aware logic
+        lives in `PageHealingHandler`.
+
+        :param page: The page whose graph should be reconciled.
+        :return: A graph "patch" — the top-level graph entries that changed,
+            keyed by point id — empty when nothing changed. See
+            `PageHealingHandler.heal_corrupted_graph`.
+        """
+
+        from baserow.contrib.builder.pages.healing_handler import (
+            PageHealingHandler,
+        )
+
+        return PageHealingHandler().heal_corrupted_graph(page)
+
+    def import_pages(
+        self,
+        builder: Builder,
+        serialized_pages: List[Dict[str, Any]],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+        cache: Optional[Dict[str, Any]] = None,
+        import_export_config: Optional[ImportExportConfig] = None,
+    ):
+        """
+        Import multiple pages at once. Especially useful when we have dependencies
+        between element of the page. Page are imported first then other part of
+        the page.
+
+        :param builder: The builder instance the new page should belong to.
+        :param serialized_pages: The serialized version of the pages.
+        :param id_mapping: A map of old->new id per data type
+            when we have foreign keys that need to be migrated.
+        :param files_zip: Contains files to import if any.
+        :param storage: Storage to get the files from.
+        :param progress: A progress object that can be used to report progress.
+        :param cache: A cache to use for the import.
+        :param import_export_config: What kind of import this is. The workflow
+            actions read it to know which of their references to keep.
+        :return: the newly created instances.
+        """
+
+        if cache is None:
+            cache = {}
+
+        child_total = sum(self._ops_count_for_import_page(p) for p in serialized_pages)
+        progress = ChildProgressBuilder.build(progress, child_total=child_total)
+
+        imported_pages = []
+        for serialized_page in serialized_pages:
+            page_instance = self.import_page_only(
+                builder,
+                serialized_page,
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                progress=progress,
+                cache=cache,
+            )
+            imported_pages.append([page_instance, serialized_page])
+
+        for page_instance, serialized_page in imported_pages:
+            self.import_data_sources(
+                page_instance,
+                serialized_page["data_sources"],
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                progress=progress,
+                cache=cache,
+            )
+
+        for page_instance, serialized_page in imported_pages:
+            if not serialized_page.get("graph"):
+                # Old export format: the serialized page has no graph, but
+                # individual elements carry parent_element_id / place_in_container
+                # / order. Build the graph from those fields so that
+                # import_elements can use it for ordering and parent lookups.
+                elements_to_migrate = [
+                    ElementToMigrate(
+                        id=e["id"],
+                        order=e["order"],
+                        parent_element_id=e.get("parent_element_id"),
+                        place_in_container=e.get("place_in_container") or "",
+                    )
+                    for e in serialized_page.get("elements", [])
+                ]
+                page_instance.graph = PageGraphMigrator(elements_to_migrate).to_graph()
+                page_instance.save(update_fields=["graph"])
+
+            self.import_elements(
+                page_instance,
+                serialized_page["elements"],
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                progress=progress,
+                cache=cache,
+            )
+
+        for page_instance, serialized_page in imported_pages:
+            self.import_workflow_actions(
+                page_instance,
+                serialized_page["workflow_actions"],
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                progress=progress,
+                cache=cache,
+                import_export_config=import_export_config,
+            )
+
+        return [i[0] for i in imported_pages]
+
+    def import_page(
+        self,
+        builder: Builder,
+        serialized_page: Dict[str, Any],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+        cache: Optional[Dict[str, any]] = None,
+        import_export_config: Optional[ImportExportConfig] = None,
+    ):
+        """
+        Creates an instance using the serialized version previously exported with
+        `.export_page'.
+
+        :param builder: The builder instance the new page should belong to.
+        :param serialized_page: The serialized version of the page.
+        :param id_mapping: A map of old->new id per data type
+            when we have foreign keys that need to be migrated.
+        :param files_zip: Contains files to import if any.
+        :param storage: Storage to get the files from.
+        :param progress: A progress object that can be used to report progress.
+        :param cache: A cache to use for the import.
+        :param import_export_config: What kind of import this is.
+        :return: the newly created instance.
+        """
+
+        return self.import_pages(
+            builder,
+            [serialized_page],
+            id_mapping,
+            files_zip=files_zip,
+            storage=storage,
+            progress=progress,
+            cache=cache,
+            import_export_config=import_export_config,
+        )[0]
+
+    def import_page_only(
+        self,
+        builder: Builder,
+        serialized_page: Dict[str, Any],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        cache: Optional[Dict[str, any]] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+    ):
+        if "builder_pages" not in id_mapping:
+            id_mapping["builder_pages"] = {}
+
+        shared = serialized_page.get("shared", False)
+
+        if shared:
+            # The shared page has already been created at builder creation. Let's
+            # reuse that one.
+            page_instance = builder.shared_page
+            page_instance.name = serialized_page["name"]
+            page_instance.order = serialized_page["order"]
+            page_instance.path = serialized_page["path"]
+            page_instance.path_params = serialized_page["path_params"]
+            page_instance.graph = serialized_page.get("graph", {})
+            # Persist the serialized graph now. Unlike the non-shared branch
+            # (which saves via Page.objects.create), the shared page is only
+            # mutated in memory here — but import_elements' migrate_graph takes
+            # a row lock that refreshes the in-memory graph from the committed
+            # row, which would otherwise reset it to the empty graph the shared
+            # page was created with and drop the whole serialized structure
+            # (e.g. a multi-page header's children).
+            page_instance.save(
+                update_fields=["name", "order", "path", "path_params", "graph"]
+            )
+        else:
+            # Publishing/importing an application creates new user sources, so
+            # page restrictions must refer to their new default roles as well.
+            roles = serialized_page.get("roles", [])
+            user_sources_mapping = id_mapping.get("user_sources", {})
+            if roles and user_sources_mapping:
+                if cache is None:
+                    cache = {}
+                existing_roles = cache.setdefault("existing_roles", {})
+                if builder.id not in existing_roles:
+                    existing_roles[builder.id] = (
+                        UserSourceHandler().get_all_roles_for_application(builder)
+                    )
+                roles = remap_user_source_roles(
+                    roles, existing_roles[builder.id], user_sources_mapping
+                )
+            # Note: serialized pages exported before the page visibility feature
+            # will not contain the `visibility`, `role_type` or `roles` keys,
+            # so we use the default values for all three values instead.
+            page_instance = Page.objects.create(
+                builder=builder,
+                name=serialized_page["name"],
+                order=serialized_page["order"],
+                path=serialized_page["path"],
+                path_params=serialized_page["path_params"],
+                query_params=serialized_page.get("query_params", []),
+                shared=False,
+                visibility=serialized_page.get("visibility", Page.VISIBILITY_TYPES.ALL),
+                role_type=serialized_page.get("role_type", Page.ROLE_TYPES.ALLOW_ALL),
+                roles=roles,
+                graph=serialized_page.get("graph", {}),
+            )
+
+        id_mapping["builder_pages"][serialized_page["id"]] = page_instance.id
+
+        self.invalidate_page_cache(page_instance)
+
+        progress.increment(state=IMPORT_SERIALIZED_IMPORTING)
+
+        return page_instance
+
+    def import_data_sources(
+        self,
+        page: Page,
+        serialized_data_sources: List[Dict],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+        cache: Optional[Dict[str, any]] = None,
+    ):
+        """
+        Import all page data sources.
+
+        :param page: the page the elements should belong to.
+        :param serialized_data_sources: the list of serialized elements.
+        :param id_mapping: A map of old->new id per data type
+            when we have foreign keys that need to be migrated.
+        :param files_zip: Contains files to import if any.
+        :param storage: Storage to get the files from.
+        :return: the newly created instance list.
+        """
+
+        for serialized_data_source in serialized_data_sources:
+            DataSourceHandler().import_data_source(
+                page,
+                serialized_data_source,
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+            )
+            progress.increment(state=IMPORT_SERIALIZED_IMPORTING)
+
+    def import_elements(
+        self,
+        page: Page,
+        serialized_elements: List[ElementDictSubClass],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+        cache: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Import all page elements following the three-phase pattern
+        (mirroring automation's import_nodes):
+
+        Phase 1: Create all elements (DB records + sub-objects like fields)
+        Phase 2: migrate_graph() — graph now has new IDs
+        Phase 3: Post-processing (property options, field formulas, element
+                 formulas) — can safely use parent_element_id / import context
+
+        :param page: the page the elements should belong to.
+        :param serialized_elements: the list of serialized elements.
+        :param id_mapping: A map of old->new id per data type
+            when we have foreign keys that need to be migrated.
+        :param files_zip: Contains files to import if any.
+        :param storage: Storage to get the files from.
+        :param progress: A progress object that can be used to report progress.
+        :param cache: A cache to use for the import.
+        :return: the newly created instance list.
+        """
+
+        # ── Phase 1: Create all elements ─────────────────────────────
+        if cache is None:
+            cache = {}
+
+        imported_elements = []
+        deferred_import_callbacks = {}
+
+        for serialized_element in serialized_elements:
+            imported_element = ElementHandler().import_element(
+                page,
+                serialized_element,
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+                deferred_import_callbacks=deferred_import_callbacks,
+            )
+
+            imported_elements.append(imported_element)
+
+            if progress:
+                progress.increment(state=IMPORT_SERIALIZED_IMPORTING)
+
+        # ── Phase 2: Migrate graph ───────────────────────────────────
+        # Graph now has new IDs, so parent_element_id works.
+        page.get_graph().migrate_graph(id_mapping)
+
+        # A page graph only ever uses the default `next` output, but an export
+        # can still carry a chain under another output (e.g. "0", written by a
+        # place_in_container on a south position before that was rejected).
+        # migrate_graph preserves such keys; fold the chains back into the
+        # default chain now, otherwise the elements would exist but never
+        # render, and a published page is never opened in the editor, so the
+        # heal would not get a chance to repair it.
+        graph = page.get_graph()
+        graph.merge_non_default_next_edges()
+
+        # If any imported element is still absent from the graph (e.g. when
+        # import_elements is called directly on a page whose graph was not
+        # pre-populated from serialized data), append it so that graph
+        # traversals like parent_element_id work correctly in Phase 3.
+        for element in imported_elements:
+            if str(element.id) not in graph.graph:
+                graph.append(element)
+
+        # ── Phase 3: Post-processing ────────────────────────────────
+        # Now that the graph is populated with new IDs, we can safely
+        # use get_import_context_addition which traverses parent_element_id.
+        element_map = {e.id: e for e in imported_elements}
+
+        updated_models = set()
+        for element in imported_elements:
+            element_type = element.get_type()
+
+            import_context = ElementHandler().get_import_context_addition(
+                element.id, element_map=element_map
+            )
+
+            if deferred_import_callback := deferred_import_callbacks.get(element.id):
+                deferred_import_callback(element, id_mapping, import_context)
+
+            updated_models |= element_type.import_formulas(
+                element,
+                id_mapping,
+                import_formula,
+                **import_context,
+            )
+
+        for m in updated_models:
+            m.save()
+
+        return imported_elements
+
+    def import_workflow_actions(
+        self,
+        page: Page,
+        serialized_workflow_actions: List[Dict],
+        id_mapping: Dict[str, Dict[int, int]],
+        files_zip: Optional[ZipFile] = None,
+        storage: Optional[Storage] = None,
+        progress: Optional[ChildProgressBuilder] = None,
+        cache: Optional[Dict[str, any]] = None,
+        **kwargs,
+    ):
+        """
+        Import all page workflow_actions.
+
+        :param page: the page the elements should belong to.
+        :param serialized_workflow_actions: the list of serialized actions.
+        :param id_mapping: A map of old->new id per data type
+            when we have foreign keys that need to be migrated.
+        :param files_zip: Contains files to import if any.
+        :param storage: Storage to get the files from.
+        :return: the newly created instance list.
+        """
+
+        # Sort action because we might have formula that use previous actions
+        serialized_workflow_actions.sort(key=lambda action: action["order"])
+
+        for serialized_workflow_action in serialized_workflow_actions:
+            BuilderWorkflowActionHandler().import_workflow_action(
+                page,
+                serialized_workflow_action,
+                id_mapping,
+                files_zip=files_zip,
+                storage=storage,
+                cache=cache,
+                **kwargs,
+            )
+            progress.increment(state=IMPORT_SERIALIZED_IMPORTING)

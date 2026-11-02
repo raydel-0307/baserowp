@@ -1,0 +1,428 @@
+import { clone } from '@baserow/modules/core/utils/object'
+import {
+  filterVisibleFieldsFunction,
+  getRowSortFunction,
+  matchSearchFilters,
+} from '@baserow/modules/database/utils/view'
+
+/**
+ * Realtime events for rows changed by a dependency cascade carry a before row
+ * without any field values because the sender doesn't know them.
+ */
+export function isSkeletonRow(row) {
+  return !Object.keys(row).some((key) => key.startsWith('field_'))
+}
+
+/**
+ * Resolves the truthful "before" state of an updated row for realtime handling.
+ *
+ * A skeleton before row is merged onto its buffered copy when the client has one;
+ * an unbuffered skeleton has no knowable old state and returns `null`.
+ *
+ * @param {Object} row The before row, possibly a `{ id }` skeleton.
+ * @param {Function} getBufferedRow Returns the buffered row for an id, or
+ *   `undefined` when it isn't buffered.
+ * @return {Object|null} The base row to compute transitions from, or `null` when
+ *   the old state is unknowable.
+ */
+export function resolveBeforeRow(row, getBufferedRow) {
+  const bufferedRow = getBufferedRow(row.id)
+  if (bufferedRow === undefined && isSkeletonRow(row)) {
+    return null
+  }
+  return bufferedRow !== undefined
+    ? Object.assign(clone(bufferedRow), clone(row))
+    : clone(row)
+}
+
+/** False when the payload omits a visible value that decides where the row was counted. */
+export function canTellIfDeletedRowWasCounted({
+  row,
+  view,
+  fields,
+  fieldOptions,
+  checkSortAndGroupBy = false,
+}) {
+  const filters = view.filters_disabled ? [] : (view.filters ?? [])
+  const decidingItems = checkSortAndGroupBy
+    ? [...filters, ...(view.sortings ?? []), ...(view.group_bys ?? [])]
+    : filters
+  const isVisible = filterVisibleFieldsFunction(fieldOptions)
+  return decidingItems.every(({ field: fieldId }) => {
+    if (row[`field_${fieldId}`] !== undefined) {
+      return true
+    }
+    const field = fields.find((f) => f.id === fieldId)
+    return field === undefined || !isVisible(field)
+  })
+}
+
+/**
+ * Serializes a row to make sure that the values are according to what the API expects.
+ *
+ * If a field doesn't have a value it will be assigned the empty value of the field
+ * type.
+ */
+export function prepareRowForRequest(row, fields, registry) {
+  return fields.reduce((preparedRow, field) => {
+    const name = `field_${field.id}`
+    const fieldType = registry.get('field', field.type)
+
+    if (!fieldType.canWriteFieldValues(field)) {
+      return preparedRow
+    }
+
+    preparedRow[name] = Object.prototype.hasOwnProperty.call(row, name)
+      ? (preparedRow[name] = fieldType.prepareValueForUpdate(field, row[name]))
+      : fieldType.getDefaultValue(field)
+
+    return preparedRow
+  }, {})
+}
+
+/**
+ * This helper function prepares objects that can be used to update a row with an
+ * immediate user experience.
+ *
+ * newRowValues: contains an object of values that can immediately be applied to the
+ * row. It will hold the updated value, and the related field values we can can
+ * update optimisticly.
+ *
+ * oldRowValues: contains an object with the same keys as the newRowValues, but with
+ * their old values. This can be used to revert back to the old values if something
+ * fails.
+ *
+ * updateRequestValues: contains the values that new values prepared for an API
+ * request update. These are the ones you want to pass into the service.
+ */
+export function prepareNewOldAndUpdateRequestValues(
+  row,
+  allFields,
+  field,
+  value,
+  oldValue,
+  registry
+) {
+  const newRowValues = {
+    id: row.id,
+    [`field_${field.id}`]: value,
+  }
+  const oldRowValues = {
+    id: row.id,
+    [`field_${field.id}`]: oldValue,
+  }
+  const updateRequestValues = { id: row.id }
+
+  // Loop over all fields except the one that we're going to update, to figure out
+  // if the `onRowChange` return value of the field has changed. If so, we want to
+  // add that to immediately add that to the `newRowValues` immediately, so that the
+  // update feels instant to the user.
+  allFields
+    .filter((f) => f.id !== field.id)
+    .forEach((fieldToCall) => {
+      const fieldType = registry.get('field', fieldToCall.type)
+      const fieldID = `field_${fieldToCall.id}`
+      const currentFieldValue = row[fieldID]
+      const optimisticFieldValue = fieldType.onRowChange(
+        row,
+        fieldToCall,
+        currentFieldValue
+      )
+
+      if (currentFieldValue !== optimisticFieldValue) {
+        newRowValues[fieldID] = optimisticFieldValue
+        oldRowValues[fieldID] = currentFieldValue
+      }
+    })
+
+  const fieldType = registry.get('field', field.type)
+  const updateValue = fieldType.prepareValueForUpdate(field, value)
+  updateRequestValues[`field_${field.id}`] = updateValue
+
+  return { newRowValues, oldRowValues, updateRequestValues }
+}
+
+/**
+ * Compute the row-form values a brand-new row should start with,
+ * combining: explicit caller-supplied values (highest priority),
+ * view-level default_row_values, and each field type's own default
+ * (`getNewRowValue`). Returns a `{ field_X: rowFormValue, ... }` map
+ * suitable for an optimistic insert; pass each value through the
+ * field type's `prepareValueForUpdate` separately to build the BE
+ * payload.
+ *
+ */
+export function buildNewRowDefaults({
+  view,
+  fields,
+  registry,
+  suppliedValues = {},
+}) {
+  const defaultItems = view?.default_row_values ?? []
+  const defaultsByFieldId = {}
+  for (const item of defaultItems) {
+    if (item.enabled && (item.value != null || item.function)) {
+      defaultsByFieldId[item.field] = item
+    }
+  }
+  const newRow = {}
+  for (const field of fields) {
+    const name = `field_${field.id}`
+    if (name in suppliedValues) {
+      newRow[name] = suppliedValues[name]
+      continue
+    }
+    const fieldTypeKey = field._?.type?.type || field.type
+    const fieldType = registry.get('field', fieldTypeKey)
+    const defaultViewItem = defaultsByFieldId[field.id]
+    const supportedFunctions = fieldType.getSupportedDefaultValueFunctions
+      ? fieldType.getSupportedDefaultValueFunctions().map((f) => f.name)
+      : []
+    if (
+      defaultViewItem?.function &&
+      supportedFunctions.includes(defaultViewItem.function)
+    ) {
+      newRow[name] = fieldType.resolveDefaultValueFunction(
+        defaultViewItem.function,
+        field
+      )
+    } else if (
+      defaultViewItem?.value != null &&
+      (!defaultViewItem.field_type ||
+        defaultViewItem.field_type === fieldTypeKey)
+    ) {
+      newRow[name] = fieldType.parseDefaultRowValue(
+        field,
+        defaultViewItem.value
+      )
+    } else if (fieldType.getNewRowValue) {
+      newRow[name] = fieldType.getNewRowValue(field)
+    }
+  }
+  return newRow
+}
+
+/**
+ * Decide whether a row still belongs at its current position after a change:
+ * whether it still matches the view's filters, and whether it lands at the same
+ * sorted index amongst the comparison set.
+ */
+export function computeRowMatchFlags({
+  row,
+  view,
+  fields,
+  registry,
+  rowsInSortingGroup = [],
+  groupBys = [],
+}) {
+  const matchFilters = view?.filters_disabled
+    ? true
+    : matchSearchFilters(
+        registry,
+        view.filter_type,
+        view.filters ?? [],
+        view.filter_groups ?? [],
+        fields ?? [],
+        row
+      )
+
+  let matchSortings = true
+  if (fields && fields.length > 0) {
+    const sortFn = getRowSortFunction(
+      registry,
+      view?.sortings ?? [],
+      fields,
+      groupBys
+    )
+    const currentIndex = rowsInSortingGroup.findIndex((r) => r.id === row.id)
+    if (currentIndex >= 0) {
+      const rowsForSorting = [...rowsInSortingGroup]
+      rowsForSorting[currentIndex] = {
+        ...rowsForSorting[currentIndex],
+        ...row,
+      }
+      const sorted = rowsForSorting.sort(sortFn)
+      const sortedIndex = sorted.findIndex((r) => r.id === row.id)
+      matchSortings = currentIndex === sortedIndex
+    }
+  }
+
+  return { matchFilters, matchSortings }
+}
+
+/**
+ * Compute the per-cell flags used by the area / checkbox multi-cell
+ * highlight: `{selected, top, right, bottom, left}`. The view's row
+ * component passes this object to `GridViewCell` which uses it to
+ * paint the outer borders only on the rectangle's perimeter (not on
+ * internal cell edges).
+ *
+ * Pure function. Grid row components can call it with their own coordinate
+ * model as long as coordinates use the same model as the grid's
+ * multi-select state: integer row index in the visible row list and integer
+ * field index in the visible fields list.
+ */
+export function computeMultiSelectPosition({
+  isAreaSelectionActive,
+  isCheckboxSelected,
+  rowIndex,
+  fieldIndex,
+  rowIndexRange,
+  fieldIndexRange,
+}) {
+  const position = {
+    selected: false,
+    top: false,
+    right: false,
+    bottom: false,
+    left: false,
+  }
+  if (!isAreaSelectionActive) {
+    if (isCheckboxSelected) position.selected = true
+    return position
+  }
+  const [minRow, maxRow] = rowIndexRange ?? [-1, -1]
+  const [minField, maxField] = fieldIndexRange ?? [-1, -1]
+  if (
+    rowIndex < 0 ||
+    fieldIndex < 0 ||
+    rowIndex < minRow ||
+    rowIndex > maxRow ||
+    fieldIndex < minField ||
+    fieldIndex > maxField
+  ) {
+    return position
+  }
+  position.selected = true
+  if (rowIndex === minRow) position.top = true
+  if (rowIndex === maxRow) position.bottom = true
+  if (fieldIndex === minField) position.left = true
+  if (fieldIndex === maxField) position.right = true
+  return position
+}
+
+/**
+ * Returns an object only containing the read-only values of the row, and the id.
+ * This can be used to update a row with the return data after making an update
+ * request. The reason we need to do this, is because the other values might have
+ * changed in the meantime, and they should not be updated.
+ */
+export function extractRowReadOnlyValues(row, allFields, registry) {
+  const readOnlyValues = { id: row.id }
+  allFields.forEach((field) => {
+    const fieldType = registry.get('field', field.type)
+    const fieldKey = `field_${field.id}`
+    if (
+      fieldType.isReadOnlyField(field) &&
+      Object.prototype.hasOwnProperty.call(row, fieldKey)
+    ) {
+      readOnlyValues[fieldKey] = row[fieldKey]
+    }
+  })
+  return readOnlyValues
+}
+
+export function extractChangedFields(
+  row,
+  allFields,
+  updatedFieldIds,
+  registry
+) {
+  const rowValues = { id: row.id }
+  allFields.forEach((field) => {
+    const fieldType = registry.get('field', field.type)
+    const fieldKey = `field_${field.id}`
+    if (
+      (fieldType.isReadOnlyField(field) &&
+        Object.prototype.hasOwnProperty.call(row, fieldKey)) ||
+      updatedFieldIds.includes(field.id)
+    ) {
+      rowValues[fieldKey] = row[fieldKey]
+    }
+  })
+  return rowValues
+}
+
+/**
+ * Call the given updateFunction with the current value of the row metadata type and
+ * set the new value. If the row metadata type does not exist yet, it will be
+ * created.
+ */
+export function updateRowMetadataType(row, rowMetadataType, updateFunction) {
+  const currentValue = row._.metadata[rowMetadataType]
+  const newValue = updateFunction(currentValue)
+
+  if (!Object.prototype.hasOwnProperty.call(row._.metadata, rowMetadataType)) {
+    const metaDataCopy = clone(row._.metadata)
+    metaDataCopy[rowMetadataType] = newValue
+    row._['metadata'] = metaDataCopy
+  } else {
+    row._.metadata[rowMetadataType] = newValue
+  }
+}
+
+/**
+ * Return the metadata of a row. If the metadata does not exist yet, it will be created
+ * as an empty object.
+ */
+export function getRowMetadata(row, metadata = {}) {
+  return { ...metadata, ...(row.metadata || {}) }
+}
+
+/**
+ * Compute where `row` belongs among `existingRows` according to the given sorts.
+ *
+ * Returns `{ anchorRowId, sortedIndex, isFirst, isLast }`:
+ * - `anchorRowId` is the id of the row immediately before `row` in sorted order,
+ *   or null when `row` sorts first.
+ * - `sortedIndex` is the 0-based position of `row` in the merged, sorted result.
+ *
+ * Expressing the insert position by row identity rather than numeric index lets
+ * both flat-array stores and grouped stores consume the result without
+ * needing to agree on a shared index space.
+ */
+export function computeRowInsertPosition(
+  row,
+  existingRows,
+  sorts,
+  fields,
+  registry,
+  groupBys = []
+) {
+  const sortFn = getRowSortFunction(registry, sorts, fields, groupBys)
+  const sorted = [...existingRows, row].sort(sortFn)
+  const sortedIndex = sorted.findIndex((r) => r.id === row.id)
+  const anchorRowId = sortedIndex > 0 ? sorted[sortedIndex - 1].id : null
+  return {
+    anchorRowId,
+    sortedIndex,
+    isFirst: sortedIndex === 0,
+    isLast: sortedIndex === sorted.length - 1,
+  }
+}
+
+/**
+ * Applies the rows of a `rows_updated` event to the view stores and row modals.
+ */
+export async function applyRowsUpdated(registry, store, data) {
+  const beforeById = Object.fromEntries(
+    (data.rows_before_update || []).map((row) => [row.id, row])
+  )
+  for (const viewType of Object.values(registry.getAll('view'))) {
+    for (const row of data.rows) {
+      await viewType.rowUpdated(
+        { store },
+        data.table_id,
+        store.getters['field/getAll'],
+        beforeById[row.id] || { id: row.id },
+        row,
+        data.metadata[row.id],
+        data.updated_field_ids,
+        'page/'
+      )
+    }
+  }
+  for (const row of data.rows) {
+    store.dispatch('rowModal/updated', { tableId: data.table_id, values: row })
+  }
+}

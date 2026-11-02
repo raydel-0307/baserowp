@@ -1,0 +1,1001 @@
+import kanbanStore from '@baserow_premium/store/view/kanban'
+import fieldStore from '@baserow/modules/database/store/field'
+import { TestApp } from '@baserow/test/helpers/testApp'
+import { UNDO_REDO_ACTION_GROUP_HEADER } from '@baserow/modules/database/utils/action'
+import { vi } from 'vitest'
+import flushPromises from 'flush-promises'
+
+const readActionGroupId = (config) => {
+  const headers = config.headers || {}
+  return typeof headers.get === 'function'
+    ? headers.get(UNDO_REDO_ACTION_GROUP_HEADER)
+    : headers[UNDO_REDO_ACTION_GROUP_HEADER]
+}
+
+describe('Kanban view store', () => {
+  let testApp = null
+  let store = null
+  const view = {
+    filters: [],
+    filters_disabled: false,
+    sortings: [],
+  }
+
+  beforeEach(() => {
+    testApp = new TestApp()
+    store = testApp.createStore({
+      modules: {
+        kanban: kanbanStore,
+        field: fieldStore,
+      },
+    })
+  })
+
+  afterEach(() => {
+    testApp.afterEach()
+  })
+
+  test('createdNewRow', async () => {
+    const stacks = {}
+    stacks.null = {
+      count: 1,
+      results: [{ id: 2, order: '2.00', field_1: null }],
+    }
+    stacks['1'] = {
+      count: 100,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 } },
+        { id: 11, order: '11.00', field_1: { id: 1 } },
+      ],
+    }
+
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = []
+    await store.dispatch('kanban/createdNewRow', {
+      view,
+      values: {
+        id: 1,
+        order: '1.00',
+        field_1: null,
+      },
+      fields,
+    })
+    await store.dispatch('kanban/createdNewRow', {
+      view,
+      values: {
+        id: 3,
+        order: '3.00',
+        field_1: null,
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks.null.count).toBe(3)
+    expect(store.state.kanban.stacks.null.results.length).toBe(3)
+    expect(store.state.kanban.stacks.null.results[0].id).toBe(1)
+    expect(store.state.kanban.stacks.null.results[1].id).toBe(2)
+    expect(store.state.kanban.stacks.null.results[2].id).toBe(3)
+
+    await store.dispatch('kanban/createdNewRow', {
+      view,
+      values: {
+        id: 9,
+        order: '9.00',
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+    await store.dispatch('kanban/createdNewRow', {
+      view,
+      values: {
+        id: 12,
+        order: '12.00',
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(102)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(3)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(9)
+    expect(store.state.kanban.stacks['1'].results[1].id).toBe(10)
+    expect(store.state.kanban.stacks['1'].results[2].id).toBe(11)
+  })
+
+  test('createdNewRow respects view sortings when placing the new row', async () => {
+    // Stack '1' has 2 loaded rows out of 100. Rows are sorted by a number
+    // field (field_2) ascending. The new row's field_2 value (10) falls
+    // between the two loaded rows (5 and 15), so it must be inserted at
+    // index 1, not appended to the end.
+    const stacks = {
+      null: { count: 0, results: [] },
+      1: {
+        count: 100,
+        results: [
+          { id: 10, order: '1.00', field_1: { id: 1 }, field_2: 5 },
+          { id: 11, order: '2.00', field_1: { id: 1 }, field_2: 15 },
+        ],
+      },
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = [{ id: 2, type: 'number', number_decimal_places: 0 }]
+    const sortedView = {
+      filters: [],
+      filters_disabled: false,
+      sortings: [{ field: 2, order: 'ASC', type: 'default' }],
+    }
+
+    // New row has order '3.00' (which would place it last without sortings),
+    // but field_2=10 which is between 5 and 15, so with sortings it must land
+    // at index 1.
+    await store.dispatch('kanban/createdNewRow', {
+      view: sortedView,
+      values: { id: 9, order: '3.00', field_1: { id: 1 }, field_2: 10 },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(101)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(3)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(10)
+    expect(store.state.kanban.stacks['1'].results[1].id).toBe(9)
+    expect(store.state.kanban.stacks['1'].results[2].id).toBe(11)
+  })
+
+  test('deletedExistingRow', async () => {
+    const stacks = {}
+    stacks.null = {
+      count: 1,
+      results: [{ id: 2, order: '2.00', field_1: null }],
+    }
+    stacks['1'] = {
+      count: 100,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 } },
+        { id: 11, order: '11.00', field_1: { id: 1 } },
+      ],
+    }
+
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = []
+
+    await store.dispatch('kanban/deletedExistingRow', {
+      view,
+      row: {
+        id: 2,
+        order: '2.00',
+        field_1: null,
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks.null.count).toBe(0)
+    expect(store.state.kanban.stacks.null.results.length).toBe(0)
+
+    await store.dispatch('kanban/deletedExistingRow', {
+      view,
+      row: {
+        id: 50,
+        order: '50.00',
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+    await store.dispatch('kanban/deletedExistingRow', {
+      view,
+      row: {
+        id: 10,
+        order: '10.00',
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(98)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(1)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(11)
+  })
+
+  test('deletedExistingRow removes a held card from its stack when the payload omits the filtered values', async () => {
+    const results = [
+      { id: 10, order: '10.00', field_1: { id: 1 } },
+      { id: 11, order: '11.00', field_1: { id: 1 } },
+    ]
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks: { 1: { count: 100, results } },
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    await store.dispatch('kanban/deletedExistingRow', {
+      view: {
+        ...view,
+        filter_type: 'AND',
+        filters: [{ id: 1, view: 1, field: 2, type: 'contains', value: 'A' }],
+      },
+      row: { id: 11, order: '11.00' },
+      fields: [{ id: 2, type: 'text' }],
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(99)
+    expect(store.state.kanban.stacks['1'].results.map((r) => r.id)).toEqual([
+      10,
+    ])
+  })
+
+  test('updateRowValue removes the row hidden by the backend and closes its row modal', async () => {
+    const stacks = {}
+    stacks['1'] = {
+      count: 2,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 }, field_2: 'keep', _: {} },
+        { id: 11, order: '11.00', field_1: { id: 1 }, field_2: 'keep', _: {} },
+      ],
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      lastKanbanId: 1,
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+    const fields = [
+      { id: 1, name: 'Stack', type: 'single_select', select_options: [] },
+      { id: 2, name: 'Name', type: 'text' },
+    ]
+    testApp.mock.onPatch('/database/rows/table/1/batch/').reply(200, {
+      items: [{ id: 10, order: '10.00', field_1: { id: 1 }, field_2: 'drop' }],
+      metadata: { updated_field_ids: [2], hidden_row_ids: [10] },
+    })
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    await store.dispatch('kanban/updateRowValue', {
+      view,
+      table: { id: 1 },
+      row: store.state.kanban.stacks['1'].results[0],
+      field: fields[1],
+      fields,
+      value: 'drop',
+      oldValue: 'keep',
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(1)
+    expect(store.state.kanban.stacks['1'].results.map((row) => row.id)).toEqual(
+      [11]
+    )
+    expect(dispatchSpy).toHaveBeenCalledWith('rowModal/rowsHiddenByBackend', {
+      tableId: 1,
+      rowIds: [10],
+    })
+  })
+
+  test('updateRowValue does not send an edit queued behind the edit that hid the row', async () => {
+    const stacks = {}
+    stacks['1'] = {
+      count: 2,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 }, field_2: 'keep', _: {} },
+        { id: 11, order: '11.00', field_1: { id: 1 }, field_2: 'keep', _: {} },
+      ],
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      lastKanbanId: 1,
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+    const fields = [
+      { id: 1, name: 'Stack', type: 'single_select', select_options: [] },
+      { id: 2, name: 'Name', type: 'text' },
+    ]
+    let releaseFirstEdit = null
+    testApp.mock
+      .onPatch('/database/rows/table/1/batch/')
+      .replyOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseFirstEdit = () =>
+              resolve([
+                200,
+                {
+                  items: [
+                    {
+                      id: 10,
+                      order: '10.00',
+                      field_1: { id: 1 },
+                      field_2: 'drop',
+                    },
+                  ],
+                  metadata: { updated_field_ids: [2], hidden_row_ids: [10] },
+                },
+              ])
+          })
+      )
+      .onPatch('/database/rows/table/1/batch/')
+      .reply(401, { error: 'ERROR_PERMISSION_DENIED' })
+    const row = store.state.kanban.stacks['1'].results[0]
+    const edit = (value, oldValue) =>
+      store.dispatch('kanban/updateRowValue', {
+        view,
+        table: { id: 1 },
+        row,
+        field: fields[1],
+        fields,
+        value,
+        oldValue,
+      })
+
+    const firstEdit = edit('drop', 'keep')
+    await flushPromises()
+    const secondEdit = edit('again', 'drop')
+    await flushPromises()
+    releaseFirstEdit()
+    await firstEdit
+    await secondEdit
+
+    expect(testApp.mock.history.patch).toHaveLength(1)
+    expect(store.state.kanban.stacks['1'].count).toBe(1)
+    expect(store.state.kanban.stacks['1'].results.map((row) => row.id)).toEqual(
+      [11]
+    )
+  })
+
+  test('createNewRow does not add the row hidden by the backend', async () => {
+    const stacks = {}
+    stacks['1'] = {
+      count: 1,
+      results: [{ id: 10, order: '10.00', field_1: { id: 1 }, field_2: 'a' }],
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      lastKanbanId: 1,
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+    const fields = [
+      { id: 1, name: 'Stack', type: 'single_select', select_options: [] },
+      { id: 2, name: 'Name', type: 'text' },
+    ]
+    testApp.mock.onPost('/database/rows/table/1/batch/').reply(200, {
+      items: [{ id: 11, order: '11.00', field_1: { id: 1 }, field_2: 'b' }],
+      metadata: { updated_field_ids: [2], hidden_row_ids: [11] },
+    })
+
+    await store.dispatch('kanban/createNewRow', {
+      view,
+      table: { id: 1 },
+      fields,
+      values: { field_1: { id: 1 }, field_2: 'b' },
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(1)
+    expect(store.state.kanban.stacks['1'].results.map((row) => row.id)).toEqual(
+      [10]
+    )
+  })
+
+  test('updatedExistingRow', async () => {
+    const stacks = {}
+    stacks.null = {
+      count: 1,
+      results: [{ id: 2, order: '2.00', field_1: null }],
+    }
+    stacks['1'] = {
+      count: 100,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 } },
+        {
+          id: 11,
+          order: '11.00',
+          field_1: { id: 1 },
+          _: { mustPersist: true },
+        },
+      ],
+    }
+
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = []
+
+    // Should be moved to the first in the buffer
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 11, order: '11.00', field_1: { id: 1 } },
+      values: {
+        order: '9.00',
+      },
+      fields,
+    })
+    // Should be completely ignored because it's outside of the buffer
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 12, order: '12.00', field_1: { id: 1 } },
+      values: {
+        order: '13.00',
+      },
+      fields,
+    })
+    // Did not exist before, but has moved within the buffer.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 8, order: '13.00', field_1: { id: 1 } },
+      values: {
+        order: '8.00',
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks['1'].count).toBe(101)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(3)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(8)
+    expect(store.state.kanban.stacks['1'].results[1].id).toBe(11)
+    expect(store.state.kanban.stacks['1'].results[1]._.mustPersist).toBe(true)
+    expect(store.state.kanban.stacks['1'].results[2].id).toBe(10)
+
+    // Moved to stack `null`, because the position is within the buffer, we expect
+    // it to be added to it.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 8, order: '8.00', field_1: { id: 1 } },
+      values: {
+        field_1: null,
+      },
+      fields,
+    })
+    // Moved to stack `null`, because the position is within the buffer, we expect
+    // it to be added to it.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 11, order: '9.00', field_1: { id: 1 } },
+      values: {
+        field_1: null,
+        order: '1.00',
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks.null.count).toBe(3)
+    expect(store.state.kanban.stacks.null.results.length).toBe(3)
+    expect(store.state.kanban.stacks.null.results[0].id).toBe(11)
+    expect(store.state.kanban.stacks.null.results[0]._.mustPersist).toBe(true)
+    expect(store.state.kanban.stacks.null.results[1].id).toBe(2)
+    expect(store.state.kanban.stacks.null.results[2].id).toBe(8)
+
+    expect(store.state.kanban.stacks['1'].count).toBe(99)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(1)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(10)
+
+    // Moved to stack `1`, because the position is within the buffer, we expect
+    // it to be added to it.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 2, order: '1.00', field_1: null },
+      values: {
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+    // Moved to stack `1`, because the position is outside the buffer, we expect it
+    // not to be in there.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 11, order: '99.00', field_1: null },
+      values: {
+        field_1: { id: 1 },
+      },
+      fields,
+    })
+
+    expect(store.state.kanban.stacks.null.count).toBe(1)
+    expect(store.state.kanban.stacks.null.results.length).toBe(1)
+    expect(store.state.kanban.stacks.null.results[0].id).toBe(8)
+
+    expect(store.state.kanban.stacks['1'].count).toBe(100)
+    expect(store.state.kanban.stacks['1'].results.length).toBe(2)
+    expect(store.state.kanban.stacks['1'].results[0].id).toBe(2)
+    expect(store.state.kanban.stacks['1'].results[1].id).toBe(10)
+  })
+
+  test('stopRowDrag with sortings drops the row from a partial buffer and skips the move call', async () => {
+    // Stack 1 represents a partially-loaded destination: 2 rows visible out of 50.
+    const draggingRow = {
+      id: 5,
+      order: '5.00',
+      field_1: { id: 1 },
+      _: { dragging: true },
+    }
+    const stacks = {
+      null: { count: 0, results: [] },
+      // The dragging row was already moved into the destination stack at the
+      // last loaded index by the in-progress drag (cardMoveOver).
+      1: {
+        count: 50,
+        results: [
+          { id: 10, order: '10.00', field_1: { id: 1 } },
+          { id: 11, order: '11.00', field_1: { id: 1 } },
+          draggingRow,
+        ],
+      },
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      lastKanbanId: 1,
+      singleSelectFieldId: 1,
+      stacks,
+      // Simulate the drag state the same way startRowDrag would have set it.
+      draggingRow,
+      draggingOriginalStackId: 'null',
+      draggingOriginalBefore: null,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = [
+      {
+        id: 1,
+        type: 'single_select',
+        select_options: [{ id: 1, value: 'A', color: 'blue' }],
+      },
+    ]
+    const table = { id: 99 }
+    const view = { sortings: [{ id: 1, field: 1, order: 'ASC' }] }
+
+    let movePatchHit = false
+    let updatePatchHit = false
+    // The single-select update endpoint must be called once; the row move
+    // endpoint must NOT be called when sortings are active.
+    testApp.mock
+      .onPatch(`/database/rows/table/${table.id}/batch/`)
+      .reply((config) => {
+        updatePatchHit = true
+        return [200, { items: JSON.parse(config.data).items }]
+      })
+    testApp.mock
+      .onPatch(`/database/rows/table/${table.id}/${draggingRow.id}/move/`)
+      .reply(() => {
+        movePatchHit = true
+        return [200, draggingRow]
+      })
+
+    await store.dispatch('kanban/stopRowDrag', { table, fields, view })
+
+    expect(updatePatchHit).toBe(true)
+    expect(movePatchHit).toBe(false)
+    // The row was at the last loaded index of a partial buffer, so it has
+    // been removed from the destination's visible buffer; the count stays
+    // unchanged because the row is still in that stack on the server.
+    expect(store.state.kanban.stacks['1'].count).toBe(50)
+    expect(store.state.kanban.stacks['1'].results.map((r) => r.id)).toEqual([
+      10, 11,
+    ])
+  })
+
+  test('stopRowDrag bundles the value update and the move in one action group', async () => {
+    // Dropping into another stack fires both the value update and the move.
+    const draggingRow = {
+      id: 5,
+      order: '5.00',
+      field_1: null,
+      _: { dragging: true },
+    }
+    const stacks = {
+      null: { count: 0, results: [] },
+      1: { count: 1, results: [draggingRow] },
+    }
+    const state = Object.assign(kanbanStore.state(), {
+      lastKanbanId: 1,
+      singleSelectFieldId: 1,
+      stacks,
+      draggingRow,
+      draggingOriginalStackId: 'null',
+      draggingOriginalBefore: null,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = [
+      {
+        id: 1,
+        type: 'single_select',
+        select_options: [{ id: 1, value: 'A', color: 'blue' }],
+      },
+    ]
+    const table = { id: 99 }
+    const noSortView = { sortings: [] }
+
+    let updateGroupId = null
+    let moveGroupId = null
+    testApp.mock
+      .onPatch(`/database/rows/table/${table.id}/batch/`)
+      .reply((config) => {
+        updateGroupId = readActionGroupId(config)
+        return [200, { items: JSON.parse(config.data).items }]
+      })
+    testApp.mock
+      .onPatch(`/database/rows/table/${table.id}/${draggingRow.id}/move/`)
+      .reply((config) => {
+        moveGroupId = readActionGroupId(config)
+        return [200, draggingRow]
+      })
+
+    await store.dispatch('kanban/stopRowDrag', {
+      table,
+      fields,
+      view: noSortView,
+    })
+
+    expect(updateGroupId).toBeTruthy()
+    expect(moveGroupId).toBeTruthy()
+    expect(updateGroupId).toBe(moveGroupId)
+  })
+
+  describe('stopRowDrag to another stack', () => {
+    const filteredView = {
+      filters: [],
+      filter_type: 'AND',
+      filter_groups: [],
+      filters_disabled: false,
+      sortings: [],
+    }
+    const fields = [
+      {
+        id: 1,
+        type: 'single_select',
+        select_options: [{ id: 1, value: 'A', color: 'blue' }],
+      },
+      { id: 2, type: 'formula' },
+    ]
+    const table = { id: 99 }
+
+    const dragRow5FromNullToStack1 = () => {
+      const draggingRow = {
+        id: 5,
+        order: '5.00',
+        field_1: null,
+        field_2: 'old',
+        _: { dragging: true },
+      }
+      const stacks = {
+        null: {
+          count: 1,
+          results: [{ id: 2, order: '2.00', field_1: null, field_2: 'x' }],
+        },
+        1: {
+          count: 2,
+          results: [
+            { id: 10, order: '10.00', field_1: { id: 1 }, field_2: 'x' },
+            draggingRow,
+          ],
+        },
+      }
+      const state = Object.assign(kanbanStore.state(), {
+        lastKanbanId: 7,
+        singleSelectFieldId: 1,
+        stacks,
+        draggingRow,
+        draggingOriginalStackId: 'null',
+        draggingOriginalBefore: null,
+      })
+      store.replaceState({ ...store.state, kanban: state })
+    }
+
+    test('removes the card and skips the move when the backend hides the row', async () => {
+      dragRow5FromNullToStack1()
+      let movePatchHit = false
+      testApp.mock
+        .onPatch(`/database/rows/table/${table.id}/batch/`)
+        .reply(200, {
+          items: [{ id: 5, order: '5.00', field_1: { id: 1 }, field_2: 'new' }],
+          metadata: {
+            updated_field_ids: [1],
+            hidden_row_ids: [5],
+          },
+        })
+      testApp.mock
+        .onPatch(`/database/rows/table/${table.id}/5/move/`)
+        .reply(() => {
+          movePatchHit = true
+          return [200, {}]
+        })
+      const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+      await store.dispatch('kanban/stopRowDrag', {
+        table,
+        fields,
+        view: filteredView,
+      })
+
+      expect(movePatchHit).toBe(false)
+      expect(store.state.kanban.stacks['1'].results.map((r) => r.id)).toEqual([
+        10,
+      ])
+      expect(store.state.kanban.stacks['1'].count).toBe(1)
+      expect(store.state.kanban.stacks.null.results.map((r) => r.id)).toEqual([
+        2,
+      ])
+      expect(store.state.kanban.stacks.null.count).toBe(1)
+      expect(store.getters['kanban/getDraggingRow']).toBeNull()
+      expect(dispatchSpy).toHaveBeenCalledWith('toast/info', {
+        title: 'hiddenRows.title - 1',
+        message: 'hiddenRows.updatedMessage - 1',
+      })
+    })
+
+    test('does not send an edit still queued when the drag hides the row', async () => {
+      const textField = { id: 3, name: 'Notes', type: 'text' }
+      const fieldsWithText = [...fields, textField]
+      const stacks = {
+        null: {
+          count: 1,
+          results: [
+            { id: 5, order: '5.00', field_1: null, field_3: 'a', _: {} },
+          ],
+        },
+        1: {
+          count: 1,
+          results: [{ id: 10, order: '10.00', field_1: { id: 1 }, _: {} }],
+        },
+      }
+      const state = Object.assign(kanbanStore.state(), {
+        lastKanbanId: 7,
+        singleSelectFieldId: 1,
+        stacks,
+      })
+      store.replaceState({ ...store.state, kanban: state })
+      let releaseFirstEdit = null
+      testApp.mock
+        .onPatch(`/database/rows/table/${table.id}/batch/`)
+        .replyOnce(
+          () =>
+            new Promise((resolve) => {
+              releaseFirstEdit = () =>
+                resolve([
+                  200,
+                  {
+                    items: [
+                      { id: 5, order: '5.00', field_1: null, field_3: 'b' },
+                    ],
+                    metadata: { updated_field_ids: [3] },
+                  },
+                ])
+            })
+        )
+        .onPatch(`/database/rows/table/${table.id}/batch/`)
+        .replyOnce(200, {
+          items: [{ id: 5, order: '5.00', field_1: { id: 1 }, field_3: 'b' }],
+          metadata: { updated_field_ids: [1], hidden_row_ids: [5] },
+        })
+        .onPatch(`/database/rows/table/${table.id}/batch/`)
+        .reply(401, { error: 'ERROR_PERMISSION_DENIED' })
+      const row = store.state.kanban.stacks.null.results[0]
+      const edit = (value, oldValue) =>
+        store.dispatch('kanban/updateRowValue', {
+          view: filteredView,
+          table,
+          row,
+          field: textField,
+          fields: fieldsWithText,
+          value,
+          oldValue,
+        })
+
+      const firstEdit = edit('b', 'a')
+      await flushPromises()
+      const secondEdit = edit('c', 'b')
+      await flushPromises()
+      await store.dispatch('kanban/startRowDrag', { row })
+      await store.dispatch('kanban/forceMoveRowTo', {
+        row,
+        targetStackId: '1',
+        targetIndex: 1,
+      })
+      await store.dispatch('kanban/stopRowDrag', {
+        table,
+        fields: fieldsWithText,
+        view: filteredView,
+      })
+      releaseFirstEdit()
+      await firstEdit
+      await secondEdit
+
+      expect(testApp.mock.history.patch).toHaveLength(2)
+      expect(store.state.kanban.stacks['1'].results.map((r) => r.id)).toEqual([
+        10,
+      ])
+    })
+
+    test('updates the card from the batch response and moves it when it stays visible', async () => {
+      dragRow5FromNullToStack1()
+      let movePatchHit = false
+      testApp.mock
+        .onPatch(`/database/rows/table/${table.id}/batch/`)
+        .reply(200, {
+          items: [{ id: 5, order: '5.00', field_1: { id: 1 }, field_2: 'new' }],
+          metadata: { updated_field_ids: [1] },
+        })
+      testApp.mock
+        .onPatch(`/database/rows/table/${table.id}/5/move/`)
+        .reply(() => {
+          movePatchHit = true
+          return [200, { id: 5, order: '11.00' }]
+        })
+
+      await store.dispatch('kanban/stopRowDrag', {
+        table,
+        fields,
+        view: filteredView,
+      })
+
+      const [updateRequest] = testApp.mock.history.patch
+      expect(JSON.parse(updateRequest.data)).toEqual({
+        items: [{ id: 5, field_1: 1 }],
+      })
+      expect(updateRequest.params).toMatchObject({ view: 7 })
+      expect(movePatchHit).toBe(true)
+      expect(store.state.kanban.stacks['1'].results.map((r) => r.id)).toEqual([
+        10, 5,
+      ])
+      expect(store.state.kanban.stacks['1'].count).toBe(2)
+      expect(store.state.kanban.stacks['1'].results[1]).toMatchObject({
+        field_2: 'new',
+        order: '11.00',
+      })
+    })
+  })
+
+  test('updatedExistingRow with a skeleton before row', async () => {
+    const stacks = {}
+    stacks.null = {
+      count: 1,
+      results: [{ id: 2, order: '2.00', field_1: null }],
+    }
+    stacks['1'] = {
+      count: 2,
+      results: [
+        { id: 10, order: '10.00', field_1: { id: 1 } },
+        { id: 11, order: '11.00', field_1: { id: 1 } },
+      ],
+    }
+
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks,
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const fields = []
+
+    // A buffered row must move stacks based on its buffered old state.
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 11 },
+      values: { field_1: null, order: '1.00' },
+      fields,
+    })
+    expect(
+      store.state.kanban.stacks['1'].results.findIndex((r) => r.id === 11)
+    ).toBe(-1)
+    expect(store.state.kanban.stacks.null.results[0].id).toBe(11)
+
+    // A skeleton before row for an unbuffered row has no usable old state, so
+    // the event must be ignored instead of throwing or duplicating cards.
+    const before = JSON.parse(JSON.stringify(store.state.kanban.stacks))
+    await store.dispatch('kanban/updatedExistingRow', {
+      view,
+      row: { id: 99 },
+      values: { order: '5.00', field_1: { id: 1 } },
+      fields,
+    })
+    expect(JSON.parse(JSON.stringify(store.state.kanban.stacks))).toStrictEqual(
+      before
+    )
+  })
+
+  test('deleteStack updates the field in the store instead of throwing', async () => {
+    const singleSelectField = {
+      id: 1,
+      table_id: 99,
+      name: 'Status',
+      type: 'single_select',
+      select_options: [
+        { id: 1, value: 'A', color: 'blue' },
+        { id: 2, value: 'B', color: 'red' },
+      ],
+    }
+
+    const fieldState = Object.assign(fieldStore.state(), {
+      items: [singleSelectField],
+    })
+    store.replaceState({ ...store.state, field: fieldState })
+
+    const state = Object.assign(kanbanStore.state(), {
+      singleSelectFieldId: 1,
+      stacks: {},
+    })
+    store.replaceState({ ...store.state, kanban: state })
+
+    const updatedField = {
+      id: 1,
+      table_id: 99,
+      name: 'Status',
+      type: 'single_select',
+      select_options: [{ id: 1, value: 'A', color: 'blue' }],
+      related_fields: [],
+    }
+    testApp.mock.onPatch('/database/fields/1/').reply(200, updatedField)
+
+    const originalGetAll = store.$registry.getAll.bind(store.$registry)
+    vi.spyOn(store.$registry, 'getAll').mockImplementation((namespace) =>
+      namespace === 'view' ? {} : originalGetAll(namespace)
+    )
+
+    const doFieldUpdate = await store.dispatch('kanban/deleteStack', {
+      singleSelectField,
+      optionId: 2,
+      deferredFieldUpdate: true,
+    })
+
+    await doFieldUpdate()
+
+    expect(store.state.field.items[0].id).toBe(1)
+    expect(store.state.field.items[0].select_options).toHaveLength(1)
+  })
+
+  test('row requests stay within the row page size limit', async () => {
+    const kanbanStoreWithView = testApp.createStore({
+      modules: {
+        kanban: kanbanStore,
+        view: {
+          namespaced: true,
+          getters: { get: () => () => view },
+        },
+      },
+    })
+    const originalLimit =
+      kanbanStoreWithView.$config.public.baserowRowPageSizeLimit
+    kanbanStoreWithView.$config.public.baserowRowPageSizeLimit = 20
+
+    const requests = []
+    testApp.mock.onGet('/database/views/kanban/1/').reply((config) => {
+      requests.push({
+        limit: config.params.get('limit'),
+        selectOptions: config.params.getAll('select_option'),
+      })
+      return [
+        200,
+        { rows: { 1: { count: 30, results: [] } }, field_options: {} },
+      ]
+    })
+
+    try {
+      await kanbanStoreWithView.dispatch('kanban/fetchInitial', {
+        kanbanId: 1,
+        singleSelectFieldId: 1,
+      })
+      await kanbanStoreWithView.dispatch('kanban/fetchMore', {
+        selectOptionId: 1,
+      })
+    } finally {
+      kanbanStoreWithView.$config.public.baserowRowPageSizeLimit = originalLimit
+    }
+
+    expect(requests).toEqual([
+      { limit: '20', selectOptions: [] },
+      { limit: '20', selectOptions: ['1,20,0'] },
+    ])
+  })
+})

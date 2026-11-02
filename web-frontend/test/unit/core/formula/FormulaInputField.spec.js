@@ -1,0 +1,919 @@
+import { TestApp } from '@baserow/test/helpers/testApp'
+import { RuntimeFunctionCollection } from '@baserow/modules/core/functionCollection'
+import { ToTipTapVisitor } from '@baserow/modules/core/formula/tiptap/toTipTapVisitor'
+import { FromTipTapVisitor } from '@baserow/modules/core/formula/tiptap/fromTipTapVisitor'
+import parseBaserowFormula from '@baserow/modules/core/formula/parser/parser'
+import FormulaInputField, {
+  disambiguateMinusOperator,
+} from '@baserow/modules/core/components/formula/FormulaInputField.vue'
+
+// ── disambiguateMinusOperator ──────────────────────────────────────
+
+describe('disambiguateMinusOperator', () => {
+  it('inserts spaces around binary minus before a digit', () => {
+    expect(disambiguateMinusOperator('x-1')).toBe('x - 1')
+  })
+
+  it('does not touch minus at the start of formula', () => {
+    expect(disambiguateMinusOperator('-1')).toBe('-1')
+  })
+
+  it('disambiguates after a closing parenthesis', () => {
+    expect(disambiguateMinusOperator('today()-200')).toBe('today() - 200')
+  })
+
+  it('disambiguates multiple binary minuses', () => {
+    expect(disambiguateMinusOperator('a-1+b-2')).toBe('a - 1+b - 2')
+  })
+
+  it('does not touch minus inside single-quoted strings', () => {
+    expect(disambiguateMinusOperator("'x-1'")).toBe("'x-1'")
+  })
+
+  it('does not touch minus inside double-quoted strings', () => {
+    expect(disambiguateMinusOperator('"x-1"')).toBe('"x-1"')
+  })
+
+  it('handles escaped quotes inside strings', () => {
+    expect(disambiguateMinusOperator("'it\\'s-1'")).toBe("'it\\'s-1'")
+  })
+
+  it('does not disambiguate minus followed by non-digit', () => {
+    expect(disambiguateMinusOperator('x-y')).toBe('x-y')
+  })
+
+  it('disambiguates in complex formula', () => {
+    const input = '(Year(Today())-200)*100+Month(Today())'
+    const result = disambiguateMinusOperator(input)
+    expect(result).toBe('(Year(Today()) - 200)*100+Month(Today())')
+  })
+
+  it('returns empty string for empty input', () => {
+    expect(disambiguateMinusOperator('')).toBe('')
+  })
+
+  it('handles digit-minus-digit', () => {
+    expect(disambiguateMinusOperator('5-3')).toBe('5 - 3')
+  })
+})
+
+// ── Advanced-mode roundtrip ─────────────────────────────────────────
+// A "roundtrip" is the full conversion cycle:
+//   formula string → ANTLR parse → AST → ToTipTapVisitor → TipTap JSON
+//   → FromTipTapVisitor → formula string
+// These tests verify that a formula survives this cycle and comes back
+// semantically equivalent, catching bugs in either visitor.
+
+describe('Advanced mode formula roundtrip', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  function roundtrip(formula) {
+    const functionCollection = new RuntimeFunctionCollection(
+      testApp.store.$registry
+    )
+    const disambiguated = disambiguateMinusOperator(formula)
+    const tree = parseBaserowFormula(disambiguated)
+    const tipTapContent = new ToTipTapVisitor(
+      functionCollection,
+      'advanced'
+    ).visit(tree)
+    const result = new FromTipTapVisitor(functionCollection, 'advanced').visit(
+      tipTapContent
+    )
+    return result
+  }
+
+  it('roundtrips a simple function call', () => {
+    expect(roundtrip('today()')).toBe('today()')
+  })
+
+  it('roundtrips a function with arguments', () => {
+    // Advanced mode visitor drops whitespace around commas
+    expect(roundtrip("if(true, 'yes', 'no')")).toBe("if(true,'yes','no')")
+  })
+
+  it('roundtrips a formula with binary minus', () => {
+    // Minus operator adds a trailing space for disambiguation
+    expect(roundtrip('year(today())-200')).toBe('year(today())-  200')
+  })
+
+  it('roundtrips a complex formula with minus', () => {
+    const formula = '(year(today())-200)*100+month(today())'
+    const result = roundtrip(formula)
+    expect(result).toBe('(year(today())-  200)*100+month(today())')
+  })
+
+  it('roundtrips nested function calls', () => {
+    expect(roundtrip('year(today())')).toBe('year(today())')
+  })
+
+  it('roundtrips grouped expressions', () => {
+    expect(roundtrip('(1+2)*3')).toBe('(1+2)*3')
+  })
+
+  it('roundtrips addition', () => {
+    expect(roundtrip('1+2')).toBe('1+2')
+  })
+
+  it('roundtrips boolean literal', () => {
+    expect(roundtrip('true')).toBe('true')
+  })
+
+  it('roundtrips string literal', () => {
+    expect(roundtrip("'hello'")).toBe("'hello'")
+  })
+
+  it('roundtrips number literal', () => {
+    expect(roundtrip('42')).toBe('42')
+  })
+
+  it('roundtrips decimal literal', () => {
+    expect(roundtrip('3.14')).toBe('3.14')
+  })
+})
+
+// ── Validation on display ───────────────────────────────────────────
+// An invalid stored formula (e.g. one that leaked a `$formula:` prefix)
+// must surface its error state as soon as it is displayed, not only after
+// the user edits the field.
+
+describe('FormulaInputField validates on display', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(() => {
+    testApp.afterEach()
+  })
+
+  async function mountField(value) {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value, mode: 'advanced' },
+    })
+    await wrapper.vm.$nextTick()
+    return wrapper
+  }
+
+  it('flags an invalid initial value without requiring an edit', async () => {
+    const wrapper = await mountField('$formula: now()')
+    expect(wrapper.vm.isFormulaInvalid).toBe(true)
+    expect(wrapper.find('.formula-input-field--error').exists()).toBe(true)
+  })
+
+  it('does not flag a valid initial value', async () => {
+    const wrapper = await mountField('now()')
+    expect(wrapper.vm.isFormulaInvalid).toBe(false)
+    expect(wrapper.find('.formula-input-field--error').exists()).toBe(false)
+  })
+
+  it('re-validates when the displayed value changes', async () => {
+    const wrapper = await mountField('now()')
+    expect(wrapper.vm.isFormulaInvalid).toBe(false)
+
+    await wrapper.setProps({ value: '$formula: now()' })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.vm.isFormulaInvalid).toBe(true)
+  })
+
+  it('emits update:invalid when validity changes', async () => {
+    const wrapper = await mountField('now()')
+    expect(wrapper.emitted('update:invalid')).toBeUndefined()
+
+    await wrapper.setProps({ value: '$formula: now()' })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.emitted('update:invalid').at(-1)).toEqual([true])
+
+    await wrapper.setProps({ value: 'today()' })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.emitted('update:invalid').at(-1)).toEqual([false])
+  })
+
+  it('emits update:invalid for an invalid initial value', async () => {
+    const wrapper = await mountField('$formula: now()')
+    expect(wrapper.emitted('update:invalid').at(-1)).toEqual([true])
+  })
+
+  it('does not flag an incomplete formula in a read-only field', async () => {
+    // Read-only fields display snippets such as the help tooltip's `get()`
+    // example, which is deliberately missing its path.
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: 'get()', mode: 'advanced', readOnly: true },
+    })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.vm.isFormulaInvalid).toBe(false)
+    expect(wrapper.find('.formula-input-field--error').exists()).toBe(false)
+    expect(wrapper.emitted('update:invalid')).toBeUndefined()
+  })
+})
+
+describe('FormulaInputField mode changes', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    await testApp.afterEach()
+  })
+
+  it('keeps an expert formula empty after switching to basic mode', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: 'now()', mode: 'advanced' },
+    })
+
+    wrapper.vm.handleModeChange('simple')
+    await wrapper.setProps({ mode: 'simple' })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.formula-input-field--formula-empty').exists()).toBe(
+      true
+    )
+    expect(wrapper.emitted('input').at(-1)).toEqual([''])
+  })
+
+  it('keeps a basic formula when switching to expert mode', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: 'now()', mode: 'simple' },
+    })
+
+    wrapper.vm.handleModeChange('advanced')
+    await wrapper.setProps({ mode: 'advanced' })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.formula-input-field--formula-empty').exists()).toBe(
+      false
+    )
+    expect(wrapper.emitted('input').at(-1)).toEqual(['now()'])
+  })
+
+  async function mountField(props = {}, slots = {}) {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: {
+        value: '',
+        mode: 'simple',
+        allowRawValues: true,
+        ...props,
+      },
+      slots,
+    })
+    await wrapper.vm.$nextTick()
+    return wrapper
+  }
+
+  it('does not show the raw mode toggle unless raw values are allowed', async () => {
+    const wrapper = await mountField({ allowRawValues: false })
+
+    expect(wrapper.find('.formula-input-field__mode-toggle').exists()).toBe(
+      false
+    )
+  })
+
+  it.each([
+    ['raw', false],
+    ['simple', true],
+    ['advanced', true],
+  ])(
+    'shows the formula toggle active state in %s mode',
+    async (mode, active) => {
+      const wrapper = await mountField({ mode })
+
+      expect(
+        wrapper
+          .find('.formula-input-field__mode-toggle')
+          .classes('formula-input-field__mode-toggle--active')
+      ).toBe(active)
+    }
+  )
+
+  it('renders a default form input in raw mode', async () => {
+    const wrapper = await mountField({
+      value: '#acc8f8',
+      mode: 'raw',
+    })
+
+    const input = wrapper.find('.form-input__input')
+    expect(input.exists()).toBe(true)
+    expect(input.element.value).toBe('#acc8f8')
+
+    await input.setValue('#ffffff')
+    expect(wrapper.emitted('input').at(-1)).toEqual(['#ffffff'])
+  })
+
+  it('renders the raw input slot when provided', async () => {
+    const wrapper = await mountField(
+      {
+        value: 'primary',
+        mode: 'raw',
+      },
+      {
+        'raw-input': `
+          <template #raw-input="{ value, input }">
+            <textarea
+              class="custom-raw-input"
+              :value="value"
+              @input="input($event.target.value)"
+            />
+          </template>
+        `,
+      }
+    )
+
+    const input = wrapper.find('.custom-raw-input')
+    const rawInputContainer = wrapper.find('.formula-input-field__raw-input')
+    expect(input.exists()).toBe(true)
+    expect(rawInputContainer.find('.custom-raw-input').exists()).toBe(true)
+    expect(input.element.value).toBe('primary')
+
+    await input.setValue('secondary')
+    expect(wrapper.emitted('input').at(-1)).toEqual(['secondary'])
+  })
+
+  it('keeps the raw text as a string literal when switching to simple mode', async () => {
+    const wrapper = await mountField({
+      value: "#acc'8f8",
+      mode: 'raw',
+    })
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+
+    // Passed through verbatim the text would be parsed as formula syntax and
+    // be invalid (`Price` is a bare function name), so it becomes a literal.
+    expect(wrapper.emitted('update:mode').at(-1)).toEqual(['simple'])
+    expect(wrapper.emitted('input').at(-1)).toEqual(["'#acc\\'8f8'"])
+
+    // The parent reflects the change back, as v-model does.
+    await wrapper.setProps({ mode: 'simple', value: "'#acc\\'8f8'" })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.formula-input-field--formula-empty').exists()).toBe(
+      false
+    )
+    expect(wrapper.find('.formula-input-field--error').exists()).toBe(false)
+    expect(wrapper.vm.editor.getText()).toContain("#acc'8f8")
+  })
+
+  it('escapes backslashes before quotes when switching raw text to simple mode', async () => {
+    // A lone trailing backslash would otherwise escape the closing quote.
+    const wrapper = await mountField({
+      value: "a\\b'c\\",
+      mode: 'raw',
+    })
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+
+    expect(wrapper.emitted('input').at(-1)).toEqual(["'a\\\\b\\'c\\\\'"])
+
+    await wrapper.setProps({ mode: 'simple', value: "'a\\\\b\\'c\\\\'" })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.find('.formula-input-field--error').exists()).toBe(false)
+    expect(wrapper.vm.editor.getText()).toContain("a\\b'c\\")
+  })
+
+  it('switches an empty raw value to simple mode with an empty formula', async () => {
+    const wrapper = await mountField({ value: '', mode: 'raw' })
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+
+    expect(wrapper.emitted('update:mode').at(-1)).toEqual(['simple'])
+    expect(wrapper.emitted('input').at(-1)).toEqual([''])
+  })
+
+  it('asks for confirmation before switching a populated simple formula to raw mode', async () => {
+    const wrapper = await mountField({
+      value: "'#acc8f8'",
+      mode: 'simple',
+    })
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+
+    expect(wrapper.vm.$refs.rawModeModal.$refs.modal.open).toBe(true)
+    expect(wrapper.emitted('update:mode')).toBeUndefined()
+    expect(wrapper.emitted('input')).toBeUndefined()
+  })
+
+  it('clears a simple formula when confirming the switch to raw mode', async () => {
+    const wrapper = await mountField({
+      value: "'#acc8f8'",
+      mode: 'simple',
+    })
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+    wrapper.vm.$refs.rawModeModal.confirm()
+
+    expect(wrapper.emitted('update:mode').at(-1)).toEqual(['raw'])
+    expect(wrapper.emitted('input').at(-1)).toEqual([''])
+  })
+
+  it('switches an empty simple formula to raw mode without confirmation', async () => {
+    const wrapper = await mountField()
+
+    await wrapper.find('.formula-input-field__mode-toggle').trigger('click')
+
+    expect(wrapper.vm.$refs.rawModeModal.$refs.modal.open).toBe(false)
+    expect(wrapper.emitted('update:mode').at(-1)).toEqual(['raw'])
+    expect(wrapper.emitted('input').at(-1)).toEqual([''])
+  })
+})
+
+// ── Help tooltip example insertion ──────────────────────────────────
+// Clicking an example in the Data Explorer's help tooltip inserts that
+// example's formula into the editor at the cursor.
+
+describe('FormulaInputField example insertion', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    await testApp.afterEach()
+  })
+
+  const example = { formula: "upper('hello')", result: "'HELLO'" }
+
+  /** The editor text without the zero-width spaces used for cursor slots. */
+  function editorText(wrapper) {
+    return wrapper
+      .find('.formula-input-field')
+      .text()
+      .replace(/\u200b/g, '')
+  }
+
+  it('inserts the example into an empty advanced-mode field', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: '', mode: 'advanced' },
+    })
+    expect(wrapper.emitted('input')).toBeUndefined()
+
+    wrapper.vm.handleExampleSelected(example)
+    await wrapper.vm.$nextTick()
+
+    expect(editorText(wrapper)).toBe("upper('hello')")
+    expect(wrapper.emitted('input').at(-1)).toEqual(["upper('hello')"])
+  })
+
+  it('inserts the example at the cursor', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: 'lower()', mode: 'advanced' },
+    })
+    // Place the cursor in the (empty) argument slot of `lower(`: ZWS (1),
+    // function node (1), so position 3 sits right after the function name.
+    wrapper.vm.editor.commands.setTextSelection(3)
+
+    wrapper.vm.handleExampleSelected(example)
+    await wrapper.vm.$nextTick()
+
+    expect(editorText(wrapper)).toBe("lower(upper('hello'))")
+    expect(wrapper.emitted('input').at(-1)).toEqual(["lower(upper('hello'))"])
+  })
+
+  it('ignores examples in simple mode', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: '', mode: 'simple' },
+    })
+
+    wrapper.vm.handleExampleSelected(example)
+    await wrapper.vm.$nextTick()
+
+    expect(editorText(wrapper)).toBe('')
+    expect(wrapper.emitted('input')).toBeUndefined()
+  })
+})
+
+// ── Null value tolerance ────────────────────────────────────────────
+// Legacy stored data can contain `formula: null`, which parents used to pass
+// straight through as the `value` prop. Focusing the field then rendered the
+// explorer context, whose `:has-value="value.length > 0"` binding threw
+// "Cannot read properties of null (reading 'length')".
+
+describe('FormulaInputField tolerates a null value', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(() => {
+    testApp.afterEach()
+  })
+
+  it('opens the explorer context on focus instead of crashing', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: null, mode: 'simple' },
+    })
+    wrapper.vm.isFocused = true
+    await wrapper.vm.$nextTick()
+
+    expect(
+      wrapper.findComponent({ name: 'FormulaInputExplorerContext' }).exists()
+    ).toBe(true)
+  })
+
+  it('emits an empty string instead of null when serialization fails', async () => {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: '', mode: 'simple' },
+    })
+    vi.spyOn(wrapper.vm, 'toFormula').mockReturnValue(null)
+
+    wrapper.vm.emitChange()
+
+    expect(wrapper.emitted('input').at(-1)).toEqual([''])
+  })
+})
+
+// ── Formats ─────────────────────────────────────────────────────────
+// The surface showing the resolved formula can render it as plain text or
+// markdown. The picker lives in the explorer context; the field only shows a
+// badge while a non-plain format is selected and relays the picked format.
+
+describe('FormulaInputField formats', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    await testApp.afterEach()
+  })
+
+  async function mountField(props = {}) {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: {
+        value: "'Name'",
+        mode: 'simple',
+        allowedFormats: ['plain', 'markdown'],
+        ...props,
+      },
+    })
+    await wrapper.vm.$nextTick()
+    return wrapper
+  }
+
+  it('shows a badge while a non-plain format is selected', async () => {
+    const wrapper = await mountField({ format: 'markdown' })
+
+    const badge = wrapper.find('.formula-input-field__format-badge')
+    expect(badge.text()).toBe('M')
+    expect(badge.attributes('title')).toBe('formulaInputField.formatBadgeTitle')
+    expect(badge.attributes('disabled')).toBeUndefined()
+  })
+
+  it('disables the badge with the field', async () => {
+    const wrapper = await mountField({ format: 'markdown', disabled: true })
+
+    expect(
+      wrapper.find('.formula-input-field__format-badge').attributes('disabled')
+    ).toBeDefined()
+  })
+
+  it.each([
+    ['the format is plain', { format: 'plain' }],
+    [
+      'a single format is allowed',
+      { format: 'markdown', allowedFormats: ['markdown'] },
+    ],
+    ['the field is read-only', { format: 'markdown', readOnly: true }],
+  ])('shows no badge when %s', async (_, props) => {
+    const wrapper = await mountField(props)
+
+    expect(wrapper.find('.formula-input-field__format-badge').exists()).toBe(
+      false
+    )
+  })
+
+  it('keeps the badge in raw mode', async () => {
+    // The format applies to the rendering of the value, not to the formula.
+    const wrapper = await mountField({
+      value: 'Name',
+      mode: 'raw',
+      format: 'markdown',
+      allowRawValues: true,
+    })
+
+    expect(wrapper.find('.formula-input-field__format-badge').exists()).toBe(
+      true
+    )
+  })
+
+  it('hands the format and its options to the explorer context', async () => {
+    const wrapper = await mountField({ format: 'markdown' })
+    wrapper.vm.isFocused = true
+    await wrapper.vm.$nextTick()
+
+    const explorer = wrapper.findComponent({
+      name: 'FormulaInputExplorerContext',
+    })
+    expect(explorer.props('format')).toBe('markdown')
+    expect(explorer.props('formatOptions')).toEqual([
+      { value: 'plain', name: 'formulaInputField.formatPlain' },
+      { value: 'markdown', name: 'formulaInputField.formatMarkdown' },
+    ])
+  })
+
+  it('emits the format picked in the explorer context', async () => {
+    const wrapper = await mountField()
+    wrapper.vm.isFocused = true
+    await wrapper.vm.$nextTick()
+
+    wrapper
+      .findComponent({ name: 'FormulaInputExplorerContext' })
+      .vm.$emit('format-changed', 'markdown')
+
+    expect(wrapper.emitted('update:format')).toEqual([['markdown']])
+  })
+})
+
+// ── Enabled modes ───────────────────────────────────────────────────
+// A parent restricts the modes through `enabledModes`. A given mode outside
+// that list falls back to expert mode, the only mode that renders any formula
+// unchanged, and the parent is told so the next edit is saved in that mode.
+
+describe('FormulaInputField enabled modes', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    await testApp.afterEach()
+  })
+
+  /** Only expert mode renders function tokens, so one tells the modes apart. */
+  const functionNode = (wrapper) => wrapper.find('.function-formula-component')
+
+  async function mountField(props) {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: "upper('hello')", ...props },
+    })
+    await wrapper.vm.$nextTick()
+    return wrapper
+  }
+
+  it('falls back to expert mode when the given mode is not enabled', async () => {
+    const wrapper = await mountField({
+      mode: 'simple',
+      enabledModes: ['advanced'],
+    })
+
+    expect(wrapper.emitted('update:mode')).toEqual([['advanced']])
+    expect(functionNode(wrapper).exists()).toBe(true)
+  })
+
+  it('keeps a mode that is enabled', async () => {
+    const wrapper = await mountField({
+      mode: 'simple',
+      enabledModes: ['simple', 'advanced'],
+    })
+
+    expect(wrapper.emitted('update:mode')).toBeUndefined()
+    expect(functionNode(wrapper).exists()).toBe(false)
+  })
+
+  it('never falls back to basic or raw mode', async () => {
+    // Those modes would turn the formula into a literal, so an expert formula
+    // stays in expert mode even when only the other modes are enabled.
+    const wrapper = await mountField({
+      mode: 'advanced',
+      enabledModes: ['raw', 'simple'],
+    })
+
+    expect(wrapper.emitted('update:mode')).toBeUndefined()
+    expect(functionNode(wrapper).exists()).toBe(true)
+  })
+
+  it('follows a later change of the enabled modes', async () => {
+    const wrapper = await mountField({ mode: 'simple' })
+    expect(functionNode(wrapper).exists()).toBe(false)
+
+    await wrapper.setProps({ enabledModes: ['advanced'] })
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.emitted('update:mode')).toEqual([['advanced']])
+    expect(functionNode(wrapper).exists()).toBe(true)
+  })
+})
+
+describe('FormulaInputField reveals clicked nodes in the explorer', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    await testApp.afterEach()
+  })
+
+  async function mountField(value) {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value, mode: 'advanced' },
+    })
+    await wrapper.vm.$nextTick()
+    return wrapper
+  }
+
+  it('reveals a clicked function', async () => {
+    const wrapper = await mountField("concat('a', 'b')")
+
+    await wrapper.find('.function-formula-component').trigger('click')
+
+    expect(wrapper.vm.revealNode).toEqual({ type: 'function', name: 'concat' })
+  })
+
+  it('reveals a clicked operator', async () => {
+    const wrapper = await mountField('1 < 2')
+
+    await wrapper.find('.operator-formula-component').trigger('click')
+
+    expect(wrapper.vm.revealNode).toEqual({ type: 'operator', name: '<' })
+  })
+
+  it('reveals a clicked data node', async () => {
+    const wrapper = await mountField("get('data_source.projects')")
+
+    await wrapper.find('.get-formula-component > div').trigger('click')
+
+    expect(wrapper.vm.revealNode).toEqual({
+      type: 'data',
+      path: 'data_source.projects',
+    })
+  })
+
+  it('reveals the function of a clicked closing parenthesis', async () => {
+    const wrapper = await mountField("concat(upper('a'), 'b')")
+    const closers = wrapper.findAll('[data-formula-closing-paren]')
+
+    await closers[0].trigger('click')
+    expect(wrapper.vm.revealNode).toEqual({ type: 'function', name: 'upper' })
+
+    await closers[1].trigger('click')
+    expect(wrapper.vm.revealNode).toEqual({ type: 'function', name: 'concat' })
+  })
+
+  it('reveals the function of a clicked argument comma', async () => {
+    const wrapper = await mountField("concat(upper('a'), 'b')")
+
+    await wrapper.find('[data-formula-comma]').trigger('click')
+
+    expect(wrapper.vm.revealNode).toEqual({ type: 'function', name: 'concat' })
+  })
+
+  it('does not reveal anything for a grouping parenthesis', async () => {
+    const wrapper = await mountField('(1 + 2)')
+
+    await wrapper.find('[data-group-closing-paren]').trigger('click')
+
+    expect(wrapper.vm.revealNode).toBe(null)
+  })
+
+  it('forgets the revealed node when the field loses focus', async () => {
+    // The explorer reveals `revealNode` whenever it mounts on focus, so a kept
+    // value would reveal it again on every focus, even once deleted.
+    const wrapper = await mountField("concat('a', 'b')")
+    wrapper.vm.isFocused = true
+    await wrapper.find('.function-formula-component').trigger('click')
+    expect(wrapper.vm.revealNode).not.toBe(null)
+
+    wrapper.vm.isFocused = false
+    await wrapper.vm.$nextTick()
+    expect(wrapper.vm.revealNode).toBe(null)
+
+    wrapper.vm.isFocused = true
+    await wrapper.vm.$nextTick()
+    const explorer = wrapper.findComponent({
+      name: 'FormulaInputExplorerContext',
+    })
+    expect(explorer.props('revealNode')).toBe(null)
+  })
+
+  it('reveals the same node again when clicked twice', async () => {
+    const wrapper = await mountField("concat('a', 'b')")
+    const functionNode = wrapper.find('.function-formula-component')
+
+    await functionNode.trigger('click')
+    const firstReveal = wrapper.vm.revealNode
+    await functionNode.trigger('click')
+
+    expect(wrapper.vm.revealNode).toEqual(firstReveal)
+    expect(wrapper.vm.revealNode).not.toBe(firstReveal)
+  })
+
+  it('hands the revealed node to the explorer context', async () => {
+    const wrapper = await mountField("concat('a', 'b')")
+    wrapper.vm.isFocused = true
+    await wrapper.find('.function-formula-component').trigger('click')
+
+    const explorer = wrapper.findComponent({
+      name: 'FormulaInputExplorerContext',
+    })
+    expect(explorer.props('revealNode')).toEqual({
+      type: 'function',
+      name: 'concat',
+    })
+  })
+})
+
+describe('FormulaInputField function help tooltip', () => {
+  let testApp = null
+
+  beforeEach(() => {
+    testApp = new TestApp()
+  })
+
+  afterEach(async () => {
+    vi.useRealTimers()
+    await testApp.afterEach()
+  })
+
+  async function mountField() {
+    const wrapper = await testApp.mount(FormulaInputField, {
+      props: { value: "upper('a')", mode: 'advanced' },
+    })
+    await wrapper.vm.$nextTick()
+    // Only the hide timers must be fake; mounting itself runs on real ones.
+    vi.useFakeTimers()
+    return wrapper
+  }
+
+  /**
+   * Shows the tooltip the way the hover extension does, and returns its
+   * `onHideTooltip` callback, which the extension calls once the mouse has
+   * left the function for a moment.
+   */
+  function showTooltip(wrapper) {
+    const { onShowTooltip, onHideTooltip } =
+      wrapper.vm.editor.extensionManager.extensions.find(
+        (extension) => extension.name === 'functionHelpTooltip'
+      ).options
+    onShowTooltip(wrapper.find('.function-formula-component').element, {
+      name: 'upper',
+      type: 'function',
+    })
+    return onHideTooltip
+  }
+
+  function tooltip(wrapper) {
+    return wrapper.findComponent({ name: 'NodeHelpTooltip' })
+  }
+
+  it('stays open while the mouse is over the tooltip', async () => {
+    const wrapper = await mountField()
+    const onHideTooltip = showTooltip(wrapper)
+
+    tooltip(wrapper).vm.$emit('mouseenter')
+    onHideTooltip()
+    vi.advanceTimersByTime(1000)
+
+    expect(wrapper.vm.hoveredFunctionNode).toEqual({
+      name: 'upper',
+      type: 'function',
+    })
+  })
+
+  it('hides a moment after the mouse leaves the tooltip', async () => {
+    const wrapper = await mountField()
+    const onHideTooltip = showTooltip(wrapper)
+    tooltip(wrapper).vm.$emit('mouseenter')
+    onHideTooltip()
+
+    tooltip(wrapper).vm.$emit('mouseleave')
+    vi.advanceTimersByTime(249)
+    expect(wrapper.vm.hoveredFunctionNode).not.toBe(null)
+
+    vi.advanceTimersByTime(1)
+    expect(wrapper.vm.hoveredFunctionNode).toBe(null)
+  })
+
+  it('stays open when the mouse moves from the tooltip back to a function', async () => {
+    const wrapper = await mountField()
+    showTooltip(wrapper)
+    tooltip(wrapper).vm.$emit('mouseenter')
+
+    tooltip(wrapper).vm.$emit('mouseleave')
+    showTooltip(wrapper)
+    vi.advanceTimersByTime(1000)
+
+    expect(wrapper.vm.hoveredFunctionNode).not.toBe(null)
+  })
+
+  it('hides when the mouse leaves the function without entering the tooltip', async () => {
+    const wrapper = await mountField()
+    const onHideTooltip = showTooltip(wrapper)
+
+    onHideTooltip()
+
+    expect(wrapper.vm.hoveredFunctionNode).toBe(null)
+  })
+})

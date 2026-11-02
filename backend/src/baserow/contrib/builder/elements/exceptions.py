@@ -1,0 +1,33 @@
+class ElementDoesNotExist(Exception):
+    """Raised when trying to get an element that doesn't exist."""
+
+
+class ElementTypeDeactivated(Exception):
+    """Raised when trying create an element of a deactivated type."""
+
+
+class ElementNotInSamePage(Exception):
+    """Raised when trying to move an element before an element on a different page."""
+
+
+class ElementMoveNotAllowed(Exception):
+    """Raised when trying to move an element to a forbidden position."""
+
+
+class CollectionElementPropertyOptionsNotUnique(Exception):
+    """
+    Raised when trying to save a collection element property with non-unique options.
+    """
+
+
+class ElementImproperlyConfigured(Exception):
+    """
+    Raised when we try to use an element that is misconfigured.
+    """
+
+
+class ElementNotMovable(Exception):
+    """
+    Raised when an element is not movable. This can happen if
+    the element's type dictates that it cannot be moved due to its state.
+    """

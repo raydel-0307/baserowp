@@ -1,0 +1,112 @@
+import { ApplicationType } from '@baserow/modules/core/applicationTypes'
+import ApplicationContext from '@baserow/modules/dashboard/components/application/ApplicationContext'
+import DashboardForm from '@baserow/modules/dashboard/components/form/DashboardForm'
+import SidebarComponentDashboard from '@baserow/modules/dashboard/components/sidebar/SidebarComponentDashboard'
+import DashboardTemplateSidebar from '@baserow/modules/dashboard/components/sidebar/DashboardTemplateSidebar'
+import DashboardTemplate from '@baserow/modules/dashboard/components/DashboardTemplate'
+import { DEVELOPMENT_STAGES } from '@baserow/modules/core/constants'
+import { pageFinished } from '@baserow/modules/core/utils/routing'
+import { nextTick } from '#imports'
+
+export class DashboardApplicationType extends ApplicationType {
+  static getType() {
+    return 'dashboard'
+  }
+
+  getIconClass() {
+    return 'baserow-icon-dashboard'
+  }
+
+  getIconColor() {
+    return 'magenta'
+  }
+
+  getName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.dashboard')
+  }
+
+  getNamePlural() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.dashboards')
+  }
+
+  getViewLabel() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.viewDashboard')
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.dashboardDesc')
+  }
+
+  getDefaultName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('applicationType.dashboardDefaultName')
+  }
+
+  supportsTrash() {
+    return false
+  }
+
+  getApplicationContextComponent() {
+    return ApplicationContext
+  }
+
+  getApplicationFormComponent() {
+    return DashboardForm
+  }
+
+  getSidebarComponent() {
+    return SidebarComponentDashboard
+  }
+
+  getTemplateSidebarComponent() {
+    return DashboardTemplateSidebar
+  }
+
+  getTemplatesPageComponent() {
+    return DashboardTemplate
+  }
+
+  getTemplatePage(application) {
+    return {
+      dashboard: application,
+    }
+  }
+
+  delete(application, { $router }) {
+    if (application._.selected) {
+      $router.push({
+        name: 'workspace',
+        params: { workspaceId: application.workspace.id },
+      })
+    }
+  }
+
+  async select(application, { $router }) {
+    try {
+      await $router.push({
+        name: 'dashboard-application',
+        params: {
+          dashboardId: application.id,
+        },
+      })
+      await pageFinished(this.app)
+      await nextTick()
+    } catch (error) {
+      if (error.name !== 'NavigationDuplicated') {
+        throw error
+      }
+    }
+  }
+
+  get developmentStage() {
+    return DEVELOPMENT_STAGES.BETA
+  }
+
+  getOrder() {
+    return 80
+  }
+}

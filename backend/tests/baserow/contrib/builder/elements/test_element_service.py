@@ -1,0 +1,1071 @@
+from unittest.mock import patch
+
+import pytest
+from rest_framework.exceptions import ValidationError as DRFValidationError
+
+from baserow.contrib.builder.elements.exceptions import (
+    ElementDoesNotExist,
+    ElementNotInSamePage,
+)
+from baserow.contrib.builder.elements.handler import ElementHandler
+from baserow.contrib.builder.elements.models import Element
+from baserow.contrib.builder.elements.registries import element_type_registry
+from baserow.contrib.builder.elements.service import ElementService
+from baserow.contrib.builder.pages.exceptions import PageNotInBuilder
+from baserow.core.exceptions import PermissionException
+from baserow.core.graph.exceptions import GraphPointReferencePointInvalid
+from baserow.core.graph.types import GraphPointPosition
+
+
+def pytest_generate_tests(metafunc):
+    if "element_type" in metafunc.fixturenames:
+        metafunc.parametrize(
+            "element_type",
+            [pytest.param(e, id=e.type) for e in element_type_registry.get_all()],
+        )
+
+
+@pytest.mark.django_db
+@patch("baserow.contrib.builder.elements.service.element_created")
+def test_create_element(element_created_mock, data_fixture, element_type):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    shared_page = page.builder.shared_page
+
+    if element_type.is_multi_page_element:
+        page = shared_page
+
+    prev_is_deactivated = element_type.is_deactivated
+    element_type.is_deactivated = lambda x: False
+
+    pytest_params = element_type.get_pytest_params(data_fixture)
+
+    service = ElementService()
+    element = service.create_element(user, element_type, page=page, **pytest_params)
+
+    element_type.is_deactivated = prev_is_deactivated
+
+    last_element = Element.objects.last()
+
+    # Check it's the last element
+    assert last_element.id == element.id
+
+    element_created_mock.send.assert_called_once_with(
+        service, element=element, user=user
+    )
+
+
+@pytest.mark.django_db
+def test_create_element_before(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_heading_element(page=page)
+
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+    element_type = element_type_registry.get("heading")
+    pytest_params = element_type.get_pytest_params(data_fixture)
+
+    element2 = ElementService().create_element(
+        user, element_type, page, element3.id, GraphPointPosition.NORTH, **pytest_params
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element2.id]}},
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+
+@pytest.mark.django_db
+def test_create_element_before_not_same_page(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_heading_element()
+
+    element_type = element_type_registry.get("heading")
+    pytest_params = element_type.get_pytest_params(data_fixture)
+
+    with pytest.raises(ElementNotInSamePage):
+        ElementService().create_element(
+            user,
+            element_type,
+            page=page,
+            reference_element_id=element3.id,
+            **pytest_params,
+        )
+
+
+@pytest.mark.django_db
+def test_create_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+
+    element_type = element_type_registry.get("heading")
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().create_element(
+            user,
+            element_type,
+            page=page,
+            **element_type.get_pytest_params(data_fixture),
+        )
+
+
+@pytest.mark.django_db
+def test_create_element_and_shared_page(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    shared_page = page.builder.shared_page
+
+    regular_element_type = next(
+        filter(lambda t: not t.is_multi_page_element, element_type_registry.get_all())
+    )
+
+    with pytest.raises(DRFValidationError):
+        ElementService().create_element(
+            user=user,
+            element_type=regular_element_type,
+            page=shared_page,
+            **regular_element_type.get_pytest_params(data_fixture),
+        )
+
+    shared_element_type = next(
+        filter(lambda t: t.is_multi_page_element, element_type_registry.get_all())
+    )
+
+    with pytest.raises(DRFValidationError):
+        ElementService().create_element(
+            user=user,
+            element_type=shared_element_type,
+            page=page,
+            **shared_element_type.get_pytest_params(data_fixture),
+        )
+
+
+@pytest.mark.django_db
+def test_element_type_validate_position_rejects_invalid_root_page(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    shared_page = page.builder.shared_page
+
+    regular_element_type = element_type_registry.get("heading")
+    shared_element_type = next(
+        filter(lambda t: t.is_multi_page_element, element_type_registry.get_all())
+    )
+
+    with pytest.raises(DRFValidationError):
+        regular_element_type.validate_position(
+            shared_page, None, "", GraphPointPosition.SOUTH
+        )
+
+    shared_element_type.validate_position(
+        shared_page, None, "", GraphPointPosition.SOUTH
+    )
+
+    with pytest.raises(DRFValidationError):
+        shared_element_type.validate_position(page, None, "", GraphPointPosition.SOUTH)
+
+
+@pytest.mark.django_db
+def test_link_element_type_validate_position_uses_base_validation(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    shared_page = page.builder.shared_page
+
+    link_element_type = element_type_registry.get("link")
+
+    with pytest.raises(DRFValidationError):
+        link_element_type.validate_position(
+            shared_page, None, "", GraphPointPosition.SOUTH
+        )
+
+
+@pytest.mark.django_db
+def test_element_type_validate_position_rejects_child_of_non_container(data_fixture):
+    page = data_fixture.create_builder_page()
+    reference_element = data_fixture.create_builder_heading_element(page=page)
+    element_type = element_type_registry.get("text")
+
+    with pytest.raises(GraphPointReferencePointInvalid):
+        element_type.validate_position(
+            page,
+            reference_element,
+            "",
+            GraphPointPosition.CHILD,
+        )
+
+
+@pytest.mark.django_db
+def test_multi_page_element_type_validate_position_rejects_child_position(
+    data_fixture,
+):
+    page = data_fixture.create_builder_page()
+    shared_page = page.builder.shared_page
+    reference_element = data_fixture.create_builder_column_element(page=shared_page)
+    shared_element_type = next(
+        filter(lambda t: t.is_multi_page_element, element_type_registry.get_all())
+    )
+
+    with pytest.raises(DRFValidationError):
+        shared_element_type.validate_position(
+            shared_page,
+            reference_element,
+            "",
+            GraphPointPosition.CHILD,
+        )
+
+    child_element = data_fixture.create_builder_heading_element(
+        page=shared_page,
+        reference_element=reference_element,
+        position=GraphPointPosition.CHILD,
+    )
+
+    with pytest.raises(DRFValidationError):
+        shared_element_type.validate_position(
+            shared_page,
+            child_element,
+            "",
+            GraphPointPosition.SOUTH,
+        )
+
+
+@pytest.mark.django_db
+def test_element_type_validate_position_as_child_rejects_by_default(data_fixture):
+    page = data_fixture.create_builder_page()
+    reference_element = data_fixture.create_builder_heading_element(page=page)
+
+    with pytest.raises(GraphPointReferencePointInvalid):
+        reference_element.get_type().validate_position_as_child("", reference_element)
+
+
+@pytest.mark.django_db
+def test_get_element(data_fixture):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    assert ElementService().get_element(user, element.id).id == element.id
+
+
+@pytest.mark.django_db
+def test_get_element_does_not_exist(data_fixture):
+    user = data_fixture.create_user()
+
+    with pytest.raises(ElementDoesNotExist):
+        assert ElementService().get_element(user, 0)
+
+
+@pytest.mark.django_db
+def test_get_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().get_element(user, element.id)
+
+
+@pytest.mark.django_db
+def test_get_elements(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_text_element(page=page)
+
+    assert [p.id for p in ElementService().get_elements(user, page)] == [
+        element1.id,
+        element2.id,
+        element3.id,
+    ]
+
+    def exclude_element_1(
+        actor,
+        operation_name,
+        queryset,
+        workspace=None,
+        context=None,
+    ):
+        return queryset.exclude(id=element1.id)
+
+    with stub_check_permissions() as stub:
+        stub.filter_queryset = exclude_element_1
+
+        assert [p.id for p in ElementService().get_elements(user, page)] == [
+            element2.id,
+            element3.id,
+        ]
+
+
+@pytest.mark.django_db
+def test_get_builder_elements(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(builder=page.builder)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_text_element(page=page2)
+
+    def exclude_element_1(
+        actor,
+        operation_name,
+        queryset,
+        workspace=None,
+        context=None,
+    ):
+        return queryset.exclude(id=element1.id)
+
+    with stub_check_permissions() as stub:
+        stub.filter_queryset = exclude_element_1
+
+        assert sorted(
+            [p.id for p in ElementService().get_builder_elements(user, page.builder)]
+        ) == sorted(
+            [
+                element2.id,
+                element3.id,
+            ]
+        )
+
+
+@pytest.mark.django_db
+def test_delete_element(data_fixture):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+    element_id = element.id
+
+    ElementService().delete_element(user, element)
+
+    element.refresh_from_db()
+    assert element.trashed is True
+    assert not Element.objects.filter(id=element_id, trashed=False).exists()
+
+
+@pytest.mark.django_db
+def test_delete_container_element_removes_container_and_graph_entries(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    container = data_fixture.create_builder_column_element(page=page, column_amount=2)
+    child1 = data_fixture.create_builder_heading_element(
+        page=page,
+        position=GraphPointPosition.CHILD,
+        reference_element=container,
+        place_in_container="0",
+    )
+    child2 = data_fixture.create_builder_column_element(
+        page=page,
+        column_amount=1,
+        position=GraphPointPosition.CHILD,
+        reference_element=container,
+        place_in_container="1",
+    )
+    grandchild = data_fixture.create_builder_heading_element(
+        page=page,
+        position=GraphPointPosition.CHILD,
+        reference_element=child2,
+        place_in_container="0",
+    )
+
+    ElementService().delete_element(user, container)
+
+    container.refresh_from_db()
+    assert container.trashed is True
+
+    # Children are soft-deleted (trashed) alongside the container so they can be
+    # restored if the container is restored. Not accessible via the default manager.
+    assert not Element.objects.filter(
+        id__in=[child1.id, child2.id, grandchild.id]
+    ).exists()
+    assert (
+        Element.trash.filter(id__in=[child1.id, child2.id, grandchild.id]).count() == 3
+    )
+
+    # All graph entries for the container and its descendants are gone.
+    page.refresh_from_db(fields=["graph"])
+    for element_id in [container.id, child1.id, child2.id, grandchild.id]:
+        assert str(element_id) not in page.graph
+    assert page.graph == {}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_delete_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().delete_element(user, element)
+
+
+@pytest.mark.django_db
+@patch("baserow.contrib.builder.elements.service.element_updated")
+def test_update_element(element_updated_mock, data_fixture):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    service = ElementService()
+    updated = service.update_element(user, element, value="newValue")
+
+    element_updated_mock.send.assert_called_once_with(
+        service, element=updated.element, user=user
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().update_element(user, element, value="newValue")
+
+
+@pytest.mark.django_db
+@patch("baserow.contrib.builder.elements.service.element_moved")
+def test_move_element(element_moved_mock, data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_text_element(page=page)
+
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element2.id]}},
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+    service = ElementService()
+    service.move_element(
+        user,
+        page,
+        element3,
+        element3.place_in_container,
+        element2.id,
+        GraphPointPosition.NORTH,
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element3.id]}},
+        str(element3.id): {"next": {"": [element2.id]}},
+        str(element2.id): {},
+    }
+
+    element_moved_mock.send.assert_called_once_with(
+        service,
+        element=element3,
+        source_page=page,
+        position=GraphPointPosition.NORTH,
+        reference_element=element2,
+        user=user,
+    )
+
+
+@pytest.mark.django_db
+def test_move_orphan_element_makes_it_join_the_graph(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+
+    # An element that exists in the DB but isn't in the page graph (an "orphan",
+    # e.g. created during a not-yet-zero-downtime deployment). create_element does
+    # not insert into the graph, so this leaves it absent from it.
+    orphan = ElementHandler().create_element(
+        element_type_registry.get("heading"), page=page
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert str(orphan.id) not in page.graph
+
+    # Moving the orphan must not raise; it should join the graph at the requested
+    # position.
+    move = ElementService().move_element(
+        user,
+        page,
+        ElementHandler().get_element_for_update(orphan.id),
+        "",
+        element1.id,
+        GraphPointPosition.SOUTH,
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [orphan.id]}},
+        str(orphan.id): {},
+    }
+
+    # There is no prior position for an orphan, so the move records an
+    # append-to-end-of-root position (used by undo to send it back to the bottom).
+    assert move.previous_reference_element is None
+    assert move.previous_position == GraphPointPosition.SOUTH
+    assert move.previous_output == ""
+
+
+@pytest.mark.django_db
+def test_move_element_not_same_builder(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_text_element(page=page2)
+
+    with pytest.raises(PageNotInBuilder):
+        ElementService().move_element(
+            user,
+            page,
+            element3,
+            element3.place_in_container,
+            element2.id,
+            GraphPointPosition.SOUTH,
+        )
+
+
+@pytest.mark.django_db
+def test_move_element_relative_to_itself_is_disallowed(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element = data_fixture.create_builder_heading_element(page=page)
+
+    with pytest.raises(GraphPointReferencePointInvalid):
+        ElementService().move_element(
+            user,
+            page,
+            element,
+            element.place_in_container,
+            element.id,  # the element references itself
+            GraphPointPosition.SOUTH,
+        )
+
+
+@pytest.mark.django_db
+def test_move_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_text_element(page=page)
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().move_element(
+            user,
+            page,
+            element3,
+            element3.place_in_container,
+            element2,
+            GraphPointPosition.SOUTH,
+        )
+
+
+@pytest.mark.django_db
+@patch("baserow.contrib.builder.elements.service.elements_created")
+def test_duplicate_element(elements_created_mock, data_fixture):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    service = ElementService()
+    result = service.duplicate_element(user, element)
+
+    elements_created_mock.send.assert_called_once_with(
+        service,
+        elements=result["elements"],
+        workflow_actions=result["workflow_actions"],
+        user=user,
+        page=element.page,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_duplicate_element_permission_denied(data_fixture, stub_check_permissions):
+    user = data_fixture.create_user()
+    element = data_fixture.create_builder_heading_element(user=user)
+
+    with (
+        stub_check_permissions(raise_permission_denied=True),
+        pytest.raises(PermissionException),
+    ):
+        ElementService().duplicate_element(user, element)
+
+
+@pytest.mark.django_db
+def test_move_element_end_of_page(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_heading_element(page=page)
+
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element2.id]}},
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+    ElementService().move_element(
+        user,
+        page,
+        element1,
+        element1.place_in_container,
+        element3.id,
+        GraphPointPosition.SOUTH,
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph == {
+        "0": element2.id,
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {"next": {"": [element1.id]}},
+        str(element1.id): {},
+    }
+
+
+@pytest.mark.django_db
+def test_move_element_into_container_with_null_place_in_container(data_fixture):
+    # Regression: moving an element into a container with a null place_in_container
+    # (which the move endpoint accepts) must land it in the default "" slot, never a
+    # bogus "None" slot key.
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    container = ElementService().create_element(
+        user, element_type_registry.get("simple_container"), page=page
+    )
+    heading = data_fixture.create_builder_heading_element(page=page)
+
+    ElementService().move_element(
+        user,
+        page,
+        ElementHandler().get_element_for_update(heading.id),
+        None,  # place_in_container
+        container.id,
+        GraphPointPosition.CHILD,
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph[str(container.id)]["children"] == {"": [heading.id]}
+    assert "None" not in page.graph[str(container.id)]["children"]
+
+
+@pytest.mark.django_db
+def test_move_element_before(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    element1 = data_fixture.create_builder_heading_element(page=page)
+    element2 = data_fixture.create_builder_heading_element(page=page)
+    element3 = data_fixture.create_builder_heading_element(page=page)
+
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element2.id]}},
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+    ElementService().move_element(
+        user,
+        page,
+        element3,
+        element3.place_in_container,
+        element2.id,
+        GraphPointPosition.NORTH,
+    )
+
+    page.refresh_from_db(fields=["graph"])
+    assert page.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element3.id]}},
+        str(element3.id): {"next": {"": [element2.id]}},
+        str(element2.id): {},
+    }
+
+
+@pytest.mark.django_db
+def test_moving_elements_inside_container(data_fixture):
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    container = data_fixture.create_builder_column_element(page=page)
+    root_element = data_fixture.create_builder_text_element(page=page)
+    element_inside_container_one = data_fixture.create_builder_text_element(
+        page=page,
+        place_in_container="1",
+        reference_element=container,
+        position=GraphPointPosition.CHILD,
+    )
+    element_inside_container_two = data_fixture.create_builder_text_element(
+        page=page,
+        place_in_container="1",
+        reference_element=container,
+        position=GraphPointPosition.CHILD,
+    )
+
+    assert page.graph == {
+        "0": container.id,
+        str(container.id): {
+            "next": {"": [root_element.id]},
+            "children": {"1": [element_inside_container_one.id]},
+        },
+        str(element_inside_container_one.id): {
+            "next": {"": [element_inside_container_two.id]}
+        },
+        str(element_inside_container_two.id): {},
+        str(root_element.id): {},
+    }
+
+    # A place only accompanies a `child` position; a sibling move inside the
+    # same slot sends the default "" output.
+    ElementService().move_element(
+        user,
+        page,
+        element_inside_container_two,
+        "",
+        element_inside_container_one.id,
+        GraphPointPosition.NORTH,
+    )
+
+    assert page.graph == {
+        "0": container.id,
+        str(container.id): {
+            "next": {"": [root_element.id]},
+            "children": {"1": [element_inside_container_two.id]},
+        },
+        str(element_inside_container_two.id): {
+            "next": {"": [element_inside_container_one.id]}
+        },
+        str(element_inside_container_one.id): {},
+        str(root_element.id): {},
+    }
+
+
+@pytest.mark.django_db
+def test_move_element_cross_page_migrates_container_subtree(data_fixture):
+    """
+    Moving a container element across pages must migrate its whole subtree (the
+    container *and* its descendants) into the target page's graph. Previously the
+    cross-graph move only relocated the root point, so the children's page_id was
+    updated in the DB but their graph entries never reached the target page,
+    leaving the target graph inconsistent.
+    """
+
+    user = data_fixture.create_user()
+    page1 = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(builder=page1.builder)
+
+    container = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("column"),
+        page=page1,
+    )
+    child = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("heading"),
+        page=page1,
+        reference_element_id=container.id,
+        position=GraphPointPosition.CHILD,
+        place_in_container="0",
+    )
+
+    assert str(container.id) in page1.graph
+    assert str(child.id) in page1.graph
+
+    ElementService().move_element(
+        user,
+        page2,
+        container,
+        "",
+        None,
+        GraphPointPosition.SOUTH,
+    )
+
+    page1.refresh_from_db(fields=["graph"])
+    page2.refresh_from_db(fields=["graph"])
+    container.refresh_from_db(fields=["page"])
+    child.refresh_from_db(fields=["page"])
+
+    # Both elements moved to page2 in the DB.
+    assert container.page_id == page2.id
+    assert child.page_id == page2.id
+
+    # The whole subtree is present in the target graph (not just the container).
+    assert str(container.id) in page2.graph
+    assert str(child.id) in page2.graph
+    assert page2.graph[str(container.id)]["children"]["0"] == [child.id]
+
+    # The source graph no longer references either element.
+    assert str(container.id) not in page1.graph
+    assert str(child.id) not in page1.graph
+
+
+@pytest.mark.django_db
+def test_move_element_cross_page_moves_its_workflow_action(data_fixture):
+    # A workflow action has its own page foreign key. When its element moves to
+    # another page (e.g. to/from the shared page) the action must follow, not be
+    # left behind on the source page.
+    user = data_fixture.create_user()
+    page1 = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(builder=page1.builder)
+
+    button = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("button"),
+        page=page1,
+    )
+    workflow_action = data_fixture.create_notification_workflow_action(element=button)
+    assert workflow_action.page_id == page1.id
+
+    ElementService().move_element(
+        user, page2, button, "", None, GraphPointPosition.SOUTH
+    )
+
+    workflow_action.refresh_from_db(fields=["page"])
+    assert workflow_action.page_id == page2.id
+
+
+@pytest.mark.django_db
+def test_move_element_cross_page_moves_descendant_workflow_actions(data_fixture):
+    # Moving a container cross-page must move the workflow actions of its
+    # descendants too, since each element in the subtree changes page.
+    user = data_fixture.create_user()
+    page1 = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(builder=page1.builder)
+
+    container = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("column"),
+        page=page1,
+    )
+    child_button = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("button"),
+        page=page1,
+        reference_element_id=container.id,
+        position=GraphPointPosition.CHILD,
+        place_in_container="0",
+    )
+    workflow_action = data_fixture.create_notification_workflow_action(
+        element=child_button
+    )
+    assert workflow_action.page_id == page1.id
+
+    ElementService().move_element(
+        user, page2, container, "", None, GraphPointPosition.SOUTH
+    )
+
+    child_button.refresh_from_db(fields=["page"])
+    workflow_action.refresh_from_db(fields=["page"])
+    assert child_button.page_id == page2.id
+    assert workflow_action.page_id == page2.id
+
+
+@pytest.mark.django_db
+def test_move_element_same_page_keeps_workflow_action(data_fixture):
+    # A same-page reorder must not touch the workflow action's page.
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    first = data_fixture.create_builder_heading_element(page=page)
+    button = ElementService().create_element(
+        user=user,
+        element_type=element_type_registry.get("button"),
+        page=page,
+    )
+    workflow_action = data_fixture.create_notification_workflow_action(element=button)
+
+    ElementService().move_element(
+        user, page, button, "", first.id, GraphPointPosition.NORTH
+    )
+
+    workflow_action.refresh_from_db(fields=["page"])
+    assert workflow_action.page_id == page.id
+
+
+@pytest.mark.django_db
+def test_move_element_cross_page_removes_entry_from_source_graph(data_fixture):
+    """
+    Moving an element from one page to another must remove the element's graph
+    entry from the source page's graph.  Before this fix, move() preserved the
+    entry (via remove(keep_info=True)) and never cleaned it up, leaving stale
+    'X: {}' nodes that broke export/import.
+    """
+
+    user = data_fixture.create_user()
+    page1 = data_fixture.create_builder_page(user=user)
+    page2 = data_fixture.create_builder_page(builder=page1.builder)
+
+    element1 = data_fixture.create_builder_heading_element(page=page1)
+    element2 = data_fixture.create_builder_heading_element(page=page1)
+    element3 = data_fixture.create_builder_heading_element(page=page1)
+
+    # Sanity-check initial state: page1 has a clean chain, page2 is empty.
+    assert page1.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element2.id]}},
+        str(element2.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+    assert page2.graph == {}
+
+    # Move element2 from page1 to page2 (append to end, i.e. null reference + south).
+    ElementService().move_element(
+        user,
+        page2,
+        element2,
+        element2.place_in_container,
+        None,
+        GraphPointPosition.SOUTH,
+    )
+
+    page1.refresh_from_db(fields=["graph"])
+    page2.refresh_from_db(fields=["graph"])
+
+    # element2 must NOT appear as a key in the source graph.
+    assert str(element2.id) not in page1.graph, (
+        f"Stale entry for element {element2.id} found in source page graph: "
+        f"{page1.graph}"
+    )
+
+    # Source chain relinked correctly: element1 → element3.
+    assert page1.graph == {
+        "0": element1.id,
+        str(element1.id): {"next": {"": [element3.id]}},
+        str(element3.id): {},
+    }
+
+    # element2 is properly placed in the target graph.
+    assert page2.graph == {
+        "0": element2.id,
+        str(element2.id): {},
+    }
+
+
+@pytest.mark.django_db(transaction=False)
+def test_graph_mutations_lock_the_page_row(data_fixture):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    heading = element_type_registry.get("heading")
+
+    # Creating an element inserts into the page graph; the graph is a single
+    # JSON document written back whole, so the mutation must take a row lock
+    # on the page (concurrent read-modify-writes were the root cause of the
+    # graph corruption incidents).
+    with CaptureQueriesContext(connection) as ctx:
+        ElementService().create_element(user, heading, page=page)
+
+    assert any(
+        "FOR UPDATE" in query["sql"] and "builder_page" in query["sql"]
+        for query in ctx.captured_queries
+    )
+
+
+@pytest.mark.django_db
+def test_write_through_stale_page_instance_does_not_lose_concurrent_update(
+    data_fixture,
+):
+    # Deterministic replay of the lost-update interleaving behind the graph
+    # corruption incidents: request 1 loads the page, request 2 commits a graph
+    # change, then request 1 writes through its now-stale page instance.
+    # The pre-lock read-modify-write overwrote the whole graph JSON and lost
+    # request 2's element; the lock + in-place refresh must preserve both.
+    from django.db import transaction
+
+    from baserow.contrib.builder.pages.models import Page
+    from baserow.core.cache import local_cache
+
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    heading = element_type_registry.get("heading")
+
+    # "Request 1" loads its page instance first...
+    stale_page = Page.objects.get(id=page.id)
+
+    # ...then "request 2" creates an element and commits.
+    with local_cache.context(), transaction.atomic():
+        e1 = ElementService().create_element(
+            user, heading, page=Page.objects.get(id=page.id)
+        )
+
+    # "Request 1" now creates an element through its stale instance.
+    with local_cache.context(), transaction.atomic():
+        e2 = ElementService().create_element(user, heading, page=stale_page)
+
+    final_graph = Page.objects.get(id=page.id).graph
+    assert final_graph == {
+        "0": e1.id,
+        str(e1.id): {"next": {"": [e2.id]}},
+        str(e2.id): {},
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_element_creations_both_land_in_graph(data_fixture):
+    # True two-connection race: both transactions insert into the same page
+    # graph at the same time. The page row lock must serialise them so that
+    # neither write is lost and the resulting chain is consistent.
+    import threading
+
+    from django.db import connection, transaction
+
+    from baserow.contrib.builder.pages.models import Page
+    from baserow.core.cache import local_cache
+
+    user = data_fixture.create_user()
+    page = data_fixture.create_builder_page(user=user)
+    heading = element_type_registry.get("heading")
+
+    barrier = threading.Barrier(2)
+    created_ids = []
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=10)
+            with local_cache.context(), transaction.atomic():
+                element = ElementService().create_element(
+                    user, heading, page=Page.objects.get(id=page.id)
+                )
+            created_ids.append(element.id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    graph = Page.objects.get(id=page.id).graph
+    root_id = graph["0"]
+    # Both elements landed: one is the root, the other its next, and nothing
+    # else is in the graph.
+    assert set(created_ids) == {root_id, graph[str(root_id)]["next"][""][0]}
+    assert set(graph) == {"0", *(str(element_id) for element_id in created_ids)}

@@ -1,0 +1,24 @@
+export default (client, $hasFeature, $registry) => {
+  return {
+    // TODO implement once endpoint exists
+    get(workspace) {
+      return {
+        data: Object.values($registry.getAll('roles')).map((role) => ({
+          uid: role.getUid(),
+          icon: role.getIconClass(),
+          description: role.getDescription(),
+          invitationSubtitle: role.getInvitationSubtitle(workspace.id),
+          showIsBillable: role.showIsBillable(workspace.id),
+          isBillable: role.getIsBillable(),
+          isVisible: role.isVisible(workspace.id),
+          isDeactivated: role.isDeactivated(workspace.id),
+          isDefaultForInvitations: role.getIsDefaultForInvitations(
+            workspace.id
+          ),
+          allowedScopeTypes: role.allowedScopeTypes,
+          allowedSubjectTypes: role.allowedSubjectTypes,
+        })),
+      }
+    },
+  }
+}

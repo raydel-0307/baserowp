@@ -1,0 +1,26 @@
+.operator-formula-component {
+  display: inline-block;
+  vertical-align: top;
+  white-space: normal;
+  cursor: default;
+  user-select: none;
+  caret-color: transparent;
+}
+
+.operator-formula-component__symbol {
+  color: $palette-green-900;
+  font-weight: 500;
+  background-color: $palette-green-50;
+  padding: 0 8px;
+  height: 24px;
+  box-sizing: border-box;
+  display: inline-block;
+  vertical-align: top;
+
+  @include rounded;
+
+  // Matches the ring functions get from the paren match highlight on hover.
+  &:hover {
+    box-shadow: inset 0 0 0 1.5px $palette-green-800;
+  }
+}

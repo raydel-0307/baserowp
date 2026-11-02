@@ -1,0 +1,293 @@
+import { uuid } from '@baserow/modules/core/utils/string'
+
+export class Task {
+  constructor(uid, func) {
+    this.uid = uid
+    this.func = func
+    // Store the resolvers to enable the resolution when the function is executed.
+    this.resolve = null
+    this.reject = null
+    this.wait = new Promise((resolve, reject) => {
+      this.resolve = resolve
+      this.reject = reject
+    })
+  }
+
+  async run() {
+    try {
+      const result = await this.func()
+      this.resolve(result)
+      return result
+    } catch (e) {
+      this.reject(e)
+    }
+  }
+}
+export class TaskQueue {
+  constructor({ doneCallback = null, onSuperseded = null }) {
+    this.queue = []
+    this.running = false
+    this.locked = false
+    this.doneCallback = doneCallback
+    this.onSuperseded = onSuperseded
+  }
+
+  add(func) {
+    if (this.running && this.onSuperseded) {
+      this.onSuperseded()
+    }
+    const task = new Task(uuid(), func)
+    this.queue.push(task)
+    return task.uid
+  }
+
+  async waitFor(taskId) {
+    const task = this.queue.find((task) => task.uid === taskId)
+    if (!task) {
+      throw new Error(`Task with id ${taskId} not found`)
+    }
+    this.start()
+    await task.wait
+  }
+
+  /**
+   * waits for all queued tasks
+   *
+   * @returns {Promise<void>}
+   */
+  async waitAll() {
+    const waitlist = Array.from(this.queue, (item) => {
+      return item.wait
+    })
+    await Promise.all(waitlist)
+  }
+
+  start() {
+    if (this.running) {
+      return
+    }
+    this.running = true
+    this.run()
+  }
+
+  async run() {
+    while (this.queue.length > 0 && this.running && !this.locked) {
+      // need to keep queue filled when task is running
+      const task = this.queue[0]
+      await task.run()
+      this.queue.shift()
+    }
+    this.running = false
+    this.done()
+  }
+
+  done() {
+    if (this.doneCallback && this.queue.length === 0) {
+      this.doneCallback()
+    }
+  }
+
+  /**
+   * Prevent queued or to be queued functions from executing by locking them.
+   */
+  lock() {
+    this.locked = true
+  }
+
+  /**
+   * Release the lock. This will immediately run the queued functions that were locked
+   * before.
+   */
+  release() {
+    this.locked = false
+    this.start()
+  }
+}
+
+/**
+ * Executes prioritized asynchronous tasks while enforcing a shared concurrency
+ * limit. Tasks with the same priority retain their insertion order.
+ */
+export class ConcurrentPriorityTaskQueue {
+  constructor({ concurrency = 1 } = {}) {
+    this.pending = []
+    this.delayed = new Map()
+    this.active = 0
+    this.sequence = 0
+    this.cancellationGeneration = 0
+    this.setConcurrency(concurrency)
+  }
+
+  setConcurrency(concurrency) {
+    if (!Number.isInteger(concurrency) || concurrency < 1) {
+      throw new TypeError('Concurrency must be a positive integer.')
+    }
+    this.concurrency = concurrency
+    this.drain()
+  }
+
+  /**
+   * Adds a task and keeps pending work ordered by priority and insertion.
+   * Retried tasks release their worker slot while waiting and re-enter the queue.
+   */
+  add(
+    task,
+    priority = 0,
+    { maxRetries = 0, shouldRetry = () => false, retryDelay = () => 0 } = {}
+  ) {
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new TypeError('Max retries must be a non-negative integer.')
+    }
+    return new Promise((resolve, reject) => {
+      this.pending.push({
+        task,
+        priority,
+        sequence: this.sequence++,
+        maxRetries,
+        shouldRetry,
+        retryDelay,
+        retryCount: 0,
+        cancellationGeneration: this.cancellationGeneration,
+        resolve,
+        reject,
+      })
+      this.sortPending()
+      this.drain()
+    })
+  }
+
+  sortPending() {
+    this.pending.sort(
+      (a, b) => a.priority - b.priority || a.sequence - b.sequence
+    )
+  }
+
+  /** Resolves queued and delayed tasks without starting another attempt. */
+  cancelPending() {
+    this.cancellationGeneration += 1
+    this.pending.splice(0).forEach(({ resolve }) => resolve(undefined))
+    this.delayed.forEach((timer, item) => {
+      clearTimeout(timer)
+      item.resolve(undefined)
+    })
+    this.delayed.clear()
+  }
+
+  /** Starts pending tasks until the configured concurrency budget is full. */
+  drain() {
+    while (this.active < this.concurrency && this.pending.length > 0) {
+      const item = this.pending.shift()
+      this.active += 1
+      Promise.resolve()
+        .then(item.task)
+        .then(item.resolve, (error) => {
+          if (item.cancellationGeneration !== this.cancellationGeneration) {
+            item.resolve(undefined)
+            return
+          }
+
+          let retry
+          try {
+            retry =
+              item.retryCount < item.maxRetries &&
+              item.shouldRetry(error, item.retryCount)
+          } catch (retryError) {
+            item.reject(retryError)
+            return
+          }
+
+          if (!retry) {
+            item.reject(error)
+            return
+          }
+
+          let delay
+          try {
+            delay = item.retryDelay(error, item.retryCount)
+          } catch (retryError) {
+            item.reject(retryError)
+            return
+          }
+          item.retryCount += 1
+          const timer = setTimeout(() => {
+            this.delayed.delete(item)
+            this.pending.push(item)
+            this.sortPending()
+            this.drain()
+          }, delay)
+          this.delayed.set(item, timer)
+        })
+        .finally(() => {
+          this.active -= 1
+          this.drain()
+        })
+    }
+  }
+}
+
+export class GroupTaskQueue {
+  constructor() {
+    this.queues = {}
+  }
+
+  getOrCreateQueue(groupId) {
+    if (!Object.prototype.hasOwnProperty.call(this.queues, groupId)) {
+      // Delete the queue when it's empty to clear the memory.
+      const doneCallback = () => {
+        delete this.queues[groupId]
+      }
+      this.queues[groupId] = new TaskQueue({ doneCallback })
+    }
+    return this.queues[groupId]
+  }
+
+  /**
+   * Add a function to the queue. If there are no other functions in the queue, it
+   * will be executed immediately, otherwise it will wait until the other are
+   * finished first.
+   *
+   * @param func the function that must be queued.
+   * @param groupId indicates the queue group identifier. Function is only stacked
+   * on the queue with the same ID.
+   * @returns resolves when the queued function completes or rejects when an
+   * exception was raised.
+   */
+  async add(func, groupId = null) {
+    const queue = this.getOrCreateQueue(groupId)
+    const taskId = queue.add(func)
+    await queue.waitFor(taskId)
+  }
+
+  lock(groupId = null) {
+    const queue = this.getOrCreateQueue(groupId)
+    queue.lock()
+  }
+
+  release(groupId = null) {
+    const queue = this.getOrCreateQueue(groupId)
+    queue.release()
+  }
+}
+
+/**
+ * Helper function that resolves when the `checkFunction` returns true.
+ */
+export function waitFor(checkFunction, interval = 5, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const startTime = Date.now()
+
+    const check = () => {
+      const loaded = checkFunction()
+
+      if (loaded) {
+        resolve()
+      } else if (Date.now() - startTime >= timeout) {
+        reject(new Error('Timeout waiting.'))
+      } else {
+        setTimeout(check, interval)
+      }
+    }
+
+    check()
+  })
+}

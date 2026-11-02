@@ -1,0 +1,374 @@
+/**
+ * Generates a UUID version 4 (UUID v4) string.
+ *
+ * This function creates a UUID v4 string by using a combination of the current
+ * timestamp and random numbers. While the standard UUID v4 is based on random
+ * numbers, this function uses the timestamp to influence the randomness.
+ *
+ * Note: This method does not produce a traditional time-based UUID (v1) or a
+ * purely random UUID v4, but rather a hybrid.
+ *
+ * @returns {string} - A UUID v4 string
+ */
+export const uuid = function () {
+  let dt = new Date().getTime()
+  const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = ((dt + Math.random() * 16) % 16) | 0
+    dt = Math.floor(dt / 16)
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
+  return uuid
+}
+
+export function generateUUID() {
+  if (
+    typeof crypto !== 'undefined' &&
+    typeof crypto?.randomUUID === 'function'
+  ) {
+    return crypto.randomUUID()
+  }
+
+  if (
+    typeof crypto !== 'undefined' &&
+    typeof crypto?.getRandomValues === 'function'
+  ) {
+    const bytes = new Uint8Array(16)
+    crypto.getRandomValues(bytes)
+
+    bytes[6] = (bytes[6] & 0x0f) | 0x40
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+
+    const hex = Array.from(bytes, (byte) =>
+      byte.toString(16).padStart(2, '0')
+    ).join('')
+
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
+      12,
+      16
+    )}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  }
+
+  // fallback (non-crypto)
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
+/**
+ * Generate a random string for small UID with low chances of collision.
+ */
+export const smallUID = (length = 5) => {
+  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+  let result = ''
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
+  return result
+}
+
+// Escape user-controlled text before it's interpolated into raw HTML
+// rendered with v-html or contentIsHtml tooltips. Without this, a malicious
+// display name could inject markup and execute a stored XSS.
+export const escapeHtml = (value) =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
+export const upperCaseFirst = function (string) {
+  return string.charAt(0).toUpperCase() + string.slice(1)
+}
+
+/**
+ * Source:
+ * https://medium.com/@mhagemann/the-ultimate-way-to-slugify-a-url-string-in-javascript-b8e4a0d849e1
+ */
+export const slugify = (string) => {
+  const a =
+    'àáâäæãåāăąçćčđďèéêëēėęěğǵḧîïíīįìłḿñńǹňôöòóœøōõőṕŕřßśšşșťțûüùúūǘůűųẃẍÿýžźż·/_,:;'
+  const b =
+    'aaaaaaaaaacccddeeeeeeeegghiiiiiilmnnnnoooooooooprrsssssttuuuuuuuuuwxyyzzz------'
+  const p = new RegExp(a.split('').join('|'), 'g')
+
+  return string
+    .toString()
+    .toLowerCase()
+    .replace(/\s+/g, '-') // Replace spaces with -
+    .replace(p, (c) => b.charAt(a.indexOf(c))) // Replace special characters
+    .replace(/&/g, '-and-') // Replace & with 'and'
+    .replace(/[^\w-]+/g, '') // Remove all non-word characters
+    .replace(/--+/g, '-') // Replace multiple - with single -
+    .replace(/^-+/, '') // Trim - from start of text
+    .replace(/-+$/, '') // Trim - from end of text
+}
+
+/**
+ * A very lenient URL validator that allows all types of URL as long as it respects
+ * the maximal amount of characters before the dot at at least have one character
+ * after the dot.
+ */
+export const isValidURL = (str) => {
+  const pattern = /^[^\s]{0,255}(?:\.|\/\/)[^\s]{1,}$/i
+  return !!pattern.test(str)
+}
+
+/**
+ * A slightly stricter URL validator than requires any url begins with a http:// or
+ * https:// and that it also passes the isValidURL validator above.
+ */
+export const isValidURLWithHttpScheme = (str) => {
+  const trimmedStr = str.trim()
+  const pattern = /^https?:\/\//i
+  return !!pattern.test(trimmedStr) && isValidURL(trimmedStr)
+}
+
+/**
+ * An even stricter validator that makes sure that https:// is prepended and that there
+ * is at least a domain name.
+ */
+export const isValidAbsoluteURL = (str) => {
+  const pattern = /^[^\s]{0,255}(\.)[^\s]{2,}$/i
+  return isValidURLWithHttpScheme(str) && pattern.test(str)
+}
+
+export const isValidEmail = (str) => {
+  // Please keep these regex in sync with the backend
+  // See baserow.contrib.database.fields.field_types.EmailFieldType
+  // JavaScript does not support using \w to match unicode letters like python.
+  // Instead we match all unicode letters including ones with modifiers by using the
+  // regex \p{L}\p{M}* taken from https://www.regular-expressions.info/unicode.html
+  // Unicode Categories section.
+  const lookahead = /(?=^.{3,254}$)/
+  // The regex property escapes below are supported as of ES 2018.
+  const localAndDomain = /([-.[\]!#$&*+/=?^_`{|}~0-9]|\p{L}\p{M}*)+/
+  const start = /^/
+  const at = /@/
+  const end = /$/
+  const pattern = new RegExp(
+    lookahead.source +
+      start.source +
+      localAndDomain.source +
+      at.source +
+      localAndDomain.source +
+      end.source,
+    'iu'
+  )
+
+  return !!pattern.test(str)
+}
+
+// The Django `EmailValidator` rules below are ported piece by piece so each one
+// can be compared with `django/core/validators.py` directly. The hostname label
+// and TLD patterns encode "does not start or end with a hyphen" structurally
+// instead of with Django's lookarounds, because Safari only added lookbehind
+// support in 16.4. The `u` flag gives the unicode range code point semantics,
+// as in Python, so astral characters do not match.
+const STRICT_EMAIL_MAX_LENGTH = 320
+// Django's dot-atom local part. The quoted-string alternative is left out.
+const strictEmailAtom = "[-!#$%&'*+/=?^_`{}|~0-9a-z]+"
+const strictEmailUserRegex = new RegExp(
+  `^${strictEmailAtom}(?:\\.${strictEmailAtom})*$`,
+  'iu'
+)
+// Django's `ul` unicode letter range is `\u00a1-\uffff`.
+const strictEmailLetter = 'a-z\\u00a1-\\uffff'
+const strictEmailLetterOrDigit = `${strictEmailLetter}0-9`
+// A hostname label: 1 to 63 characters, no leading or trailing hyphen.
+const strictEmailLabel =
+  `[${strictEmailLetterOrDigit}]` +
+  `(?:[${strictEmailLetterOrDigit}-]{0,61}[${strictEmailLetterOrDigit}])?`
+// A TLD: 2 to 63 letters or hyphens with no leading or trailing hyphen, or a
+// punycode label. Like Django, a non-punycode TLD does not allow digits.
+const strictEmailTld =
+  `(?:[${strictEmailLetter}][${strictEmailLetter}-]{0,61}[${strictEmailLetter}]` +
+  `|xn--[a-z0-9]{1,59})`
+const strictEmailDomainRegex = new RegExp(
+  `^${strictEmailLabel}(?:\\.${strictEmailLabel})*\\.${strictEmailTld}$`,
+  'iu'
+)
+
+/**
+ * Mirrors Django's `EmailValidator`, which the Application Builder backend uses
+ * for input text elements with the email validation type
+ * (`InputTextElementType.is_valid`) and which `ensure_email` uses for the SMTP
+ * email action. Keep it in sync with Django.
+ *
+ * Unlike the permissive `isValidEmail` above, which belongs to the database
+ * email field, this requires an ASCII dot-atom local part and a dotted domain
+ * whose TLD is 2 to 63 letters or punycode, or the domain `localhost`. IP
+ * literal domains and quoted-string local parts are deliberately not supported,
+ * so every value this accepts is accepted by the backend, but not the other way
+ * round.
+ *
+ * The two rules are not nested: Django accepts `'` and `%` in the local part,
+ * which the database email field rejects. The builder input text element
+ * therefore checks both helpers, because its value usually ends up in an email
+ * field.
+ */
+export const isValidStrictEmail = (str) => {
+  if (typeof str !== 'string' || str.length > STRICT_EMAIL_MAX_LENGTH) {
+    return false
+  }
+  const at = str.lastIndexOf('@')
+  if (at === -1) {
+    return false
+  }
+  const user = str.slice(0, at)
+  const domain = str.slice(at + 1)
+  return (
+    strictEmailUserRegex.test(user) &&
+    (domain === 'localhost' || strictEmailDomainRegex.test(domain))
+  )
+}
+
+export const getFilenameFromUrl = (url) => {
+  const pathname = new URL(url).pathname
+  const index = pathname.lastIndexOf('/')
+  return pathname.substring(index + 1) // if index === -1 then index+1 will be 0
+}
+
+// Regex duplicated from
+// src/baserow/contrib/database/fields/field_types.py#PhoneNumberFieldType
+// Docs reference what characters are valid in PhoneNumberFieldType.getDocsDescription
+// Ensure they are kept in sync.
+export const isSimplePhoneNumber = (str) => {
+  const pattern = /^[0-9NnXx,+._*()#=;/ -]{1,100}$/
+  return pattern.test(str)
+}
+
+export const isSecureURL = (str) => {
+  return str.toLowerCase().substr(0, 5) === 'https'
+}
+
+export const escapeRegExp = (string) => {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+export const isInteger = (value) => {
+  return /^-?\d+$/.test(value)
+}
+
+export const isNumeric = (value) => {
+  return /^-?\d+([.]\d+)?$/.test(value)
+}
+
+/**
+ * Normalize a localized number to a numeric string. A decimal point is also
+ * accepted when it cannot be confused with the locale's grouping separator.
+ * @throws {Error} If the input does not match the locale's numeric syntax.
+ */
+export const parseLocalizedNumber = (str, locale) => {
+  const parts = new Intl.NumberFormat(locale).formatToParts(123456789.6)
+  const group = parts.find((p) => p.type === 'group')?.value
+  const decimal = parts.find((p) => p.type === 'decimal')?.value || '.'
+  let integerPattern = '\\d+'
+  let groupPattern
+
+  if (group) {
+    // Space-grouping locales also accept ordinary and non-breaking spaces,
+    // but tabs and newlines must not be silently removed.
+    groupPattern = /^[ \u202f\u00a0]$/.test(group)
+      ? '[ \u202f\u00a0]'
+      : escapeRegExp(group)
+    const integers = parts.filter((p) => p.type === 'integer')
+    const primarySize = integers.at(-1).value.length
+    const secondarySize = integers.at(-2).value.length
+    const groupedPattern = `\\d{1,${secondarySize}}(?:${groupPattern}\\d{${secondarySize}})*${groupPattern}\\d{${primarySize}}`
+    integerPattern = `(?:${integerPattern}|${groupedPattern})`
+  }
+
+  const decimalPattern =
+    decimal !== '.' && group !== '.'
+      ? `(?:${escapeRegExp(decimal)}|\\.)`
+      : escapeRegExp(decimal)
+  const pattern = new RegExp(
+    `^[-+]?${integerPattern}(?:${decimalPattern}\\d+)?$`
+  )
+  const match = str.match(pattern)
+  if (!match || match[0] !== str) {
+    throw new Error('Invalid localized number.')
+  }
+
+  const ungrouped = groupPattern
+    ? str.replace(new RegExp(groupPattern, 'g'), '')
+    : str
+  return ungrouped.replace(decimal, '.')
+}
+
+/**
+ * Allow to find the next unused name excluding a list of names.
+ * This is the frontend equivalent of backend ".find_unused_name()" method.
+ *
+ * @param {string} baseName
+ * @param {string[]} excludeNames
+ * @returns the first baseName potentially suffixed with a number that is not in
+ * excludedNames.
+ *
+ * @example
+ * // returns 'name'
+ * getNextAvailableNameInSequence('name', []);
+ *
+ * @example
+ * // returns 'name 1'
+ * getNextAvailableNameInSequence('name', ['name']);
+ *
+ * @example
+ * // returns 'name 2'
+ * getNextAvailableNameInSequence('name', ['name', 'name 1', 'name 3']);
+ *
+ * @example
+ * // returns 'name__2'
+ * getNextAvailableNameInSequence('name', ['name', 'name 1', 'name 3'],
+ *   {pattern: (baseName, index) => `${basename}__${index + 1}`});
+ */
+export const getNextAvailableNameInSequence = (
+  baseName,
+  excludeNames,
+  { pattern = (baseName, index) => `${baseName} ${index + 1}` } = {}
+) => {
+  let name = baseName
+  let i = 0
+  while (i < excludeNames.length) {
+    if (!excludeNames.includes(name)) {
+      return name
+    }
+    name = pattern(baseName, i)
+    i++
+  }
+  return name
+}
+
+/**
+ * Checks if a search term is a substring of at least one string within a given list of
+ * strings.
+ *
+ * @param strings
+ * @param searchTerm
+ * @returns boolean
+ */
+export const isSubstringOfStrings = (strings, searchTerm) => {
+  const stringsSanitised = strings.map((s) => s.toLowerCase().trim())
+  const searchTermSanitised = searchTerm.toLowerCase().trim()
+
+  return stringsSanitised.some((s) => s.includes(searchTermSanitised))
+}
+
+export function collatedStringCompare(stringA, stringB, order) {
+  return order === 'ASC'
+    ? stringA.localeCompare(stringB, 'en')
+    : stringB.localeCompare(stringA, 'en')
+}
+
+/**
+ * Reverses a string.
+ *
+ * @param {string} value
+ * @returns string
+ */
+export const reverseString = (value) => {
+  return [...value].reverse().join('')
+}

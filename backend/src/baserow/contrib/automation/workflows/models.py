@@ -1,0 +1,247 @@
+from typing import TYPE_CHECKING
+
+from django.conf import settings
+from django.db import models
+
+from baserow.contrib.automation.constants import WORKFLOW_NAME_MAX_LEN
+from baserow.contrib.automation.workflows.constants import WorkflowState
+from baserow.core.cache import local_cache
+from baserow.core.graph.models import GraphModelMixin
+from baserow.core.jobs.mixins import (
+    JobWithUndoRedoIds,
+    JobWithUserIpAddress,
+    JobWithWebsocketId,
+)
+from baserow.core.jobs.models import Job
+from baserow.core.mixins import (
+    CreatedAndUpdatedOnMixin,
+    HierarchicalModelMixin,
+    OrderableMixin,
+    TrashableModelMixin,
+)
+from baserow.core.services.deferred_deletion import deferred_service_deletion_context
+from baserow.core.subjects import UserSubjectType
+
+if TYPE_CHECKING:
+    from baserow.contrib.automation.models import Automation
+    from baserow.contrib.automation.nodes.models import AutomationTriggerNode
+
+
+class AutomationWorkflowTrashManager(models.Manager):
+    """
+    Manager for the AutomationWorkflow model.
+
+    Ensure all trashed relations are excluded from the default queryset.
+    """
+
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .exclude(
+                models.Q(trashed=True)
+                | models.Q(automation__trashed=True)
+                | models.Q(automation__workspace__trashed=True)
+            )
+        )
+
+
+class AutomationWorkflow(
+    HierarchicalModelMixin,
+    TrashableModelMixin,
+    CreatedAndUpdatedOnMixin,
+    OrderableMixin,
+    GraphModelMixin,
+):
+    untrusted_content = models.BooleanField(
+        default=False,
+        db_default=False,
+        help_text="Blocks custom code nodes until explicitly trusted.",
+    )
+    import_report = models.JSONField(
+        default=list,
+        db_default=[],
+        editable=False,
+        help_text="Active content found during import, using the imported object IDs.",
+    )
+    supports_edges = True
+
+    automation = models.ForeignKey(
+        "automation.Automation", on_delete=models.CASCADE, related_name="workflows"
+    )
+    simulate_until_node = models.ForeignKey(
+        "automation.AutomationNode",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text=(
+            "When set, upon the next workflow run, simulates the dispatch of "
+            "the workflow until this node and updates the sample_data of the "
+            "node's service."
+        ),
+    )
+
+    name = models.CharField(max_length=WORKFLOW_NAME_MAX_LEN)
+    state = models.CharField(
+        choices=WorkflowState.choices,
+        default=WorkflowState.DRAFT,
+        db_default=WorkflowState.DRAFT,
+        max_length=20,
+    )
+
+    order = models.PositiveIntegerField()
+
+    allow_test_run_until = models.DateTimeField(null=True, blank=True)
+
+    # Who asked for the pending test run or simulation, so a run that waits for
+    # its trigger's event still records them. Cleared with the temporary states.
+    test_run_triggered_by_id = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="The id of the subject who asked for the pending test run.",
+    )
+    test_run_triggered_by_type = models.CharField(
+        max_length=255,
+        db_default=UserSubjectType.type,
+        help_text="The subject type of who asked for the pending test run.",
+    )
+
+    notification_recipients = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        related_name="automation_notification_workflows",
+        help_text=(
+            "The workspace users that should receive notifications related to "
+            "this workflow."
+        ),
+    )
+
+    objects = AutomationWorkflowTrashManager()
+    objects_and_trash = models.Manager()
+
+    class Meta:
+        ordering = ("order",)
+
+    def get_parent(self):
+        return self.automation
+
+    def delete(self, *args, **kwargs):
+        with deferred_service_deletion_context():
+            return super().delete(*args, **kwargs)
+
+    @classmethod
+    def get_last_order(cls, automation: "Automation"):
+        queryset = AutomationWorkflow.objects.filter(automation=automation)
+        return cls.get_highest_order_of_queryset(queryset) + 1
+
+    def is_original(self) -> bool:
+        """
+        Whether this is an original workflow.
+        """
+
+        return not bool(self.automation.published_from_id)
+
+    def get_original(self) -> "AutomationWorkflow":
+        """
+        Gets the original workflow related to the current instance.
+
+        :return: The original workflow that can be the current instance.
+        """
+
+        from .handler import AutomationWorkflowHandler
+
+        return local_cache.get(
+            f"automation_workflow_original_{self.id}",
+            lambda: (
+                AutomationWorkflowHandler().get_workflow(
+                    self.automation.published_from_id
+                )
+                if self.automation.published_from_id
+                else self
+            ),
+        )
+
+    def get_graph_handler(self):
+        from baserow.contrib.automation.workflows.graph_handler import (
+            AutomationWorkflowGraphHandler,
+        )
+
+        return AutomationWorkflowGraphHandler
+
+    def get_trigger(self) -> "AutomationTriggerNode":
+        """
+        Returns the first node of the workflow A.K.A the trigger.
+        """
+
+        return self.get_graph().get_point_at_position(None, "south", "")
+
+    def can_be_immediately_dispatched(self):
+        """
+        True if the workflow trigger can dispatch without waiting for an event.
+
+        Only the trigger's service type is needed for this, so instead of loading the
+        full specific node graph, the trigger is read from the
+        `automation_workflow_nodes` relation, which can be prefetched with the base
+        services when many workflows are checked at once.
+
+        :return: True if the workflow can be immediately dispatched.
+        """
+
+        trigger_node_id = self.graph.get(self.get_graph_handler().GRAPH_ROOT_KEY)
+        if trigger_node_id is None:
+            return False
+
+        trigger = next(
+            (
+                node
+                for node in self.automation_workflow_nodes.all()
+                if node.id == int(trigger_node_id)
+            ),
+            None,
+        )
+        if trigger is None:
+            return False
+
+        return trigger.service.get_type().can_be_immediately_dispatched(trigger.service)
+
+    @property
+    def is_published(self) -> bool:
+        from baserow.contrib.automation.workflows.handler import (
+            AutomationWorkflowHandler,
+        )
+
+        workflow = self
+        if published_workflow := AutomationWorkflowHandler().get_published_workflow(
+            self
+        ):
+            workflow = published_workflow
+
+        return workflow.state == WorkflowState.LIVE
+
+
+class DuplicateAutomationWorkflowJob(
+    JobWithUserIpAddress, JobWithWebsocketId, JobWithUndoRedoIds, Job
+):
+    original_automation_workflow = models.ForeignKey(
+        AutomationWorkflow,
+        null=True,
+        related_name="duplicated_by_jobs",
+        on_delete=models.SET_NULL,
+        help_text="The automation workflow to duplicate.",
+    )
+
+    duplicated_automation_workflow = models.OneToOneField(
+        AutomationWorkflow,
+        null=True,
+        related_name="duplicated_from_jobs",
+        on_delete=models.SET_NULL,
+        help_text="The duplicated automation workflow.",
+    )
+
+
+class PublishAutomationWorkflowJob(JobWithUserIpAddress, Job):
+    automation_workflow = models.ForeignKey(
+        AutomationWorkflow,
+        null=True,
+        on_delete=models.SET_NULL,
+    )

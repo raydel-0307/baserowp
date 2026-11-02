@@ -1,0 +1,182 @@
+<template>
+  <div :class="`guided-tour-step guided-tour-step--${position}`">
+    <div v-auto-overflow-scroll class="guided-tour-step__body">
+      <a
+        v-if="stoppable"
+        href="#"
+        class="guided-tour-step__close"
+        :title="$t('guidedTourStep.stopTour')"
+        :aria-label="$t('guidedTourStep.stopTour')"
+        @click.prevent="$emit('stop')"
+      >
+        <i class="iconoir-cancel"></i>
+      </a>
+      <div class="guided-tour-step__page">
+        {{ $t('guidedTourStep.step', { step, totalSteps }) }}
+      </div>
+      <div class="guided-tour-step__title">
+        {{ title }}
+      </div>
+      <div class="guided-tour-step__description">
+        <MarkdownIt :content="content" />
+      </div>
+      <div
+        v-if="videos.length > 0 && !thumbnailFailed"
+        class="guided-tour-step__video"
+      >
+        <a
+          class="guided-tour-step__video-thumbnail"
+          @click="$refs.videoModal.show(0)"
+        >
+          <img
+            v-show="thumbnailLoaded"
+            :key="videos[0]"
+            :src="thumbnailUrl"
+            :alt="$t('guidedTourStep.watchVideo')"
+            @load="thumbnailLoaded = true"
+            @error="thumbnailFailed = true"
+          />
+          <i v-if="thumbnailLoaded" class="iconoir-play"></i>
+          <div v-else class="guided-tour-step__video-loading"></div>
+        </a>
+        <a
+          class="guided-tour-step__academy"
+          :href="academyUrl"
+          target="_blank"
+          rel="noopener noreferrer"
+          >{{ $t('academy.learnMore') }}</a
+        >
+        <GuidedTourVideoModal ref="videoModal" :videos="videos" />
+      </div>
+    </div>
+    <div class="guided-tour-step__foot">
+      <div class="flex justify-content-space-between align-items-center">
+        <a
+          v-if="!first"
+          href="#"
+          class="guided-tour-step__back"
+          @click="$emit('previous')"
+          >{{ $t('guidedTourStep.back') }}</a
+        >
+        <Button type="secondary" @click="$emit('next')">{{
+          buttonText ||
+          (last ? $t('guidedTourStep.gotIt') : $t('guidedTourStep.next'))
+        }}</Button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import GuidedTourVideoModal from '@baserow/modules/core/components/guidedTour/GuidedTourVideoModal'
+import { BASEROW_ACADEMY_URL } from '@baserow/modules/core/utils/academy'
+import { getYouTubeThumbnailUrl } from '@baserow/modules/core/utils/youtube'
+
+export default {
+  name: 'GuidedTourStep',
+  components: { GuidedTourVideoModal },
+  props: {
+    position: {
+      required: true,
+      type: String,
+      validator(value) {
+        return [
+          'right-top',
+          'right-bottom',
+          'left-top',
+          'bottom-left',
+          'bottom-right',
+          'bottom-center',
+          'center',
+        ].includes(value)
+      },
+    },
+    step: {
+      type: Number,
+      required: true,
+    },
+    totalSteps: {
+      type: Number,
+      required: true,
+    },
+    title: {
+      type: String,
+      required: true,
+    },
+    content: {
+      type: String,
+      required: true,
+    },
+    first: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    last: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    buttonText: {
+      validator: (prop) => typeof prop === 'string' || prop === null,
+      required: false,
+      default: null,
+    },
+    videos: {
+      type: Array,
+      required: false,
+      default: () => [],
+    },
+    stoppable: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+  },
+  emits: ['next', 'previous', 'stop'],
+  data() {
+    return {
+      thumbnailFailed: false,
+      thumbnailLoaded: false,
+    }
+  },
+  computed: {
+    academyUrl() {
+      return BASEROW_ACADEMY_URL
+    },
+    thumbnailUrl() {
+      return getYouTubeThumbnailUrl(this.videos[0])
+    },
+  },
+  watch: {
+    thumbnailUrl() {
+      this.thumbnailFailed = false
+      this.thumbnailLoaded = false
+    },
+  },
+  async mounted() {
+    const updatePosition = () => {
+      const rect = this.$el.getBoundingClientRect()
+      this.$el.style['max-height'] = `calc(100vh - ${rect.top - 12}px)`
+    }
+
+    // Delay the position update to the next tick to let the Context content
+    // be available in DOM for accurate positioning.
+    await this.$nextTick()
+    updatePosition()
+
+    this.$el.updatePositionViaResizeEvent = () => {
+      updatePosition()
+    }
+    window.addEventListener('resize', this.$el.updatePositionViaResizeEvent)
+  },
+  beforeUnmount() {
+    window.removeEventListener(
+      'scroll',
+      this.$el.updatePositionViaScrollEvent,
+      true
+    )
+    window.removeEventListener('resize', this.$el.updatePositionViaResizeEvent)
+  },
+}
+</script>

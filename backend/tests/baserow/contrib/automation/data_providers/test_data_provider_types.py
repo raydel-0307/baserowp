@@ -1,0 +1,410 @@
+from django.utils import timezone
+
+import pytest
+
+from baserow.contrib.automation.automation_dispatch_context import (
+    AutomationDispatchContext,
+)
+from baserow.contrib.automation.data_providers.data_provider_types import (
+    CurrentIterationDataProviderType,
+    CurrentNodeDataProviderType,
+    PreviousNodeProviderType,
+)
+from baserow.contrib.automation.history.handler import AutomationHistoryHandler
+from baserow.core.formula.exceptions import InvalidFormulaContext
+
+
+@pytest.mark.django_db
+def test_previous_node_data_provider_get_data_chunk(data_fixture):
+    workflow = data_fixture.create_automation_workflow()
+    workflow_history = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+
+    trigger = workflow.get_trigger()
+    trigger_node_history = AutomationHistoryHandler().create_node_history(
+        workflow_history=workflow_history,
+        node=trigger,
+        started_on=timezone.now(),
+    )
+    AutomationHistoryHandler().create_node_result(
+        node_history=trigger_node_history,
+        result={"results": [{"field_1": "Horse"}]},
+    )
+
+    first_action = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow,
+    )
+    first_action_node_history = AutomationHistoryHandler().create_node_history(
+        workflow_history=workflow_history,
+        node=first_action,
+        started_on=timezone.now(),
+    )
+    AutomationHistoryHandler().create_node_result(
+        node_history=first_action_node_history,
+        result={"field_2": "Badger"},
+    )
+
+    data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow,
+    )
+
+    dispatch_context = AutomationDispatchContext(
+        workflow,
+        workflow_history,
+        event_payload=workflow_history.event_payload,
+    )
+
+    # `first_action` referencing the trigger input data.
+    assert (
+        PreviousNodeProviderType().get_data_chunk(
+            dispatch_context, [str(trigger.id), "0", "field_1"]
+        )
+        == "Horse"
+    )
+
+    # `second_action` referencing the `first_action` dispatch data.
+    assert (
+        PreviousNodeProviderType().get_data_chunk(
+            dispatch_context, [str(first_action.id), "field_2"]
+        )
+        == "Badger"
+    )
+
+    # If a formula path references a non-existent node, it should raise an exception.
+    with pytest.raises(InvalidFormulaContext) as exc:
+        PreviousNodeProviderType().get_data_chunk(dispatch_context, ["999", "field_3"])
+    assert exc.value.args[0] == "The previous node doesn't exist"
+
+    workflow_history_2 = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+    trigger_node_history_2 = AutomationHistoryHandler().create_node_history(
+        workflow_history=workflow_history_2,
+        node=trigger,
+        started_on=timezone.now(),
+    )
+    AutomationHistoryHandler().create_node_result(
+        node_history=trigger_node_history_2,
+        result={"results": [{"field_1": "Horse"}]},
+    )
+
+    dispatch_context = AutomationDispatchContext(
+        workflow,
+        workflow_history_2,
+    )
+
+    # Existing node but after
+    with pytest.raises(InvalidFormulaContext) as exc:
+        PreviousNodeProviderType().get_data_chunk(
+            dispatch_context, [str(first_action.id), "field_2"]
+        )
+    assert (
+        exc.value.args[0]
+        == "The previous node id is not present in the dispatch context results"
+    )
+
+
+@pytest.mark.django_db
+def test_previous_node_data_provider_import_path(data_fixture):
+    data_provider = PreviousNodeProviderType()
+
+    node = data_fixture.create_local_baserow_create_row_action_node()
+
+    valid_id_mapping = {"automation_workflow_nodes": {1: node.id}}
+    invalid_id_mapping = {"automation_workflow_nodes": {3: 4}}
+
+    path = ["1", "0", "field_1"]
+
+    assert data_provider.import_path(path, {}) == ["1", "0", "field_1"]
+    assert data_provider.import_path(path, invalid_id_mapping) == ["1", "0", "field_1"]
+    assert data_provider.import_path(path, valid_id_mapping) == [
+        str(node.id),
+        "0",
+        "field_1",
+    ]
+
+
+@pytest.mark.django_db
+def test_current_iteration_data_provider_get_data_chunk(data_fixture):
+    workflow = data_fixture.create_automation_workflow()
+    workflow_history = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+    iterator = data_fixture.create_core_iterator_action_node(
+        workflow=workflow,
+    )
+    data_fixture.create_local_baserow_create_row_action_node(
+        workflow=workflow,
+    )
+    node_history = AutomationHistoryHandler().create_node_history(
+        workflow_history=workflow_history,
+        node=iterator,
+        started_on=timezone.now(),
+    )
+    AutomationHistoryHandler().create_node_result(
+        node_history=node_history,
+        result={"results": [{"field_1": "Horse"}, {"field_1": "Duck"}]},
+    )
+
+    dispatch_context = AutomationDispatchContext(
+        workflow,
+        workflow_history,
+        event_payload=workflow_history.event_payload,
+        current_iterations={iterator.id: 0},
+    )
+
+    assert (
+        CurrentIterationDataProviderType().get_data_chunk(
+            dispatch_context, [str(iterator.id), "item", "field_1"]
+        )
+        == "Horse"
+    )
+
+    dispatch_context.current_iterations[iterator.id] = 1
+
+    assert (
+        CurrentIterationDataProviderType().get_data_chunk(
+            dispatch_context, [str(iterator.id), "item", "field_1"]
+        )
+        == "Duck"
+    )
+
+
+@pytest.mark.django_db
+def test_current_iteration_data_provider_import_path(data_fixture):
+    data_provider = CurrentIterationDataProviderType()
+
+    node = data_fixture.create_core_iterator_action_node()
+
+    valid_id_mapping = {"automation_workflow_nodes": {1: node.id}}
+    invalid_id_mapping = {"automation_workflow_nodes": {3: 4}}
+
+    path = ["1", "item", "field_1"]
+
+    assert data_provider.import_path(path, {}) == ["1", "item", "field_1"]
+    assert data_provider.import_path(path, invalid_id_mapping) == [
+        "1",
+        "item",
+        "field_1",
+    ]
+    assert data_provider.import_path(path, valid_id_mapping) == [
+        str(node.id),
+        "item",
+        "field_1",
+    ]
+
+
+@pytest.mark.django_db
+def test_previous_node_data_provider_reads_a_slack_answer(data_fixture):
+    """
+    A Slack node stores what the dispatch returned, and its schema is what the
+    data explorer offers a later node. The two have to name the same path, or
+    chaining off a Slack node resolves to nothing.
+    """
+
+    from baserow.contrib.automation.nodes.node_types import (
+        SlackWriteMessageActionNodeType,
+    )
+
+    workflow = data_fixture.create_automation_workflow()
+    workflow_history = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+
+    slack_node = data_fixture.create_automation_node(
+        type=SlackWriteMessageActionNodeType.type, workflow=workflow
+    )
+    slack_node_history = AutomationHistoryHandler().create_node_history(
+        workflow_history=workflow_history,
+        node=slack_node,
+        started_on=timezone.now(),
+    )
+    # Built by the service itself rather than written out here, so a change to
+    # either side of the pair is caught: the node stores `DispatchResult.data`.
+    answer = {"ok": True, "channel": "C1", "ts": "1503435956.000247"}
+    dispatched = (
+        slack_node.service.specific.get_type().dispatch_transform({"data": answer}).data
+    )
+    AutomationHistoryHandler().create_node_result(
+        node_history=slack_node_history,
+        result=dispatched,
+    )
+    data_fixture.create_local_baserow_create_row_action_node(workflow=workflow)
+
+    dispatch_context = AutomationDispatchContext(
+        workflow,
+        workflow_history,
+        event_payload=workflow_history.event_payload,
+    )
+
+    def leaf_paths(schema, prefix=()):
+        """Every path the data explorer can offer for this schema."""
+
+        properties = schema.get("properties") or {}
+        if not properties:
+            yield prefix
+            return
+        for name, child in properties.items():
+            yield from leaf_paths(child, prefix + (name,))
+
+    # Derived from the schema rather than written out, so unwrapping the
+    # dispatch without moving the schema, or the reverse, fails here.
+    service = slack_node.service.specific
+    schema = service.get_type().generate_schema(service)
+    offered = list(leaf_paths(schema))
+    assert offered, "the schema offers nothing"
+
+    for path in offered:
+        assert (
+            PreviousNodeProviderType().get_data_chunk(
+                dispatch_context, [str(slack_node.id), *path]
+            )
+            is not None
+        ), path
+
+    assert ("data", "ts") in offered
+    assert (
+        PreviousNodeProviderType().get_data_chunk(
+            dispatch_context, [str(slack_node.id), "data", "ts"]
+        )
+        == "1503435956.000247"
+    )
+
+
+@pytest.mark.django_db
+def test_current_node_data_provider_get_data_chunk(data_fixture):
+    """
+    `current_node` carries no node id in its path: it reads the result of the
+    node the runner put on the context, prepared the way the node's service
+    expects its paths.
+    """
+
+    user = data_fixture.create_user()
+    workflow = data_fixture.create_automation_workflow(user=user)
+    workflow_history = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+    http_node = data_fixture.create_automation_node(
+        type="http_request", workflow=workflow
+    )
+
+    dispatch_context = AutomationDispatchContext(workflow, workflow_history)
+    dispatch_context.current_node = http_node
+    dispatch_context.current_node_result = {
+        "status_code": 429,
+        "headers": {"retry-after": "30"},
+    }
+
+    assert (
+        CurrentNodeDataProviderType().get_data_chunk(dispatch_context, ["status_code"])
+        == 429
+    )
+    assert (
+        CurrentNodeDataProviderType().get_data_chunk(
+            dispatch_context, ["headers", "retry-after"]
+        )
+        == "30"
+    )
+
+    # The runner evaluates the condition on a clone of the dispatch context.
+    cloned_context = dispatch_context.clone()
+    assert (
+        CurrentNodeDataProviderType().get_data_chunk(cloned_context, ["status_code"])
+        == 429
+    )
+
+    # A list service stores its rows under `results`, keyed by the human field
+    # names, while the formula path uses the `field_<id>` of the column.
+    table = data_fixture.create_database_table(user=user)
+    name_field = data_fixture.create_text_field(table=table, name="Name")
+    list_rows_node = data_fixture.create_automation_node(
+        type="local_baserow_list_rows",
+        workflow=workflow,
+        service=data_fixture.create_local_baserow_list_rows_service(table=table),
+    )
+    dispatch_context.current_node = list_rows_node
+    dispatch_context.current_node_result = {
+        "results": [
+            {"id": 1, "Name": "Horse"},
+            {"id": 2, "Name": "Duck"},
+        ],
+        "has_next_page": False,
+    }
+
+    assert (
+        CurrentNodeDataProviderType().get_data_chunk(
+            dispatch_context, ["0", name_field.db_column]
+        )
+        == "Horse"
+    )
+    assert (
+        CurrentNodeDataProviderType().get_data_chunk(dispatch_context, ["1", "id"]) == 2
+    )
+    assert CurrentNodeDataProviderType().get_data_chunk(dispatch_context, ["1"]) == {
+        "id": 2,
+        "Name": "Duck",
+    }
+
+
+@pytest.mark.django_db
+def test_current_node_data_provider_requires_a_current_node(data_fixture):
+    workflow = data_fixture.create_automation_workflow()
+    workflow_history = AutomationHistoryHandler().create_workflow_history(
+        workflow,
+        workflow,
+        timezone.now(),
+        False,
+    )
+    http_node = data_fixture.create_automation_node(
+        type="http_request", workflow=workflow
+    )
+    message = "The current node's result is only available in its retry condition"
+
+    # Outside a retry condition, the node being dispatched has no result yet.
+    dispatch_context = AutomationDispatchContext(workflow, workflow_history)
+    with pytest.raises(InvalidFormulaContext) as exc:
+        CurrentNodeDataProviderType().get_data_chunk(dispatch_context, ["status_code"])
+    assert exc.value.args[0] == message
+
+    # The node without its result is not enough either.
+    dispatch_context.current_node = http_node
+    with pytest.raises(InvalidFormulaContext) as exc:
+        CurrentNodeDataProviderType().get_data_chunk(dispatch_context, ["status_code"])
+    assert exc.value.args[0] == message
+
+
+@pytest.mark.django_db
+def test_current_node_data_provider_import_path(data_fixture):
+    data_provider = CurrentNodeDataProviderType()
+    node = data_fixture.create_local_baserow_create_row_action_node()
+    id_mapping = {"database_fields": {1: 2}}
+    path = ["field_1", "value"]
+
+    # Without the node whose formula is being imported there is no service to
+    # remap the path against.
+    assert data_provider.import_path(path, id_mapping) == ["field_1", "value"]
+
+    assert data_provider.import_path(path, id_mapping, current_node=node) == [
+        "field_2",
+        "value",
+    ]
+    assert data_provider.import_path(["id"], id_mapping, current_node=node) == ["id"]
+    assert data_provider.import_path(
+        path, {"database_fields": {}}, current_node=node
+    ) == ["field_1", "value"]

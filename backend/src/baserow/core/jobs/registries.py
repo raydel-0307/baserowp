@@ -1,0 +1,279 @@
+from typing import Any, Dict, Type
+
+from django.contrib.auth.models import AbstractUser
+
+from opentelemetry import trace
+from rest_framework import serializers
+
+from baserow.core.db import transaction_atomic
+from baserow.core.registry import (
+    CustomFieldsInstanceMixin,
+    CustomFieldsRegistryMixin,
+    Instance,
+    MapAPIExceptionsInstanceMixin,
+    ModelInstanceMixin,
+    ModelRegistryMixin,
+    Registry,
+)
+from baserow.core.telemetry.utils import BaserowTraceMeta, baserow_trace
+from baserow.core.utils import Progress
+
+from .exceptions import (
+    JobTypeAlreadyRegistered,
+    JobTypeDoesNotExist,
+    MaxJobCountExceeded,
+)
+from .models import Job, JobQuerySet
+from .types import AnyJob
+
+tracer = trace.get_tracer(__name__)
+
+
+class JobType(
+    CustomFieldsInstanceMixin,
+    ModelInstanceMixin,
+    MapAPIExceptionsInstanceMixin,
+    Instance,
+    metaclass=BaserowTraceMeta,
+):
+    """
+    This abstract class represents a custom job type that can be added to the
+    job type registry. It must be extended so customization can be done. Each job
+    type will have its own `run` method that will be run asynchronously.
+    """
+
+    job_exceptions_map = {}
+
+    """
+    A map of exception that can be used to map exceptions to certain task error
+    messages.
+    """
+
+    max_count: int = 1
+
+    """
+    A number of max jobs count for the same type for a given user.
+    """
+
+    lock_on_cancel: bool = False
+
+    """
+    Whether a cancellation locks the row of the job and asks `is_cancellable`
+    first. A job that commits its work before it ends can lock the row with
+    `JobHandler.lock_job` and check for a cancellation in the same transaction, so
+    that a cancellation is either noticed before the commit or refused after it.
+    The job must then save its row with `update_fields`, so that it doesn't write
+    its in-memory state over a cancellation, like `run_async_job` does when the job
+    starts.
+    """
+
+    def can_schedule_or_raise(self, job: Job) -> None:
+        """
+        Checks whether ``job`` can be scheduled for the given user. Splits into
+        ``_get_running_jobs`` (which jobs already block scheduling) and
+        ``_can_schedule_or_raise`` (the actual rule).
+
+        :param job: The job instance that is going to be scheduled.
+        :raises MaxJobCountExceeded: If the user cannot schedule a new job of this type.
+        """
+
+        running_jobs = self._get_running_jobs(job)
+        self._can_schedule_or_raise(running_jobs, job)
+
+    def _get_running_jobs(self, job: Job) -> JobQuerySet:
+        """
+        Returns the currently pending or running jobs that should be considered
+        when deciding whether ``job`` can be scheduled. Returns a queryset so
+        subclasses can compose further filters / ``select_related`` / ``exists``
+        on top.
+
+        :param job: The job instance that is going to be scheduled.
+        :return: A queryset of pending/running jobs to evaluate against.
+        """
+
+        return job.__class__.objects.filter(user_id=job.user.id).is_pending_or_running()
+
+    def _can_schedule_or_raise(self, running_jobs: JobQuerySet, new_job: Job) -> None:
+        """
+        Default rule: refuse scheduling once ``max_count`` jobs of the same
+        type are already pending or running for this user. Override to add
+        per-job conflict checks (e.g. one job per application) and call ``super()``
+        to keep the global cap.
+
+        :param running_jobs: The pending/running jobs queryset returned by
+            ``_get_running_jobs``.
+        :param new_job: The job instance that is going to be scheduled.
+        :raises MaxJobCountExceeded: If the user cannot schedule ``new_job``.
+        """
+
+        if len(running_jobs) >= self.max_count:
+            raise MaxJobCountExceeded(
+                f"You can only launch {self.max_count} {self.type} job(s) at "
+                "the same time."
+            )
+
+    def scope_queryset_to_user(
+        self, user: AbstractUser, queryset: JobQuerySet
+    ) -> JobQuerySet:
+        """
+        Restricts a jobs listing queryset to the jobs that ``user`` may see. By
+        default jobs are only visible to the user that created them. A job type
+        can widen this, after an explicit object-level permission check, to also
+        expose jobs created by other users (e.g. runs of a shared resource).
+
+        :param user: The user requesting the jobs listing.
+        :param queryset: The already filtered queryset of jobs of this type.
+        :return: The queryset restricted to what the user may see.
+        """
+
+        return queryset.filter(user=user)
+
+    def enhance_queryset(self, queryset: JobQuerySet) -> JobQuerySet:
+        """
+        Adds the relations needed to serialize this job type efficiently. The jobs
+        listing calls this hook on each concrete job queryset before serialization.
+
+        :param queryset: A queryset for this job type's concrete model.
+        :return: The queryset with any required relations selected or prefetched.
+        """
+
+        return queryset
+
+    def transaction_atomic_context(self, job: Job):
+        """
+        This method gives the possibility to change the transaction context per request.
+        """
+
+        return transaction_atomic()
+
+    def prepare_values(
+        self, values: Dict[str, Any], user: AbstractUser
+    ) -> Dict[str, Any]:
+        """
+        The prepare_values hook gives the possibility to change the provided values
+        that just before they are going to be used to create or update the instance. For
+        example if an ID is provided, it can be converted to a model instance. Or to
+        convert a certain date string to a date object. It's also an opportunity to add
+        specific validations.
+
+        :param values: The provided values.
+        :param user: The user on whose behalf the change is made.
+        :return: The updated values.
+        """
+
+        return values
+
+    def after_job_creation(self, job: AnyJob, values: Dict[str, Any]):
+        """
+        This method gives the possibility to change the job just after the
+        instance creation. For example, files can be saved, or relationship can be
+        added.
+
+        :param job: The created job.
+        :param values: The provided values.
+        """
+
+    @baserow_trace(tracer)
+    def run(self, job: AnyJob, progress: Progress) -> Any:
+        """
+        This method is the task of this job type that will be executed asynchronously.
+
+        :param job: the specific instance of the related job instance
+        :param progress: A progress object that can be used to track the progress of
+          the task.
+        """
+
+        raise NotImplementedError("The run method must be implemented.")
+
+    def is_cancellable(self, job: AnyJob) -> bool:
+        """
+        Whether the job can still be cancelled. Only called with the locked job of
+        a type that sets `lock_on_cancel`, and only while it hasn't ended.
+
+        :param job: The specific job, as it is in the database.
+        :return: False if the cancellation must be refused.
+        """
+
+        return True
+
+    def before_delete(self, job: AnyJob):
+        """
+        If a job type need to do something before a job deletion, can be done here.
+        This method is do nothing by default.
+        """
+
+    def on_cancelled(self, job: AnyJob):
+        """
+        Called after a job has been cancelled and its state saved. Runs outside the
+        main transaction context, so any database changes made here are kept.
+
+        :param job: The specific instance of the related job instance.
+        """
+
+    def on_error(self, job: AnyJob, error: Exception):
+        """
+        This method gives the possibility to change the job after an exception has
+        been raised. This happens after the transaction so database changes are kept.
+
+        :param job: the specific instance of the related job instance
+        :param error: the exception raised.
+        """
+
+    @property
+    def request_serializer_class(self):
+        """
+        The serializer that must be used to validate the request data before
+        creating a new job instance of this type.
+        """
+
+        return self.get_serializer_class(
+            base_class=serializers.Serializer,
+            request_serializer=True,
+            meta_ref_name=f"{self.__class__.__name__}RequestSerializer",
+        )
+
+    @property
+    def response_serializer_class(self):
+        """
+        The serializer that must be used to serialize the response data of the job
+        instance of this type.
+        """
+
+        from baserow.api.jobs.serializers import JobSerializer
+
+        return self.get_serializer_class(
+            base_class=JobSerializer,
+            meta_ref_name=f"{self.__class__.__name__}ResponseSerializer",
+        )
+
+    def get_filters_serializer(self) -> Type[serializers.Serializer] | None:
+        """
+        This method enables job types to define custom filters for job listing
+        operations. Since query parameters cannot utilize Discriminator fields and must
+        be flattened, all filter field names should be prefixed with the job type name
+        followed by an underscore to prevent naming conflicts between different job
+        types.
+
+        :return: A serializer class extending JobTypeFiltersSerializer, or None if no
+                 type-specific filters are needed.
+        """
+
+        return None
+
+
+class JobTypeRegistry(
+    CustomFieldsRegistryMixin,
+    ModelRegistryMixin[Job, JobType],
+    Registry[JobType],
+):
+    """
+    The registry that holds all the available job types.
+    """
+
+    name = "job_type"
+
+    does_not_exist_exception_class = JobTypeDoesNotExist
+    already_registered_exception_class = JobTypeAlreadyRegistered
+
+
+job_type_registry: JobTypeRegistry = JobTypeRegistry()

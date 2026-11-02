@@ -1,0 +1,3373 @@
+import { Registerable } from '@baserow/modules/core/registry'
+import {
+  NumberBaserowRuntimeFormulaArgumentType,
+  TextBaserowRuntimeFormulaArgumentType,
+  DateTimeBaserowRuntimeFormulaArgumentType,
+  ObjectBaserowRuntimeFormulaArgumentType,
+  BooleanBaserowRuntimeFormulaArgumentType,
+  TimezoneBaserowRuntimeFormulaArgumentType,
+  AnyBaserowRuntimeFormulaArgumentType,
+  ArrayBaserowRuntimeFormulaArgumentType,
+  ArrayOfNumbersBaserowRuntimeFormulaArgumentType,
+  ThousandSeparatorBaserowRuntimeFormulaArgumentType,
+  DecimalSeparatorBaserowRuntimeFormulaArgumentType,
+  TimedeltaBaserowRuntimeFormulaArgumentType,
+  DatetimeFormatBaserowRuntimeFormulaArgumentType,
+  DurationBaserowRuntimeFormulaArgumentType,
+  DurationFormatBaserowRuntimeFormulaArgumentType,
+  Timedelta,
+} from '@baserow/modules/core/runtimeFormulaArgumentTypes'
+import {
+  InvalidFormulaArgument,
+  InvalidFormulaArgumentType,
+  InvalidNumberOfArguments,
+} from '@baserow/modules/core/formula/parser/errors'
+import { reverseString, generateUUID } from '@baserow/modules/core/utils/string'
+import { avg, sum } from '@baserow/modules/core/utils/number'
+import { markdownToHtml } from '@baserow/modules/core/utils/markdownToHtml'
+import {
+  ensureString,
+  ensureArray,
+  ensureDateTime,
+  ensureJsonSerializable,
+  ensureDeserializedJson,
+} from '@baserow/modules/core/utils/validator'
+import {
+  formatValueWithDurationFormat,
+  parseValueWithDurationFormat,
+} from '@baserow/modules/core/utils/duration'
+import { Node, VueNodeViewRenderer } from '@tiptap/vue-3'
+import GetFormulaComponent from '@baserow/modules/core/components/formula/GetFormulaComponent'
+import { mergeAttributes } from '@tiptap/core'
+import { FORMULA_CATEGORY, FORMULA_TYPE } from '@baserow/modules/core/enums'
+import _ from 'lodash'
+import moment from '@baserow/modules/core/moment'
+
+export class RuntimeFormulaFunction extends Registerable {
+  /**
+   * Must return an object containing the category name and icon class of the formula.
+   */
+  static getCategoryType() {
+    throw new Error('The category type of a formula function must be set.')
+  }
+
+  /**
+   * Must return a string indicating the valid formula type.
+   */
+  static getFormulaType() {
+    throw new Error('The formula type of a formula function must be set.')
+  }
+
+  /**
+   * Should define the arguments the function has. If null then we don't know what
+   * arguments the function has any anything is accepted.
+   *
+   * @returns {Array<BaserowRuntimeFormulaArgumentType> || null}
+   */
+  get args() {
+    return null
+  }
+
+  /**
+   * The number of arguments the execute function expects
+   * @returns {null|number}
+   */
+  get numArgs() {
+    return this.args === null ? null : this.args.length
+  }
+
+  /**
+   * This is the main function that will produce a result for the defined formula
+   *
+   * @param {Object} context - The data the function has access to
+   * @param {Array} args - The arguments that the function should be executed with
+   * @returns {any} - The result of executing the function
+   */
+  execute(context, args) {
+    return null
+  }
+
+  /**
+   * This function can be called to perform basic argument validation on the formula
+   * functions. By default, it'll check if the argument types match what the function
+   * expects.
+   *
+   * Individual formula functions should override this method if they need to
+   * perform custom argument validation beyond number and type checks.
+   *
+   * @param {Array} args - The parsed ANTLR arguments.
+   * @param {Object} validationContext - E.g. { dataProviderRegistry }
+   * @param {Object} ctx - ANTLR context object
+   * @throws InvalidFormulaArgumentType - If any of the arguments have a wrong type
+   */
+  validateArgs(args, { ctx = null, validationContext = {} } = {}) {
+    const results = this.validateTypeOfArgs(args)
+    if (results.length > 0) {
+      const [index, invalidArg] = results[0]
+      if (this.args) {
+        const message = this.args[index].getErrorMessage(
+          invalidArg,
+          this.app.$i18n
+        )
+        if (message) {
+          throw new InvalidFormulaArgument(this.getType(), message)
+        }
+      }
+      throw new InvalidFormulaArgumentType(this, invalidArg)
+    }
+  }
+
+  /**
+   * This function validates that the number of args is correct.
+   *
+   * @param args - The args passed to the execute function
+   * @param throwOnError - Whether to throw an error if the number of args is incorrect
+   * @throws {InvalidNumberOfArguments} - If the number of args is incorrect
+   */
+  validateNumberOfArgs(args, throwOnError = false) {
+    if (this.numArgs === null) return true
+    const requiredArgs = this.args.filter((arg) => !arg.optional).length
+    const totalArgs = this.args.length
+    const validArgLength =
+      args.length >= requiredArgs && args.length <= totalArgs
+    if (!validArgLength && throwOnError) {
+      throw new InvalidNumberOfArguments(this, requiredArgs, totalArgs)
+    }
+    return validArgLength
+  }
+
+  /**
+   * This function validates that the type of all args is correct.
+   * If a type is incorrect it will return that arg.
+   *
+   * @param args - The args that are being checked
+   * @returns {any} - An array of [index, arg] that has the wrong type.
+   */
+  validateTypeOfArgs(args) {
+    if (this.args === null) {
+      return []
+    }
+
+    return args.reduce((errors, arg, index) => {
+      if (!this.args[index].test(arg)) {
+        errors.push([index, arg])
+      }
+      return errors
+    }, [])
+  }
+
+  /**
+   * This function parses the arguments before they get handed over to the execute
+   * function. This allows us to cast any args that might be of the wrong type to
+   * the correct type or transform the data in any other way we wish to.
+   *
+   * @param args - The args that are being parsed
+   * @returns {*} - The args after they were parsed
+   */
+  parseArgs(args) {
+    if (this.args === null) {
+      return args
+    }
+
+    return args.map((arg, index) => this.args[index].parse(arg))
+  }
+
+  /**
+   * The type name of the formula component that should be used to render the formula
+   * in the editor.
+   * @returns {string || null}
+   */
+  get formulaComponentType() {
+    return null
+  }
+
+  /**
+   * The component configuration that should be used to render the formula in the
+   * editor.
+   *
+   * @returns {null}
+   */
+  get formulaComponent() {
+    return null
+  }
+
+  /**
+   * This function returns one or many nodes that can be used to render the formula
+   * in the editor.
+   *
+   * @param args - The args that are being parsed
+   * @param mode - The mode of the formula editor ('simple', 'advanced', or 'raw')
+   * @returns {object || Array} - The component configuration or a list of components
+   */
+  toNode(args, mode = 'simple') {
+    return {
+      type: this.formulaComponentType,
+    }
+  }
+
+  getDescription() {
+    throw new Error(
+      'Not implemented error. This method should return the functions description.'
+    )
+  }
+
+  getExamples() {
+    throw new Error(
+      'Not implemented error. This method should return list of strings showing ' +
+        'example usage of the function.'
+    )
+  }
+
+  getCategory() {
+    const { $i18n: i18n } = this.app
+    return i18n.t(`runtimeFormulaTypes.${this.getCategoryType().category}`)
+  }
+
+  getIconClass() {
+    return this.getCategoryType().iconClass
+  }
+
+  /**
+   * If the formula type is 'operator', returns the correct literal
+   * operator symbol. Otherwise returns null.
+   * @returns {string|null}
+   */
+  get getOperatorSymbol() {
+    return null
+  }
+}
+
+export class RuntimeConcat extends RuntimeFormulaFunction {
+  static getType() {
+    return 'concat'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  execute(context, args) {
+    return args.map((arg) => ensureString(arg)).join('')
+  }
+
+  /**
+   * Validates that the number of args is at least 2.
+   * @param args - The ANTLR parsed args.
+   * @param throwOnError - Whether to throw an error if the number of args is incorrect.
+   * @return {boolean} - Whether the number of args is valid.
+   */
+  validateNumberOfArgs(args, throwOnError = false) {
+    const validArgLength = args.length > 1
+    if (!validArgLength && throwOnError) {
+      throw new InvalidNumberOfArguments(this, 2)
+    }
+    return validArgLength
+  }
+
+  toNode(args, mode = 'simple') {
+    // In advanced mode, we want to show the formula as-is with quotes
+    if (mode === 'advanced') {
+      return {
+        type: this.formulaComponentType,
+      }
+    }
+
+    // In simple mode, recognize root concat that adds the new lines between paragraphs
+    if (args.every((arg, index) => index % 2 === 0 || arg.type === 'newLine')) {
+      return args
+        .filter((arg, index) => index % 2 === 0) // Remove the new lines elements
+        .map((arg) => {
+          // If arg is already a wrapper, extract its content; otherwise wrap it
+          const content =
+            arg?.type === 'wrapper' && arg.content ? arg.content : [arg].flat()
+          return { type: 'wrapper', content }
+        })
+    }
+    return { type: 'wrapper', content: args }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.concatDescription')
+  }
+
+  getExamples() {
+    return [
+      { formula: "concat('Hello,', ' World!')", result: '"Hello, world!"' },
+    ]
+  }
+}
+
+export class RuntimeGet extends RuntimeFormulaFunction {
+  static getType() {
+    return 'get'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  get formulaComponentType() {
+    return 'get-formula-component'
+  }
+
+  get formulaComponent() {
+    const formulaComponentType = this.formulaComponentType
+    return Node.create({
+      name: formulaComponentType,
+      group: 'inline',
+      inline: true,
+      selectable: false,
+      atom: true,
+      addNodeView() {
+        return VueNodeViewRenderer(GetFormulaComponent)
+      },
+      addAttributes() {
+        return {
+          path: {
+            default: '',
+          },
+          isSelected: {
+            default: false,
+          },
+        }
+      },
+      parseHTML() {
+        return [
+          {
+            tag: formulaComponentType,
+          },
+        ]
+      },
+      renderHTML({ HTMLAttributes }) {
+        return [formulaComponentType, mergeAttributes(HTMLAttributes)]
+      },
+    })
+  }
+
+  execute(context, args) {
+    return context[args[0]]
+  }
+
+  toNode(args) {
+    const [textNode] = args
+    const defaultConfiguration = super.toNode(args)
+    const specificConfiguration = {
+      attrs: {
+        path: textNode.text,
+        isSelected: false,
+      },
+    }
+    return _.merge(specificConfiguration, defaultConfiguration)
+  }
+
+  fromNodeToFormula(node) {
+    return `get('${node.attrs.path}')`
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.getDescription')
+  }
+
+  getExamples() {
+    // The help tooltip renders examples against the live data of the page or
+    // workflow being edited, so any placeholder path would show up as an
+    // invalid reference. Show the bare call instead; the data nodes in the
+    // explorer insert a `get()` with a real path for the user.
+    return [{ formula: 'get()', result: '' }]
+  }
+
+  /**
+   * Validates the arguments for the get() function.
+   *
+   * @param {Array} args - The accepted ANTLR parse tree nodes for arguments
+   *
+   * @param {Object} validationContext - Contains { dataProviderRegistry }
+   * @param {Object} ctx - ANTLR context object
+   * @throws {InvalidFormulaArgument} - If the argument is invalid.
+   */
+  validateArgs(args, { ctx = null, validationContext = {} } = {}) {
+    // Perform our argument count and type validation first.
+    super.validateArgs(args, { ctx, validationContext })
+
+    // Only continue with validation if we have a context to work with.
+    // In the validation visitor, we'll have additional context, in the
+    // execution visitor, we won't.
+    if (_.isEmpty(validationContext)) {
+      return
+    }
+
+    const { $i18n } = this.app
+    const { dataProviderRegistry } = validationContext
+    const path = args[0]
+
+    // Ensure the path is dot-delimited (e.g., 'a.b' or 'a.b.c')
+    if (!path.includes('.')) {
+      throw new InvalidFormulaArgument(
+        this.getType(),
+        $i18n.t('runtimeGetErrors.invalidPath', { path })
+      )
+    }
+    const [providerName, ...rest] = _.toPath(path)
+
+    // Ensure that a provider has been given to us.
+    if (!providerName) {
+      throw new InvalidFormulaArgument(
+        this.getType(),
+        $i18n.t('runtimeGetErrors.missingProvider', { path })
+      )
+    }
+
+    // Check if provider exists in registry
+    const provider = dataProviderRegistry.find(
+      (p) => p.getType() === providerName
+    )
+    if (!provider) {
+      throw new InvalidFormulaArgument(
+        this.getType(),
+        $i18n.t('runtimeGetErrors.unknownProvider', { providerName })
+      )
+    }
+
+    // Ask the provider to validate this path.
+    if (!provider.isValid(rest, validationContext.applicationContext)) {
+      throw new InvalidFormulaArgument(
+        this.getType(),
+        $i18n.t('runtimeGetErrors.invalidProviderPath', { providerName, path })
+      )
+    }
+  }
+}
+
+export class RuntimeAdd extends RuntimeFormulaFunction {
+  static getType() {
+    return 'add'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get getOperatorSymbol() {
+    return '+'
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  validateTypeOfArgs(args) {
+    if (args.length === 2) {
+      const [a, b] = args
+      const num = new NumberBaserowRuntimeFormulaArgumentType()
+      const dt = new DateTimeBaserowRuntimeFormulaArgumentType()
+      const td = new TimedeltaBaserowRuntimeFormulaArgumentType()
+      if (num.test(a) && num.test(b)) return []
+      if (td.test(a) && td.test(b)) return []
+      if ((td.test(a) && num.test(b)) || (num.test(a) && td.test(b))) return []
+      if ((dt.test(a) && td.test(b)) || (td.test(a) && dt.test(b))) return []
+      if (!(num.test(a) || dt.test(a) || td.test(a))) return [[0, a]]
+      if (!(num.test(b) || dt.test(b) || td.test(b))) return [[1, b]]
+
+      // Reject invalid pairs, e.g.: datetime + number, datetime + datetime, etc.
+      return [[0, a]]
+    }
+
+    return super.validateTypeOfArgs(args)
+  }
+
+  parseArgs(args) {
+    if (args.some((a) => a instanceof Timedelta || a instanceof Date)) {
+      return args
+    }
+    return super.parseArgs(args)
+  }
+
+  execute(context, args) {
+    const [a, b] = args
+    if (a instanceof Timedelta && b instanceof Timedelta) {
+      return new Timedelta(a.ms + b.ms)
+    }
+    if (a instanceof Timedelta && typeof b === 'number') {
+      return new Timedelta(a.ms + b * 1000)
+    }
+    if (typeof a === 'number' && b instanceof Timedelta) {
+      return new Timedelta(a * 1000 + b.ms)
+    }
+    if (a instanceof Date && b instanceof Timedelta) {
+      return new Date(a.getTime() + b.ms)
+    }
+    if (a instanceof Timedelta && b instanceof Date) {
+      return new Date(b.getTime() + a.ms)
+    }
+    return a + b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.addDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '2 + 3',
+        result: '5',
+      },
+      {
+        formula: '1 + 2 + 3',
+        result: '6',
+      },
+    ]
+  }
+}
+
+export class RuntimeMinus extends RuntimeFormulaFunction {
+  static getType() {
+    return 'minus'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get getOperatorSymbol() {
+    return '-'
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  validateTypeOfArgs(args) {
+    if (args.length === 2) {
+      const [a, b] = args
+      const num = new NumberBaserowRuntimeFormulaArgumentType()
+      const dt = new DateTimeBaserowRuntimeFormulaArgumentType()
+      const td = new TimedeltaBaserowRuntimeFormulaArgumentType()
+      if (num.test(a) && num.test(b)) return []
+      if (td.test(a) && td.test(b)) return []
+      if ((td.test(a) && num.test(b)) || (num.test(a) && td.test(b))) return []
+      if (dt.test(a) && td.test(b)) return []
+      if (!(num.test(a) || dt.test(a) || td.test(a))) return [[0, a]]
+
+      // Reject invalid pairs, e.g.: datetime - number, timedelta - datetime, etc.
+      return [[1, b]]
+    }
+
+    return super.validateTypeOfArgs(args)
+  }
+
+  parseArgs(args) {
+    if (args.some((a) => a instanceof Timedelta || a instanceof Date)) {
+      return args
+    }
+    return super.parseArgs(args)
+  }
+
+  execute(context, args) {
+    const [a, b] = args
+    if (a instanceof Timedelta && b instanceof Timedelta) {
+      return new Timedelta(a.ms - b.ms)
+    }
+    if (a instanceof Timedelta && typeof b === 'number') {
+      return new Timedelta(a.ms - b * 1000)
+    }
+    if (typeof a === 'number' && b instanceof Timedelta) {
+      return new Timedelta(a * 1000 - b.ms)
+    }
+    if (a instanceof Date && b instanceof Timedelta) {
+      return new Date(a.getTime() - b.ms)
+    }
+    return a - b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.minusDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '3 - 2',
+        result: '1',
+      },
+      {
+        formula: '5 - 2 - 1',
+        result: '2',
+      },
+    ]
+  }
+}
+
+export class RuntimeMultiply extends RuntimeFormulaFunction {
+  static getType() {
+    return 'multiply'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get getOperatorSymbol() {
+    return '*'
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  validateTypeOfArgs(args) {
+    if (args.length === 2) {
+      const [a, b] = args
+      const num = new NumberBaserowRuntimeFormulaArgumentType()
+      const td = new TimedeltaBaserowRuntimeFormulaArgumentType()
+      if (num.test(a) && num.test(b)) return []
+      if ((td.test(a) && num.test(b)) || (num.test(a) && td.test(b))) return []
+      if (!(num.test(a) || td.test(a))) return [[0, a]]
+
+      // Reject invalid pairs, e.g.: timedelta * timedelta, etc.
+      return [[1, b]]
+    }
+
+    return super.validateTypeOfArgs(args)
+  }
+
+  parseArgs(args) {
+    if (args.some((a) => a instanceof Timedelta)) {
+      return args
+    }
+    return super.parseArgs(args)
+  }
+
+  execute(context, args) {
+    const [a, b] = args
+    if (a instanceof Timedelta && typeof b === 'number') {
+      return new Timedelta(a.ms * b)
+    }
+    if (typeof a === 'number' && b instanceof Timedelta) {
+      return new Timedelta(b.ms * a)
+    }
+    return a * b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.multiplyDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '2 * 3',
+        result: '6',
+      },
+      {
+        formula: '2 * 3 * 3',
+        result: '18',
+      },
+    ]
+  }
+}
+
+export class RuntimeDivide extends RuntimeFormulaFunction {
+  static getType() {
+    return 'divide'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get getOperatorSymbol() {
+    return '/'
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  validateTypeOfArgs(args) {
+    if (args.length === 2) {
+      const [a, b] = args
+      const num = new NumberBaserowRuntimeFormulaArgumentType()
+      const td = new TimedeltaBaserowRuntimeFormulaArgumentType()
+      if (num.test(a) && num.test(b)) return []
+      if (td.test(a) && num.test(b)) return []
+      if (!(num.test(a) || td.test(a))) return [[0, a]]
+
+      // Reject invalid pairs, e.g.: number / timedelta, timedelta / timedelta, etc.
+      return [[1, b]]
+    }
+
+    return super.validateTypeOfArgs(args)
+  }
+
+  parseArgs(args) {
+    if (args.some((a) => a instanceof Timedelta)) {
+      return args
+    }
+    return super.parseArgs(args)
+  }
+
+  execute(context, args) {
+    const [a, b] = args
+    if (a instanceof Timedelta && typeof b === 'number') {
+      return new Timedelta(a.ms / b)
+    }
+    return a / b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.divideDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '6 / 2',
+        result: '3',
+      },
+      {
+        formula: '15 / 2 / 2',
+        result: '3.75',
+      },
+    ]
+  }
+}
+
+export class RuntimeEqual extends RuntimeFormulaFunction {
+  static getType() {
+    return 'equal'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '='
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    return a === b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.equalDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '2 = 3',
+        result: 'false',
+      },
+      {
+        formula: '"foo" = "bar"',
+        result: 'false',
+      },
+      {
+        formula: '"foo" = "foo"',
+        result: 'true',
+      },
+      {
+        formula: 'now() = now()',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeNotEqual extends RuntimeFormulaFunction {
+  static getType() {
+    return 'not_equal'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '!='
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    return a !== b
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.notEqualDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '2 != 3',
+        result: 'true',
+      },
+      {
+        formula: '"foo" != "foo"',
+        result: 'false',
+      },
+      {
+        formula: '"foo" != "bar"',
+        result: 'true',
+      },
+      {
+        formula: 'now() != now()',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeGreaterThan extends RuntimeFormulaFunction {
+  static getType() {
+    return 'greater_than'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '>'
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    const typeA = typeof a
+    const typeB = typeof b
+
+    if (typeA === 'number' && typeB === 'number') {
+      return a > b
+    }
+
+    if (typeA === 'string' && typeB === 'string') {
+      return a > b
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.greaterThanDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '5 > 4',
+        result: 'true',
+      },
+      {
+        formula: '"a" > "b"',
+        result: 'false',
+      },
+      {
+        formula: '"Ambarella" > "fig"',
+        result: 'false',
+      },
+      {
+        formula: 'now() > now()',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeLessThan extends RuntimeFormulaFunction {
+  static getType() {
+    return 'less_than'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '<'
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    const typeA = typeof a
+    const typeB = typeof b
+
+    if (typeA === 'number' && typeB === 'number') {
+      return a < b
+    }
+
+    if (typeA === 'string' && typeB === 'string') {
+      return a < b
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.lessThanDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '2 < 3',
+        result: 'true',
+      },
+      {
+        formula: '"b" < "a"',
+        result: 'false',
+      },
+      {
+        formula: '"Ambarella" < "fig"',
+        result: 'true',
+      },
+      {
+        formula: 'now() < now()',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeGreaterThanOrEqual extends RuntimeFormulaFunction {
+  static getType() {
+    return 'greater_than_or_equal'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '>='
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    const typeA = typeof a
+    const typeB = typeof b
+
+    if (typeA === 'number' && typeB === 'number') {
+      return a >= b
+    }
+
+    if (typeA === 'string' && typeB === 'string') {
+      return a >= b
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.greaterThanOrEqualDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '3 >= 2',
+        result: 'false',
+      },
+      {
+        formula: '"b" >= "a"',
+        result: 'true',
+      },
+      {
+        formula: '"Ambarella" >= "fig"',
+        result: 'false',
+      },
+      {
+        formula: 'now() >= now()',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeLessThanOrEqual extends RuntimeFormulaFunction {
+  static getType() {
+    return 'less_than_or_equal'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get getOperatorSymbol() {
+    return '<='
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, [a, b]) {
+    const typeA = typeof a
+    const typeB = typeof b
+
+    if (typeA === 'number' && typeB === 'number') {
+      return a <= b
+    }
+
+    if (typeA === 'string' && typeB === 'string') {
+      return a <= b
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.lessThanDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: '3 <= 3',
+        result: 'true',
+      },
+      {
+        formula: '"a" <= "b"',
+        result: 'false',
+      },
+      {
+        formula: '"fig" <= "Ambarella"',
+        result: 'false',
+      },
+      {
+        formula: 'now() <= now()',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeUpper extends RuntimeFormulaFunction {
+  static getType() {
+    return 'upper'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [s]) {
+    return s.toUpperCase()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.upperDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "upper('Hello, World!')",
+        result: "'HELLO, WORLD!'",
+      },
+    ]
+  }
+}
+
+export class RuntimeLower extends RuntimeFormulaFunction {
+  static getType() {
+    return 'lower'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [s]) {
+    return s.toLowerCase()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.lowerDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "lower('Hello, World!')",
+        result: "'hello, world!'",
+      },
+    ]
+  }
+}
+
+export class RuntimeCapitalize extends RuntimeFormulaFunction {
+  static getType() {
+    return 'capitalize'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  capitalize(str) {
+    if (!str) return ''
+    const [firstChar, ...remainingChars] = [...str]
+    return firstChar.toUpperCase() + remainingChars.join('').toLowerCase()
+  }
+
+  execute(context, [s]) {
+    return this.capitalize(s)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.capitalizeDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "capitalize('hello, world!')",
+        result: "'Hello, world!'",
+      },
+    ]
+  }
+}
+
+export class RuntimeRound extends RuntimeFormulaFunction {
+  static getType() {
+    return 'round'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType({
+        optional: true,
+        castToInt: true,
+      }),
+    ]
+  }
+
+  execute(context, args) {
+    // Default to 2 decimal places
+    let decimalPlaces = 2
+
+    if (args.length === 2) {
+      // Avoid negative numbers
+      decimalPlaces = Math.max(args[1], 0)
+    }
+
+    return Number(args[0].toFixed(decimalPlaces))
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.roundDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "round('12.345', 2)",
+        result: '12.35',
+      },
+      {
+        formula: 'round(3.14159)',
+        result: '3.14',
+      },
+      {
+        formula: 'round(10 / 3, 1)',
+        result: '3.3',
+      },
+    ]
+  }
+}
+
+export class RuntimeAbs extends RuntimeFormulaFunction {
+  static getType() {
+    return 'abs'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [new NumberBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [n]) {
+    return Math.abs(n)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.absDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'abs(-5)',
+        result: '5',
+      },
+      {
+        formula: 'abs(3.14)',
+        result: '3.14',
+      },
+    ]
+  }
+}
+
+export class RuntimeIsEven extends RuntimeFormulaFunction {
+  static getType() {
+    return 'is_even'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get args() {
+    return [new NumberBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [n]) {
+    return n % 2 === 0
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.evenDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'is_even(12)',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeIsOdd extends RuntimeFormulaFunction {
+  static getType() {
+    return 'is_odd'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get args() {
+    return [new NumberBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [n]) {
+    return n % 2 !== 0
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.oddDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'is_odd(11)',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeDateTimeFormat extends RuntimeFormulaFunction {
+  static getType() {
+    return 'datetime_format'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [
+      new DateTimeBaserowRuntimeFormulaArgumentType(),
+      new DatetimeFormatBaserowRuntimeFormulaArgumentType(),
+      new TimezoneBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  execute(context, args) {
+    const [
+      datetime,
+      momentFormat,
+      timezone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+    ] = args
+
+    return moment(datetime).tz(timezone).format(momentFormat)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.dateTimeDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "datetime_format(now(), 'YYYY-MM-DD')",
+        result: "'2025-11-03'",
+      },
+      {
+        formula: "datetime_format(now(), 'YYYY-MM-DD', 'Europe/Amsterdam')",
+        result: "'2025-11-03'",
+      },
+      {
+        formula: "datetime_format(now(), 'DD/MM/YYYY HH:mm:ss', 'UTC')",
+        result: "'03/11/2025 12:12:09'",
+      },
+    ]
+  }
+}
+
+export class RuntimeDay extends RuntimeFormulaFunction {
+  static getType() {
+    return 'day'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getDate()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.dayDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "day('2025-10-16 11:05:38')",
+        result: '16',
+      },
+      {
+        formula: 'day(today())',
+        result: '16',
+      },
+    ]
+  }
+}
+
+export class RuntimeMonth extends RuntimeFormulaFunction {
+  static getType() {
+    return 'month'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getMonth()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.monthDescription')
+  }
+
+  getExamples() {
+    // Month is 0 indexed
+    return [
+      {
+        formula: "month('2025-10-16 11:05:38')",
+        result: '9',
+      },
+      {
+        formula: 'month(now())',
+        result: '9',
+      },
+    ]
+  }
+}
+
+export class RuntimeYear extends RuntimeFormulaFunction {
+  static getType() {
+    return 'year'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getFullYear()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.yearDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "year('2025-10-16 11:05:38')",
+        result: '2025',
+      },
+      {
+        formula: 'year(today())',
+        result: '2025',
+      },
+    ]
+  }
+}
+
+export class RuntimeHour extends RuntimeFormulaFunction {
+  static getType() {
+    return 'hour'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getHours()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.hourDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "hour('2025-10-16 11:05:38')",
+        result: '11',
+      },
+    ]
+  }
+}
+
+export class RuntimeMinute extends RuntimeFormulaFunction {
+  static getType() {
+    return 'minute'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getMinutes()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.minuteDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "minute('2025-10-16T11:05:38')",
+        result: '5',
+      },
+      {
+        formula: 'minute(now())',
+        result: '5',
+      },
+    ]
+  }
+}
+
+export class RuntimeSecond extends RuntimeFormulaFunction {
+  static getType() {
+    return 'second'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [new DateTimeBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [datetime]) {
+    return datetime.getSeconds()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.secondDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "second('2025-10-16 11:05:38')",
+        result: '38',
+      },
+      {
+        formula: 'second(now())',
+        result: '38',
+      },
+    ]
+  }
+}
+
+export class RuntimeNow extends RuntimeFormulaFunction {
+  static getType() {
+    return 'now'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return []
+  }
+
+  execute(context, args) {
+    return new Date()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.nowDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'now()',
+        result: "'2025-10-16 11:05:38'",
+      },
+    ]
+  }
+}
+
+export class RuntimeToday extends RuntimeFormulaFunction {
+  static getType() {
+    return 'today'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return []
+  }
+
+  execute(context, args) {
+    return new Date().toISOString().split('T')[0]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.todayDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'today()',
+        result: "'2025-10-16'",
+      },
+    ]
+  }
+}
+
+export class RuntimeGetProperty extends RuntimeFormulaFunction {
+  static getType() {
+    return 'get_property'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [
+      new ObjectBaserowRuntimeFormulaArgumentType(),
+      new TextBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    return args[0][args[1]]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.getPropertyDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'get_property(\'{"cherry": "red"}\', \'cherry\')',
+        result: "'red'",
+      },
+      {
+        formula: 'get_property(from_json(\'{"name": "Ada"}\'), \'name\')',
+        result: "'Ada'",
+      },
+    ]
+  }
+}
+
+export class RuntimeRandomInt extends RuntimeFormulaFunction {
+  static getType() {
+    return 'random_int'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType({ castToInt: true }),
+      new NumberBaserowRuntimeFormulaArgumentType({ castToInt: true }),
+    ]
+  }
+
+  execute(context, args) {
+    const min = Math.ceil(args[0])
+    const max = Math.floor(args[1])
+    return Math.floor(Math.random() * (max - min + 1) + min)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.randomIntDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'random_int(10, 20)',
+        result: '17',
+      },
+    ]
+  }
+}
+
+export class RuntimeRandomFloat extends RuntimeFormulaFunction {
+  static getType() {
+    return 'random_float'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType({ castToFloat: true }),
+      new NumberBaserowRuntimeFormulaArgumentType({ castToFloat: true }),
+    ]
+  }
+
+  execute(context, args) {
+    return Math.random() * (args[1] - args[0]) + args[0]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.randomFloatDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'random_float(10, 20)',
+        result: '18.410550297490616',
+      },
+    ]
+  }
+}
+
+export class RuntimeRandomBool extends RuntimeFormulaFunction {
+  static getType() {
+    return 'random_bool'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.BOOLEAN
+  }
+
+  get args() {
+    return []
+  }
+
+  execute(context, args) {
+    return Math.random() < 0.5
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.randomBoolDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'random_bool()',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeGenerateUUID extends RuntimeFormulaFunction {
+  static getType() {
+    return 'generate_uuid'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return []
+  }
+
+  execute(context, args) {
+    return generateUUID()
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.generateUUIDDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'generate_uuid()',
+        result: "'9b772ad6-08bc-4d19-958d-7f1c21a4f4ef'",
+      },
+    ]
+  }
+}
+
+export class RuntimeIf extends RuntimeFormulaFunction {
+  static getType() {
+    return 'if'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.CONDITION
+  }
+
+  get args() {
+    return [
+      new BooleanBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    return args[0] ? args[1] : args[2]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.ifDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'if(true, true, false)',
+        result: 'true',
+      },
+      {
+        formula:
+          "if(random_bool(), 'Random bool is true', 'Random bool is false')",
+        result: "'Random bool is false'",
+      },
+    ]
+  }
+}
+
+export class RuntimeAnd extends RuntimeFormulaFunction {
+  static getType() {
+    return 'and'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.CONDITION
+  }
+
+  get getOperatorSymbol() {
+    return '&&'
+  }
+
+  get args() {
+    return [
+      new BooleanBaserowRuntimeFormulaArgumentType(),
+      new BooleanBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    return args[0] && args[1]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.andDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'true && true',
+        result: 'true',
+      },
+      {
+        formula: 'true && true && false',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeOr extends RuntimeFormulaFunction {
+  static getType() {
+    return 'or'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.OPERATOR
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.CONDITION
+  }
+
+  get getOperatorSymbol() {
+    return '||'
+  }
+
+  get args() {
+    return [
+      new BooleanBaserowRuntimeFormulaArgumentType(),
+      new BooleanBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    return args[0] || args[1]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.orDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'true || true',
+        result: 'true',
+      },
+      {
+        formula: 'true || true || false',
+        result: 'true',
+      },
+      {
+        formula: 'false || false',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeReplace extends RuntimeFormulaFunction {
+  static getType() {
+    return 'replace'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [
+      new TextBaserowRuntimeFormulaArgumentType(),
+      new TextBaserowRuntimeFormulaArgumentType(),
+      new TextBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    return args[0].replaceAll(args[1], args[2])
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.replaceDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "replace('Hello, world!', 'l', '-')",
+        result: "'He--o, wor-d!'",
+      },
+      {
+        formula: "replace('2025-10-16', '-', '/')",
+        result: "'2025/10/16'",
+      },
+    ]
+  }
+}
+
+export class RuntimeLength extends RuntimeFormulaFunction {
+  static getType() {
+    return 'length'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new AnyBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [value]) {
+    if (Array.isArray(value)) {
+      return value.length
+    } else if (value !== null && typeof value === 'object') {
+      return Object.keys(value).length
+    } else if (typeof value === 'string') {
+      return value.length
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.lengthDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "length('Hello, world!')",
+        result: '13',
+      },
+      {
+        formula: 'length(to_array("foo, bar"))',
+        result: '2',
+      },
+    ]
+  }
+}
+
+export class RuntimeContains extends RuntimeFormulaFunction {
+  static getType() {
+    return 'contains'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new AnyBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    const value = args[0]
+    const toCheck = args[1]
+
+    if (Array.isArray(value)) {
+      return value.includes(toCheck)
+    } else if (value !== null && typeof value === 'object') {
+      return Object.keys(value).includes(toCheck)
+    } else if (typeof value === 'string') {
+      return value.includes(toCheck)
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.containsDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "contains('Hello, world!', 'll')",
+        result: 'true',
+      },
+      {
+        formula: 'contains(to_array("foo, bar"), "foo")',
+        result: 'true',
+      },
+    ]
+  }
+}
+
+export class RuntimeReverse extends RuntimeFormulaFunction {
+  static getType() {
+    return 'reverse'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new AnyBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    if (Array.isArray(arg)) {
+      return arg.reverse()
+    }
+
+    if (typeof arg === 'string') {
+      return reverseString(arg)
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.reverseDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "reverse('Hello, world!')",
+        result: "'!dlrow ,olleH'",
+      },
+      {
+        formula: "reverse('😀💙🚀')",
+        result: "'🚀💙😀",
+      },
+      {
+        formula: 'reverse(to_array("foo, bar"))',
+        result: "'bar,foo'",
+      },
+    ]
+  }
+}
+
+export class RuntimeJoin extends RuntimeFormulaFunction {
+  static getType() {
+    return 'join'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new TextBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  execute(context, args) {
+    const val = args[0]
+    let separator = ','
+    if (args.length === 2) {
+      separator = args[1]
+    }
+
+    if (Array.isArray(val)) {
+      return val.join(separator)
+    }
+
+    if (typeof val === 'string') {
+      return val.split('').join(separator)
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.joinDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'join(to_array("foo, bar"))',
+        result: "'foo,bar'",
+      },
+      {
+        formula: 'join(to_array("foo, bar"), " * ")',
+        result: "'foo * bar'",
+      },
+    ]
+  }
+}
+
+export class RuntimeSplit extends RuntimeFormulaFunction {
+  static getType() {
+    return 'split'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [
+      new TextBaserowRuntimeFormulaArgumentType(),
+      new TextBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  execute(context, args) {
+    let separator = ''
+    if (args.length === 2) {
+      separator = args[1]
+    }
+    return args[0].split(separator)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.splitDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'split("foobar")',
+        result: "'f,o,o,b,a,r'",
+      },
+      {
+        formula: 'split("foobar", "b")',
+        result: "'foo,ar'",
+      },
+    ]
+  }
+}
+
+export class RuntimeIsEmpty extends RuntimeFormulaFunction {
+  static getType() {
+    return 'is_empty'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new AnyBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    if (arg === undefined || arg === null) {
+      return true
+    }
+
+    if (Array.isArray(arg)) {
+      return arg.length === 0
+    }
+
+    if (typeof arg === 'object') {
+      return Object.keys(arg).length === 0
+    }
+
+    if (typeof arg === 'string') {
+      return arg.trim().length === 0
+    }
+
+    return false
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.isEmptyDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "is_empty('')",
+        result: 'true',
+      },
+      {
+        formula: 'is_empty(0)',
+        result: 'true',
+      },
+      {
+        formula: 'is_empty(to_array(""))',
+        result: 'true',
+      },
+      {
+        formula: "is_empty('foo')",
+        result: 'false',
+      },
+      {
+        formula: 'is_empty(1)',
+        result: 'false',
+      },
+      {
+        formula: 'is_empty(to_array("foo,bar"))',
+        result: 'false',
+      },
+    ]
+  }
+}
+
+export class RuntimeStrip extends RuntimeFormulaFunction {
+  static getType() {
+    return 'strip'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    if (typeof arg === 'string' && isNaN(Number(arg))) {
+      return arg.trim()
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.stripDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "strip(' foo ')",
+        result: "'foo'",
+      },
+    ]
+  }
+}
+
+export class RuntimeEncodeUri extends RuntimeFormulaFunction {
+  static getType() {
+    return 'encode_uri'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [value]) {
+    return encodeURI(value)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.encodeUriDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "encode_uri('https://example.com/a b')",
+        result: "'https://example.com/a%20b'",
+      },
+    ]
+  }
+}
+
+export class RuntimeEncodeUriComponent extends RuntimeFormulaFunction {
+  static getType() {
+    return 'encode_uri_component'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [value]) {
+    return encodeURIComponent(value)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.encodeUriComponentDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "encode_uri_component('a&b')",
+        result: "'a%26b'",
+      },
+    ]
+  }
+}
+
+export class RuntimeMarkdownToHtml extends RuntimeFormulaFunction {
+  static getType() {
+    return 'markdown_to_html'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [value]) {
+    return markdownToHtml(value)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.markdownToHtmlDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "markdown_to_html('**Hello** world')",
+        result: "'<p><strong>Hello</strong> world</p>'",
+      },
+    ]
+  }
+}
+
+export class RuntimeSum extends RuntimeFormulaFunction {
+  static getType() {
+    return 'sum'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [new ArrayOfNumbersBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    try {
+      return sum(arg, { strict: true })
+    } catch {
+      return null
+    }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.sumDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'sum(to_array("1, 2, 3"))',
+        result: '6',
+      },
+      {
+        formula: 'sum(to_array("1, 2.5, 3"))',
+        result: '6.5',
+      },
+    ]
+  }
+}
+
+export class RuntimeAvg extends RuntimeFormulaFunction {
+  static getType() {
+    return 'avg'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [new ArrayOfNumbersBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    try {
+      return avg(arg, { strict: true })
+    } catch {
+      return null
+    }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.avgDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "avg(to_array('1, 2, 3, 4'))",
+        result: '2.5',
+      },
+    ]
+  }
+}
+
+export class RuntimeAt extends RuntimeFormulaFunction {
+  static getType() {
+    return 'at'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [
+      new AnyBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType({ castToInt: true }),
+    ]
+  }
+
+  execute(context, args) {
+    const [value, index] = args
+
+    if (
+      (Array.isArray(value) || typeof value === 'string') &&
+      value.length > index
+    ) {
+      return value[index]
+    }
+
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.atDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'at(to_array("foo, bar"), 1)',
+        result: '"bar"',
+      },
+      {
+        formula: 'at(to_array("foo, bar"), 3)',
+        result: 'null',
+      },
+    ]
+  }
+}
+
+export class RuntimeToArray extends RuntimeFormulaFunction {
+  static getType() {
+    return 'to_array'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.TEXT
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    try {
+      return ensureArray(arg)
+    } catch {
+      return null
+    }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.toArrayDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "to_array('foo,bar')",
+        result: '["foo", "bar"]',
+      },
+    ]
+  }
+}
+
+export class RuntimeRange extends RuntimeFormulaFunction {
+  static getType() {
+    return 'range'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType({ castToInt: true }),
+      new NumberBaserowRuntimeFormulaArgumentType({
+        optional: true,
+        castToInt: true,
+      }),
+      new NumberBaserowRuntimeFormulaArgumentType({
+        optional: true,
+        castToInt: true,
+      }),
+    ]
+  }
+
+  execute(context, args) {
+    const [start, stop, step] =
+      args.length === 1
+        ? [0, args[0], 1]
+        : args.length === 2
+          ? [args[0], args[1], 1]
+          : [args[0], args[1], args[2]]
+
+    if (step === 0) {
+      return null
+    }
+
+    // range() length is computed up front so an oversized range is rejected
+    // before building the array.
+    const count = Math.max(0, Math.ceil((stop - start) / step))
+    const maxItems = Number(this.app.$config.public.formulaRangeMaxItems)
+    if (count > maxItems) {
+      return null
+    }
+
+    const result = []
+    if (step > 0) {
+      for (let i = start; i < stop; i += step) {
+        result.push(i)
+      }
+    } else {
+      for (let i = start; i > stop; i += step) {
+        result.push(i)
+      }
+    }
+    return result
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.rangeDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'range(4)',
+        result: '[0, 1, 2, 3]',
+      },
+      {
+        formula: 'range(1, 5)',
+        result: '[1, 2, 3, 4]',
+      },
+      {
+        formula: 'range(0, 10, 2)',
+        result: '[0, 2, 4, 6, 8]',
+      },
+    ]
+  }
+}
+
+export class RuntimeToJson extends RuntimeFormulaFunction {
+  static getType() {
+    return 'to_json'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new AnyBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    try {
+      return JSON.stringify(ensureJsonSerializable(arg))
+    } catch {
+      return null
+    }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.toJsonDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "concat('{\"value\": ', to_json('foo \"bar\"'), '}')",
+        result: '\'{"value": "foo \\"bar\\""}\'',
+      },
+      {
+        formula: "to_json(to_array('a, b'))",
+        result: '\'["a","b"]\'',
+      },
+    ]
+  }
+}
+
+export class RuntimeFromJson extends RuntimeFormulaFunction {
+  static getType() {
+    return 'from_json'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return [new TextBaserowRuntimeFormulaArgumentType()]
+  }
+
+  execute(context, [arg]) {
+    try {
+      return ensureDeserializedJson(arg, { strict: true })
+    } catch {
+      return null
+    }
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.fromJsonDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "from_json('[1, 2, 3]')",
+        result: '[1, 2, 3]',
+      },
+    ]
+  }
+}
+
+export class RuntimeNull extends RuntimeFormulaFunction {
+  static getType() {
+    return 'null'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.UTILITY
+  }
+
+  get args() {
+    return []
+  }
+
+  execute(context, args) {
+    return null
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.nullDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'null()',
+        result: 'null',
+      },
+    ]
+  }
+}
+
+export class RuntimeNumberFormat extends RuntimeFormulaFunction {
+  static getType() {
+    return 'number_format'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.NUMBER
+  }
+
+  get args() {
+    return [
+      new NumberBaserowRuntimeFormulaArgumentType(),
+      new NumberBaserowRuntimeFormulaArgumentType({
+        optional: true,
+        castToInt: true,
+      }),
+      new ThousandSeparatorBaserowRuntimeFormulaArgumentType({
+        optional: true,
+      }),
+      new DecimalSeparatorBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  validateArgs(args, { ctx = null, validationContext = {} } = {}) {
+    super.validateArgs(args, { ctx, validationContext })
+    if (args.length >= 4 && args[2] === args[3]) {
+      const { $i18n } = this.app
+      throw new InvalidFormulaArgument(
+        this.getType(),
+        $i18n.t('runtimeFormulaTypeErrors.sameSeparators')
+      )
+    }
+  }
+
+  execute(context, args) {
+    const value = args[0]
+    // `toFixed` throws a RangeError above 100 decimal places.
+    const decimalPlaces =
+      args.length > 1 ? Math.min(Math.max(Math.trunc(args[1]), 0), 100) : 0
+    const thousandSep = args.length > 2 ? args[2] : ','
+    const decimalSep = args.length > 3 ? args[3] : '.'
+
+    const isNegative = value < 0
+    const absValue = Math.abs(value)
+    const formatted = absValue.toFixed(decimalPlaces)
+
+    let intPart, decPart
+    if (decimalPlaces > 0) {
+      ;[intPart, decPart] = formatted.split('.')
+    } else {
+      intPart = formatted
+      decPart = undefined
+    }
+
+    intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, thousandSep)
+    let result =
+      decPart !== undefined ? intPart + decimalSep + decPart : intPart
+
+    if (isNegative) result = '-' + result
+    return result
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.numberFormatDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: 'number_format(1000000)',
+        result: "'1,000,000'",
+      },
+      {
+        formula: 'number_format(1000000, 2)',
+        result: "'1,000,000.00'",
+      },
+      {
+        formula: "number_format(1000000, 2, '.', ',')",
+        result: "'1.000.000,00'",
+      },
+    ]
+  }
+}
+
+export class RuntimeToDatetime extends RuntimeFormulaFunction {
+  static getType() {
+    return 'to_datetime'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [
+      new TextBaserowRuntimeFormulaArgumentType(),
+      new DatetimeFormatBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  validateArgs(args, { ctx = null, validationContext = {} } = {}) {
+    super.validateArgs(args, { ctx, validationContext })
+    const value = args[0]
+    if (args.length === 2) {
+      const fmt = args[1]
+      try {
+        ensureDateTime(value, { allowEmpty: false, format: fmt })
+      } catch {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          `'${value}' could not be parsed using format '${fmt}'.`
+        )
+      }
+    } else {
+      // "2026" is a valid string argument to moment, but the backend
+      // expects the full datetime string. This ensures that we don't
+      // allow "2026" or "2026-05" to be accepted as valid.
+      const hasMinDatePart = /^\d{4}-\d{2}-\d{2}/.test(value)
+      if (!hasMinDatePart) {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          `'${value}' is not a valid datetime string.`
+        )
+      }
+
+      try {
+        ensureDateTime(value, { allowEmpty: false })
+      } catch {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          `'${value}' is not a valid datetime string.`
+        )
+      }
+    }
+  }
+
+  execute(context, args) {
+    if (args.length === 2) {
+      return ensureDateTime(args[0], { allowEmpty: false, format: args[1] })
+    }
+    return ensureDateTime(args[0], { allowEmpty: false })
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.toDatetimeDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "to_datetime('2024-01-15')",
+        result: '2024-01-15T00:00:00',
+      },
+      {
+        formula: "to_datetime('15/01/2024', 'DD/MM/YYYY')",
+        result: '2024-01-15T00:00:00',
+      },
+    ]
+  }
+}
+
+export class RuntimeToDuration extends RuntimeFormulaFunction {
+  static getType() {
+    return 'to_duration'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [
+      new DurationBaserowRuntimeFormulaArgumentType(),
+      new DurationFormatBaserowRuntimeFormulaArgumentType({ optional: true }),
+    ]
+  }
+
+  formatMismatchError(value, durationFormat) {
+    return `'${value}' could not be parsed using format '${durationFormat}'.`
+  }
+
+  timedeltaWithFormatError() {
+    return 'A duration format cannot be applied to a timedelta value.'
+  }
+
+  validateTypeOfArgs(args) {
+    // When a format is provided, arg 0's validity depends on the format.
+    // Defer checking arg 0 to validateArgs() in that case.
+    if (args.length === 2) {
+      if (!this.args[1].test(args[1])) {
+        return [[1, args[1]]]
+      }
+      return []
+    }
+    return super.validateTypeOfArgs(args)
+  }
+
+  validateArgs(args, { ctx = null, validationContext = {} } = {}) {
+    super.validateArgs(args, { ctx, validationContext })
+
+    if (args.length !== 2) {
+      return
+    }
+
+    const [value, durationFormat] = args
+    if (typeof value === 'string') {
+      if (parseValueWithDurationFormat(value, durationFormat) === null) {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          this.formatMismatchError(value, durationFormat)
+        )
+      }
+    }
+  }
+
+  parseArgs(args) {
+    // When the format arg is provided, defer parsing of the 1st arg to
+    // execute() so the raw value string is checked later.
+    if (args.length === 2) {
+      return [args[0], this.args[1].parse(args[1])]
+    }
+    return super.parseArgs(args)
+  }
+
+  execute(context, args) {
+    if (args.length === 2) {
+      const [value, durationFormat] = args
+      // Arg 0 may resolve to a Timedelta at runtime (e.g. from a get() on
+      // a duration field), in which case it doesn't make sense to
+      // apply a format.
+      if (value instanceof Timedelta) {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          this.timedeltaWithFormatError()
+        )
+      }
+      const result = parseValueWithDurationFormat(value, durationFormat)
+      if (result === null) {
+        throw new InvalidFormulaArgument(
+          this.getType(),
+          this.formatMismatchError(value, durationFormat)
+        )
+      }
+      return result
+    }
+    return args[0]
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.toDurationDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula: "to_duration('1:30:15.234', 'h:mm:ss.fff')",
+        result: '5415 seconds',
+      },
+      {
+        formula: "to_duration('1 day')",
+        result: '86400 seconds',
+      },
+      {
+        formula: "now() + to_duration('1 day')",
+        result: "'2025-10-17 11:05:38'",
+      },
+    ]
+  }
+}
+
+export class RuntimeDurationFormat extends RuntimeFormulaFunction {
+  static getType() {
+    return 'duration_format'
+  }
+
+  static getFormulaType() {
+    return FORMULA_TYPE.FUNCTION
+  }
+
+  static getCategoryType() {
+    return FORMULA_CATEGORY.DATE
+  }
+
+  get args() {
+    return [
+      new DurationBaserowRuntimeFormulaArgumentType(),
+      new DurationFormatBaserowRuntimeFormulaArgumentType(),
+    ]
+  }
+
+  execute(context, args) {
+    const [duration, durationFormat] = args
+    if (duration === null || duration === undefined) {
+      return null
+    }
+    return formatValueWithDurationFormat(duration, durationFormat)
+  }
+
+  getDescription() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('runtimeFormulaTypes.durationFormatDescription')
+  }
+
+  getExamples() {
+    return [
+      {
+        formula:
+          "duration_format(to_duration('1:30:25.234', 'h:mm:ss.fff'), 'h:mm:ss.f')",
+        result: "'1:30:25.2'",
+      },
+      {
+        formula: "duration_format(to_duration('26:30', 'h:mm'), 'd h:mm')",
+        result: "'1 2:30'",
+      },
+    ]
+  }
+}

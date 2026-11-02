@@ -1,0 +1,21 @@
+.read-only-form {
+  & input,
+  & .input,
+  & .form-input,
+  & .formula-input-field,
+  & .dropdown,
+  & .control__label,
+  & .color-input__input,
+  & .checkbox,
+  & .radio,
+  & .segment-control,
+  & a,
+  & .button,
+  & .button-icon,
+  & .button-text,
+  & .chips {
+    pointer-events: none;
+    user-select: none;
+    opacity: 0.7;
+  }
+}

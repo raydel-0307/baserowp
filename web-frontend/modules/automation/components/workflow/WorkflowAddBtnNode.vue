@@ -1,0 +1,44 @@
+<template>
+  <div>
+    <ButtonFloating
+      ref="btn"
+      icon="iconoir-plus"
+      size="small"
+      :disabled="props.disabled"
+      :title="$t('workflowAddNode.displayTitle')"
+      @click="toggleCreateContext"
+      @mousedown.stop
+    />
+    <WorkflowNodeContext
+      ref="context"
+      @change="emit('add-node', $event)"
+      @recipe="emit('add-recipe', $event)"
+    />
+  </div>
+</template>
+
+<script setup>
+import WorkflowNodeContext from '@baserow/modules/automation/components/workflow/WorkflowNodeContext'
+import { useVueFlow } from '@vue-flow/core'
+
+const props = defineProps({
+  disabled: {
+    type: Boolean,
+    default: false,
+  },
+})
+
+const emit = defineEmits(['add-node', 'add-recipe'])
+const context = ref()
+const btn = ref()
+
+// Hide context on pan
+const { onMove } = useVueFlow()
+onMove(() => {
+  context.value.hide()
+})
+
+const toggleCreateContext = (nodeId) => {
+  context.value.show(btn.value.$el, 'bottom', 'left', 10, -225)
+}
+</script>

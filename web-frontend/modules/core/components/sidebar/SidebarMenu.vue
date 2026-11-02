@@ -1,0 +1,225 @@
+<template>
+  <div class="sidebar__section" ph-autocapture="sidebar" data-highlight="menu">
+    <ul class="tree">
+      <SidebarSearch
+        :selected-workspace="selectedWorkspace"
+        @open-workspace-search="openWorkspaceSearch"
+      />
+      <nuxt-link
+        v-slot="{ href, navigate, isExactActive, prefetch, shouldPrefetch }"
+        custom
+        prefetch-on="interaction"
+        :to="{
+          name: 'workspace',
+          params: {
+            workspaceId: selectedWorkspace.id,
+          },
+        }"
+      >
+        <li
+          class="tree__item"
+          :class="{
+            active: isExactActive,
+          }"
+        >
+          <div class="tree__action sidebar__action">
+            <a
+              :href="href"
+              class="tree__link"
+              @click="navigate"
+              @pointerenter="shouldPrefetch('interaction') && prefetch()"
+              @focus="shouldPrefetch('interaction') && prefetch()"
+            >
+              <i class="tree__icon iconoir-clock"></i>
+              <span class="tree__link-text">
+                <span class="sidebar__item-name">{{
+                  $t('sidebar.recents')
+                }}</span>
+              </span>
+            </a>
+          </div>
+        </li>
+      </nuxt-link>
+
+      <li class="tree__item">
+        <div class="tree__action tree__action--has-counter">
+          <a
+            class="tree__link"
+            @click="$refs.notificationPanel.toggle($event.currentTarget)"
+          >
+            <i class="tree__icon tree__icon--type iconoir-bell"></i>
+            <span class="tree__link-text">{{
+              $t('sidebar.notifications')
+            }}</span>
+          </a>
+          <BadgeCounter
+            v-show="unreadNotificationCount"
+            class="tree__counter"
+            :count="unreadNotificationCount"
+            :limit="10"
+          >
+          </BadgeCounter>
+        </div>
+        <NotificationPanel ref="notificationPanel" />
+      </li>
+
+      <nuxt-link
+        v-if="
+          $hasPermission(
+            'workspace.list_workspace_users',
+            selectedWorkspace,
+            selectedWorkspace.id
+          )
+        "
+        v-slot="{ href, navigate, prefetch, shouldPrefetch }"
+        custom
+        prefetch-on="interaction"
+        :to="{
+          name: 'settings-members',
+          params: {
+            workspaceId: selectedWorkspace.id,
+          },
+        }"
+      >
+        <li
+          class="tree__item"
+          :class="{
+            active: isManagementPage,
+          }"
+          data-highlight="members"
+        >
+          <div class="tree__action sidebar__action">
+            <a
+              :href="href"
+              class="tree__link"
+              @click="navigate"
+              @pointerenter="shouldPrefetch('interaction') && prefetch()"
+              @focus="shouldPrefetch('interaction') && prefetch()"
+            >
+              <i class="tree__icon baserow-icon-team"></i>
+              <span class="tree__link-text">
+                <span class="sidebar__item-name">{{
+                  $t('sidebar.members')
+                }}</span>
+              </span>
+              <span v-if="membersCount" class="sidebar__item-count">
+                {{ membersCount }}</span
+              >
+            </a>
+          </div>
+        </li>
+      </nuxt-link>
+
+      <li
+        v-if="
+          $hasPermission(
+            'workspace.create_invitation',
+            selectedWorkspace,
+            selectedWorkspace.id
+          )
+        "
+        class="tree__item"
+      >
+        <div class="tree__action sidebar__action">
+          <a class="tree__link" @click="$refs.inviteModal.show()">
+            <i class="tree__icon iconoir-add-user"></i>
+            <span class="tree__link-text">
+              <span class="sidebar__item-name">{{
+                $t('sidebar.inviteOthers')
+              }}</span>
+            </span>
+          </a>
+        </div>
+
+        <InviteModal ref="inviteModal" :workspace="selectedWorkspace" />
+      </li>
+      <component
+        :is="component"
+        v-for="(component, index) in sidebarWorkspaceComponents"
+        :key="'sidebarWorkspaceComponents' + index"
+        :workspace="selectedWorkspace"
+        :right-sidebar-open="rightSidebarOpen"
+      ></component>
+      <li class="tree__item">
+        <div class="tree__action sidebar__action">
+          <a class="tree__link" @click="$refs.trashModal.show()">
+            <i class="tree__icon iconoir-bin"></i>
+            <span class="tree__link-text">
+              <span class="sidebar__item-name">{{ $t('sidebar.trash') }}</span>
+            </span>
+          </a>
+          <TrashModal
+            ref="trashModal"
+            :initial-workspace="selectedWorkspace"
+          ></TrashModal>
+        </div>
+      </li>
+    </ul>
+  </div>
+</template>
+
+<script>
+import { mapGetters } from 'vuex'
+import { getWorkspaceMembersCount } from '@baserow/modules/core/utils/workspace'
+
+import TrashModal from '@baserow/modules/core/components/trash/TrashModal'
+import NotificationPanel from '@baserow/modules/core/components/NotificationPanel'
+import InviteModal from '@baserow/modules/core/components/invitation/InviteModal'
+import BadgeCounter from '@baserow/modules/core/components/BadgeCounter'
+import SidebarSearch from '@baserow/modules/core/components/sidebar/SidebarSearch'
+
+export default {
+  name: 'SidebarMenu',
+  components: {
+    TrashModal,
+    NotificationPanel,
+    InviteModal,
+    BadgeCounter,
+    SidebarSearch,
+  },
+  props: {
+    selectedWorkspace: {
+      type: Object,
+      required: true,
+    },
+    rightSidebarOpen: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+  },
+  emits: ['open-workspace-search'],
+  computed: {
+    membersCount() {
+      return getWorkspaceMembersCount(
+        this.selectedWorkspace,
+        this.$hasPermission(
+          'workspace.list_agents',
+          this.selectedWorkspace,
+          this.selectedWorkspace.id
+        )
+      )
+    },
+    isManagementPage() {
+      return ['settings-members', 'settings-teams', 'settings-agents'].includes(
+        this.$route.name
+      )
+    },
+    sidebarWorkspaceComponents() {
+      return Object.values(this.$registry.getAll('plugin'))
+        .flatMap((plugin) =>
+          plugin.getSidebarWorkspaceComponents(this.selectedWorkspace)
+        )
+        .filter((component) => component !== null)
+    },
+    ...mapGetters({
+      unreadNotificationCount: 'notification/getUnreadCount',
+    }),
+  },
+  methods: {
+    openWorkspaceSearch() {
+      this.$emit('open-workspace-search')
+    },
+  },
+}
+</script>

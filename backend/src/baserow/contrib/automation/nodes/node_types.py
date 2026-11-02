@@ -1,0 +1,960 @@
+from typing import Any, Callable, Dict, Iterable, Optional
+
+from django.contrib.auth.models import AbstractUser
+from django.db import router, transaction
+from django.db.models import Q
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from celery.exceptions import SoftTimeLimitExceeded
+from loguru import logger
+
+from baserow.contrib.automation.history.constants import HistoryStatusChoices
+from baserow.contrib.automation.nodes.constants import ERROR_POLICY_FIELDS
+from baserow.contrib.automation.nodes.exceptions import (
+    AutomationNodeDoesNotExist,
+    AutomationNodeFirstNodeMustBeTrigger,
+    AutomationNodeMisconfiguredService,
+    AutomationNodeNotDeletable,
+    AutomationNodeNotMovable,
+    AutomationNodeNotReplaceable,
+    AutomationNodeTriggerAlreadyExists,
+    AutomationNodeTriggerMustBeFirstNode,
+)
+from baserow.contrib.automation.nodes.models import (
+    AIAgentActionNode,
+    AutomationNode,
+    AutomationTriggerNode,
+    CoreCSVFileReaderActionNode,
+    CoreGotoActionNode,
+    CoreHTTPRequestActionNode,
+    CoreHTTPTriggerNode,
+    CoreInboundEmailTriggerNode,
+    CoreIteratorActionNode,
+    CoreManualTriggerNode,
+    CorePeriodicTriggerNode,
+    CoreResponseActionNode,
+    CoreRouterActionNode,
+    CoreSMTPEmailActionNode,
+    CoreStartWorkflowActionNode,
+    LocalBaserowAggregateRowsActionNode,
+    LocalBaserowCreateRowActionNode,
+    LocalBaserowCreateRowsActionNode,
+    LocalBaserowDeleteRowActionNode,
+    LocalBaserowFieldsUpdatedTriggerNode,
+    LocalBaserowGetRowActionNode,
+    LocalBaserowListRowsActionNode,
+    LocalBaserowRowsCreatedTriggerNode,
+    LocalBaserowRowsDeletedTriggerNode,
+    LocalBaserowRowsUpdatedTriggerNode,
+    LocalBaserowUpdateRowActionNode,
+    LocalBaserowUpdateRowsActionNode,
+    SlackWriteMessageActionNode,
+)
+from baserow.contrib.automation.nodes.registries import AutomationNodeType
+from baserow.contrib.automation.nodes.signals import automation_node_updated
+from baserow.contrib.automation.workflows.constants import WorkflowState
+from baserow.contrib.automation.workflows.models import AutomationWorkflow
+from baserow.contrib.integrations.ai.service_types import AIAgentServiceType
+from baserow.contrib.integrations.core.inbound_email import (
+    is_inbound_email_configured,
+)
+from baserow.contrib.integrations.core.models import CoreGotoService
+from baserow.contrib.integrations.core.service_types import (
+    CoreCSVFileReaderServiceType,
+    CoreGotoServiceType,
+    CoreHTTPRequestServiceType,
+    CoreHTTPTriggerServiceType,
+    CoreInboundEmailTriggerServiceType,
+    CoreIteratorServiceType,
+    CoreManualTriggerServiceType,
+    CorePeriodicTriggerServiceType,
+    CoreResponseServiceType,
+    CoreRouterServiceType,
+    CoreSMTPEmailServiceType,
+    CoreStartWorkflowServiceType,
+)
+from baserow.contrib.integrations.local_baserow.mixins import (
+    UpdateRowRequiresRowIdMixin,
+)
+from baserow.contrib.integrations.local_baserow.service_types import (
+    LocalBaserowAggregateRowsUserServiceType,
+    LocalBaserowCreateRowsServiceType,
+    LocalBaserowDeleteRowServiceType,
+    LocalBaserowFieldsUpdatedTriggerServiceType,
+    LocalBaserowGetRowUserServiceType,
+    LocalBaserowListRowsUserServiceType,
+    LocalBaserowRowsCreatedTriggerServiceType,
+    LocalBaserowRowsDeletedTriggerServiceType,
+    LocalBaserowRowsUpdatedTriggerServiceType,
+    LocalBaserowUpdateRowsServiceType,
+    LocalBaserowUpsertRowServiceType,
+)
+from baserow.contrib.integrations.slack.service_types import (
+    SlackWriteMessageServiceType,
+)
+from baserow.core.formula.types import (
+    BASEROW_FORMULA_MODE_RAW,
+    BaserowFormulaObject,
+)
+from baserow.core.graph.types import GraphPointPositionType
+from baserow.core.registry import Instance
+from baserow.core.services.exceptions import (
+    ServiceImproperlyConfiguredDispatchException,
+)
+from baserow.core.services.models import Service
+from baserow.core.services.registries import service_type_registry
+from baserow.core.services.types import DispatchResult
+from baserow.core.utils import exception_capturer
+
+
+class AutomationActionNodeType(AutomationNodeType):
+    is_workflow_action = True
+
+    # The retry condition is a formula on the node itself, not on its service,
+    # so the node type's own `import_formulas()` pass remaps it on import.
+    simple_formula_fields = ["retry_condition"]
+
+    @property
+    def allowed_fields(self):
+        # Every action node carries an error policy. Trigger types keep the
+        # base list, so these fields are dropped when sent to a trigger.
+        return super().allowed_fields + ERROR_POLICY_FIELDS
+
+    def before_create(self, workflow, reference_node, position, output):
+        if reference_node is None:
+            raise AutomationNodeFirstNodeMustBeTrigger()
+
+    def before_move(self, node, reference_node, position, output):
+        if reference_node is None:
+            raise AutomationNodeFirstNodeMustBeTrigger()
+
+
+class ContainerNodeTypeMixin:
+    is_container = True
+
+    def before_delete(self, node: "ContainerNodeTypeMixin"):
+        if node.workflow.get_graph().get_children(node):
+            raise AutomationNodeNotDeletable(
+                "Container nodes cannot be deleted if they "
+                "have one or more children nodes associated with them."
+            )
+
+    def before_replace(self, node: "ContainerNodeTypeMixin", new_node_type: Instance):
+        if node.workflow.get_graph().get_children(node):
+            raise AutomationNodeNotReplaceable(
+                "Container nodes cannot be replaced if they "
+                "have one or more children nodes associated with them."
+            )
+
+        super().before_replace(node, new_node_type)
+
+    def before_move(
+        self,
+        node: "ContainerNodeTypeMixin",
+        reference_node: AutomationNode | None,
+        position: GraphPointPositionType,
+        output: str,
+    ):
+        """
+        Check the container node is not moved inside itself.
+        """
+
+        if node in reference_node.get_parent_points():
+            raise AutomationNodeNotMovable(
+                "A container node cannot be moved inside itself"
+            )
+
+        super().before_move(node, reference_node, position, output)
+
+
+class LocalBaserowUpsertRowActionNodeType(AutomationActionNodeType):
+    type = "local_baserow_upsert_row"
+    compat_type = "upsert_row"
+    service_type = LocalBaserowUpsertRowServiceType.type
+
+    def get_pytest_params(self, pytest_data_fixture) -> Dict[str, int]:
+        service = pytest_data_fixture.create_local_baserow_upsert_row_service()
+        return {"service": service}
+
+
+class LocalBaserowCreateRowActionNodeType(LocalBaserowUpsertRowActionNodeType):
+    display_name = _("Local Baserow create row")
+    type = "local_baserow_create_row"
+    compat_type = "create_row"
+    model_class = LocalBaserowCreateRowActionNode
+
+
+class LocalBaserowCreateRowsActionNodeType(AutomationActionNodeType):
+    type = "local_baserow_create_rows"
+    model_class = LocalBaserowCreateRowsActionNode
+    service_type = LocalBaserowCreateRowsServiceType.type
+
+    def get_pytest_params(self, pytest_data_fixture) -> Dict[str, int]:
+        service = pytest_data_fixture.create_local_baserow_create_rows_service()
+        return {"service": service}
+
+
+class LocalBaserowUpdateRowActionNodeType(
+    UpdateRowRequiresRowIdMixin, LocalBaserowUpsertRowActionNodeType
+):
+    display_name = _("Local Baserow update row")
+    type = "local_baserow_update_row"
+    compat_type = "update_row"
+    model_class = LocalBaserowUpdateRowActionNode
+
+
+class LocalBaserowUpdateRowsActionNodeType(AutomationActionNodeType):
+    type = "local_baserow_update_rows"
+    model_class = LocalBaserowUpdateRowsActionNode
+    service_type = LocalBaserowUpdateRowsServiceType.type
+
+    def get_pytest_params(self, pytest_data_fixture) -> Dict[str, int]:
+        service = pytest_data_fixture.create_local_baserow_update_rows_service()
+        return {"service": service}
+
+
+class LocalBaserowDeleteRowActionNodeType(AutomationActionNodeType):
+    display_name = _("Local Baserow delete row")
+    type = "local_baserow_delete_row"
+    compat_type = "delete_row"
+    model_class = LocalBaserowDeleteRowActionNode
+    service_type = LocalBaserowDeleteRowServiceType.type
+
+
+class LocalBaserowGetRowActionNodeType(AutomationActionNodeType):
+    display_name = _("Local Baserow get row")
+    type = "local_baserow_get_row"
+    compat_type = "get_row"
+    model_class = LocalBaserowGetRowActionNode
+    service_type = LocalBaserowGetRowUserServiceType.type
+
+
+class LocalBaserowListRowsActionNodeType(AutomationActionNodeType):
+    display_name = _("Local Baserow list rows")
+    type = "local_baserow_list_rows"
+    compat_type = "list_rows"
+    model_class = LocalBaserowListRowsActionNode
+    service_type = LocalBaserowListRowsUserServiceType.type
+
+
+class LocalBaserowAggregateRowsActionNodeType(AutomationActionNodeType):
+    display_name = _("Local Baserow aggregate rows")
+    type = "local_baserow_aggregate_rows"
+    compat_type = "aggregate_rows"
+    model_class = LocalBaserowAggregateRowsActionNode
+    service_type = LocalBaserowAggregateRowsUserServiceType.type
+
+
+class CoreHTTPRequestActionNodeType(AutomationActionNodeType):
+    display_name = _("HTTP request")
+    type = "http_request"
+    model_class = CoreHTTPRequestActionNode
+    service_type = CoreHTTPRequestServiceType.type
+
+
+class CoreIteratorActionNodeType(ContainerNodeTypeMixin, AutomationActionNodeType):
+    display_name = _("Iterator")
+    type = "iterator"
+    model_class = CoreIteratorActionNode
+    service_type = CoreIteratorServiceType.type
+
+
+class CoreCSVFileReaderActionNodeType(AutomationActionNodeType):
+    type = "csv_file_reader"
+    model_class = CoreCSVFileReaderActionNode
+    service_type = CoreCSVFileReaderServiceType.type
+
+
+class CoreSMTPEmailActionNodeType(AutomationActionNodeType):
+    display_name = _("Send email")
+    type = "smtp_email"
+    model_class = CoreSMTPEmailActionNode
+    service_type = CoreSMTPEmailServiceType.type
+
+
+class CoreStartWorkflowActionNodeType(AutomationActionNodeType):
+    type = "start_workflow"
+    model_class = CoreStartWorkflowActionNode
+    service_type = CoreStartWorkflowServiceType.type
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: Optional[CoreStartWorkflowActionNode] = None,
+    ) -> Dict[str, Any]:
+        service_values = values.get("service") or {}
+        if service_values.get("workflow_id") is not None:
+            workflow = instance.workflow if instance else values.get("workflow")
+            # Resolved here rather than by the service type, whose lookup
+            # accepts any workflow the user can read, in any workspace.
+            service_values["workflow"] = self.get_service_type().get_workflow_to_start(
+                user,
+                service_values.pop("workflow_id"),
+                workflow.automation.workspace_id,
+            )
+        return super().prepare_values(values, user, instance)
+
+
+class CoreResponseActionNodeType(AutomationActionNodeType):
+    display_name = _("Response")
+    type = "response"
+    model_class = CoreResponseActionNode
+    service_type = CoreResponseServiceType.type
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: AutomationNode = None,
+    ) -> Dict[str, Any]:
+        """Default new response nodes to a raw 204 status-code formula."""
+
+        if instance is None:
+            service_values = values.get("service") or {}
+            values = {
+                **values,
+                "service": {
+                    "status_code": BaserowFormulaObject.create(
+                        "204", mode=BASEROW_FORMULA_MODE_RAW
+                    ),
+                    **service_values,
+                },
+            }
+        return super().prepare_values(values, user, instance)
+
+
+class AIAgentActionNodeType(AutomationActionNodeType):
+    display_name = _("AI agent")
+    type = "ai_agent"
+    model_class = AIAgentActionNode
+    service_type = AIAgentServiceType.type
+
+
+class CoreRouterActionNodeType(AutomationActionNodeType):
+    display_name = _("Router")
+    type = "router"
+    model_class = CoreRouterActionNode
+    service_type = CoreRouterServiceType.type
+
+    def has_node_on_edge(self, node: CoreRouterActionNode) -> bool:
+        """
+        Given a router node, this method returns whether one of its edges has a node.
+
+        :param node: The router node instance.
+        """
+
+        for edge_uid in node.service.get_type().get_edges(node.service.specific).keys():
+            if edge_uid != "" and node.workflow.get_graph().get_next_points(
+                node, edge_uid
+            ):
+                return True
+
+        return False
+
+    def before_delete(self, node: CoreRouterActionNode):
+        if self.has_node_on_edge(node):
+            raise AutomationNodeNotDeletable(
+                "Router nodes cannot be deleted if they "
+                "have one or more output nodes associated with them."
+            )
+
+        super().before_delete(node)
+
+    def before_replace(self, node: CoreRouterActionNode, new_node_type: Instance):
+        if self.has_node_on_edge(node):
+            raise AutomationNodeNotReplaceable(
+                "Router nodes cannot be replaced if they "
+                "have one or more output nodes associated with them."
+            )
+
+        super().before_replace(node, new_node_type)
+
+    def before_move(
+        self,
+        node: AutomationTriggerNode,
+        reference_node: AutomationNode | None,
+        position: GraphPointPositionType,
+        output: str,
+    ):
+        """
+        Check the container node is not moved inside it self.
+        """
+
+        if self.has_node_on_edge(node):
+            raise AutomationNodeNotMovable(
+                "Router nodes cannot be moved if they "
+                "have one or more output nodes associated with them."
+            )
+
+        super().before_move(node, reference_node, position, output)
+
+    def after_create(self, node: CoreRouterActionNode):
+        """
+        After a router node is created, this method will create
+        an initial edge for the user to start with.
+
+        :param node: The router node instance that was just created.
+        """
+
+        if not len(node.service.edges.all()):
+            node.service.edges.create(label=_("Branch"))
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: AutomationNode = None,
+    ) -> Dict[str, Any]:
+        """
+        Before updating a router node's service, this method is called to allow us to
+        check if one or more edges have been removed. If so, we need to verify that
+        there are no automation node outputs pointing to those edges. If there are,
+        then an exception is raised to prevent the update.
+
+        :param values: The values to prepare for the router node.
+        :param user: The user performing the action.
+        :param instance: The current instance of the router node.
+        :return: The prepared values for the router node.
+        """
+
+        service_values = values.get("service", {})
+        if instance and "edges" in service_values:
+            prepared_uids = [
+                str(edge["uid"]) for edge in service_values.get("edges", [])
+            ]
+            service = instance.service.specific
+            persisted_uids = [str(edge.uid) for edge in service.edges.only("uid")]
+            removed_uids = list(set(persisted_uids) - set(prepared_uids))
+
+            for removed_uid in removed_uids:
+                if instance.workflow.get_graph().get_point_at_position(
+                    instance, "south", removed_uid
+                ):
+                    raise AutomationNodeMisconfiguredService(
+                        "One or more branches have been removed from the router node, "
+                        "but they still point to output nodes. These nodes must be "
+                        "trashed before the router can be updated."
+                    )
+
+        return super().prepare_values(values, user, instance)
+
+
+class CoreGotoActionNodeType(AutomationActionNodeType):
+    type = "goto"
+    model_class = CoreGotoActionNode
+    service_type = CoreGotoServiceType.type
+
+    def get_history_status(self, dispatch_result: DispatchResult) -> str:
+        """
+        A "Go to" node only jumps when its condition resolves to true, so a
+        dispatch without a destination means the jump was not followed. The
+        history is marked as skipped in that case, so it isn't presented as
+        if execution had been redirected.
+        """
+
+        if dispatch_result.destination_service_id is None:
+            return HistoryStatusChoices.SKIPPED
+        return HistoryStatusChoices.SUCCESS
+
+    def get_history_destination_node(
+        self, node: AutomationNode
+    ) -> Optional[AutomationNode]:
+        """
+        Resolves the node this "Go to" node jumps to via its service's
+        configured destination. Returns None when no destination has been
+        configured (or the destination service is not backed by a node).
+        """
+
+        service = node.service.specific
+        destination_service = service.destination_service
+
+        if destination_service is None:
+            return None
+
+        return getattr(destination_service, "automation_workflow_node", None)
+
+    @staticmethod
+    def validate_goto_destination(
+        source_node: AutomationNode,
+        destination_node: Optional[AutomationNode],
+    ) -> Optional[str]:
+        """
+        Validates that destination_node is an eligible "Go to node" destination
+        for source_node.
+
+        A destination is eligible when it belongs to the same workflow, is at
+        the same level (i.e. has the same parent/container nodes), is not a
+        trigger node and runs before the Go to node on its own path (a backward
+        jump). Forward jumps are not allowed for now: they would leave the
+        skipped nodes unexecuted, so a later node that reads a skipped node's
+        output via the previous-node data provider would fail at dispatch time.
+        A node may not target itself.
+        """
+
+        if destination_node is None:
+            return None
+
+        if destination_node.id == source_node.id:
+            return "The destination node cannot be the Go to node itself."
+
+        if destination_node.workflow_id != source_node.workflow_id:
+            return "The destination node must belong to the same workflow."
+
+        if destination_node.get_type().is_workflow_trigger:
+            return "The destination node cannot be a trigger node."
+
+        source_level = sorted(node.id for node in source_node.get_parent_points())
+        destination_level = sorted(
+            node.id for node in destination_node.get_parent_points()
+        )
+        if source_level != destination_level:
+            return "The destination node must be at the same level as the Go to node."
+
+        # The destination must run before the Go to node on its own path (a
+        # backward jump). `get_previous_points` returns the whole root-to-node
+        # path, so this both rejects forward jumps and a same-level node on a
+        # different branch, whose own predecessors would not have run when the
+        # jump lands on it.
+        source_previous_ids = {node.id for node in source_node.get_previous_points()}
+        if destination_node.id not in source_previous_ids:
+            return "The destination node must run before the Go to node."
+
+        return None
+
+    def validate_jump_destination(
+        self,
+        automation_node: AutomationNode,
+        destination_service_id: int,
+    ) -> None:
+        """
+        Re-validates the configured jump against the live graph before the
+        runner follows it. The service only resolves the intent to jump (and to
+        which destination); a link that became invalid after the service was
+        configured (e.g. the destination was moved to another level) raises a
+        clean misconfigured error instead of jumping.
+
+        The runner calls this only when the jump is about to be followed, so a
+        jump that is never followed (e.g. while simulating) is never validated.
+        """
+
+        from baserow.contrib.automation.nodes.handler import AutomationNodeHandler
+
+        try:
+            destination_node = AutomationNodeHandler().get_node_by_service_id(
+                destination_service_id
+            )
+        except AutomationNodeDoesNotExist:
+            # The destination was deleted after the jump was configured. The
+            # link is only nulled when the destination is permanently deleted,
+            # so a trashed destination still resolves to a service here.
+            raise ServiceImproperlyConfiguredDispatchException(
+                "The destination node no longer exists."
+            )
+
+        if error := self.validate_goto_destination(automation_node, destination_node):
+            raise ServiceImproperlyConfiguredDispatchException(error)
+
+    def prepare_values(
+        self,
+        values: Dict[str, Any],
+        user: AbstractUser,
+        instance: AutomationNode = None,
+    ) -> Dict[str, Any]:
+        """
+        Validates the configured destination node before the service is updated.
+
+        The destination must be a same-level, non-trigger node of the same
+        workflow, and cannot be the Go to node itself. We can only check this
+        when updating an existing node, as the source node must already exist
+        in the graph to determine its level.
+
+        A destination that no longer exists is dropped instead of rejected: the
+        link is only nulled when the destination is permanently deleted, so an
+        update can carry a destination whose node has since been trashed (e.g.
+        when undoing an update that predates the deletion).
+        """
+
+        from baserow.contrib.automation.nodes.handler import AutomationNodeHandler
+
+        service_values = values.get("service", {})
+        if instance is not None and service_values.get("destination_service_id"):
+            try:
+                destination_node = AutomationNodeHandler().get_node_by_service_id(
+                    service_values["destination_service_id"]
+                )
+            except AutomationNodeDoesNotExist:
+                values = {
+                    **values,
+                    "service": {**service_values, "destination_service_id": None},
+                }
+            else:
+                if error := self.validate_goto_destination(instance, destination_node):
+                    raise AutomationNodeMisconfiguredService(error)
+
+        return super().prepare_values(values, user, instance)
+
+    def after_move(
+        self, user: AbstractUser, workflow: AutomationWorkflow
+    ) -> list[tuple[int, int]] | None:
+        # A move can change a node's level or take it off the source node's
+        # path, either of which may invalidate a "Go to node" link that targets
+        # - or originates from - the moved node. Clear any now-invalid links and
+        # report them so the move can be undone.
+        return self.clear_invalidated_links(user, workflow) or None
+
+    def revert_move(
+        self, user: AbstractUser, modifications: list[tuple[int, int]]
+    ) -> None:
+        self.restore_links(user, modifications)
+
+    @classmethod
+    def clear_invalidated_links(
+        cls,
+        user: AbstractUser,
+        workflow: AutomationWorkflow,
+    ) -> list[tuple[int, int]]:
+        """
+        Nulls every "Go to node" destination in the workflow that is no longer a
+        valid jump from its source node - i.e. it left the source's level or its
+        path. Intended to be called after a move, which can change either. We
+        simply re-validate every goto link in the workflow: there are few of
+        them, and this avoids depending on the exact descendant semantics of the
+        graph to work out which links the move could have touched. A link
+        survives when it is still a valid backward jump (e.g. source and
+        destination moved together inside a container).
+
+        An `automation_node_updated` signal is sent for each cleared Go to node
+        so connected clients drop the stale link.
+
+        :return: A list of (goto_node_id, previous_destination_node_id) tuples
+            describing the links that were cleared, so the caller can restore
+            them when a move is undone.
+        """
+
+        from baserow.contrib.automation.nodes.handler import AutomationNodeHandler
+
+        handler = AutomationNodeHandler()
+        goto_services = CoreGotoService.objects.filter(
+            automation_workflow_node__workflow=workflow,
+            destination_service__isnull=False,
+        ).select_related(
+            "automation_workflow_node",
+            "destination_service__automation_workflow_node",
+        )
+
+        cleared_goto_links: list[tuple[int, int]] = []
+        for service in goto_services:
+            source_node = service.automation_workflow_node
+            destination_node = service.destination_service.automation_workflow_node
+            if cls.validate_goto_destination(source_node, destination_node) is None:
+                continue
+
+            service.destination_service = None
+            service.save(update_fields=["destination_service"])
+            cleared_goto_links.append((source_node.id, destination_node.id))
+
+            automation_node_updated.send(
+                cls, user=user, node=handler.get_node(source_node.id)
+            )
+
+        return cleared_goto_links
+
+    @classmethod
+    def restore_links(
+        cls,
+        user: AbstractUser,
+        links: list[tuple[int, int]],
+    ) -> None:
+        """
+        Re-applies "Go to node" destinations that a move cleared, used when that
+        move is undone. Each link is re-validated against the (restored) graph
+        and skipped if it would still be invalid, so we never persist a
+        cross-level link.
+
+        :param links: (goto_node_id, destination_node_id) tuples to restore.
+        """
+
+        from baserow.contrib.automation.nodes.handler import AutomationNodeHandler
+
+        handler = AutomationNodeHandler()
+        for goto_node_id, destination_node_id in links:
+            try:
+                goto_node = handler.get_node(goto_node_id)
+                destination_node = handler.get_node(destination_node_id)
+            except AutomationNodeDoesNotExist:
+                # An endpoint was deleted after the move was made; nothing to
+                # restore. (The link stays cleared, which is correct.)
+                continue
+            if cls.validate_goto_destination(goto_node, destination_node) is not None:
+                continue
+
+            service = goto_node.service.specific
+            service.destination_service_id = destination_node.service_id
+            service.save(update_fields=["destination_service"])
+
+            automation_node_updated.send(
+                cls, user=user, node=handler.get_node(goto_node_id)
+            )
+
+
+class AutomationTriggerNodeType(AutomationNodeType):
+    is_workflow_trigger = True
+
+    def after_register(self):
+        service_type_registry.get(self.service_type).start_listening(self.on_event)
+        return super().after_register()
+
+    def before_unregister(self):
+        service_type_registry.get(self.service_type).stop_listening()
+        return super().before_unregister()
+
+    def before_create(
+        self,
+        workflow: AutomationWorkflow,
+        reference_node: AutomationNode,
+        position: str,
+        output: str,
+    ):
+        if workflow.get_graph().get_point_at_position(None, "south", ""):
+            raise AutomationNodeTriggerAlreadyExists()
+
+        if reference_node is not None:
+            raise AutomationNodeTriggerMustBeFirstNode()
+
+    def before_delete(self, node: AutomationNode):
+        if node.workflow.get_graph().get_next_points(node):
+            raise AutomationNodeNotDeletable(
+                "Trigger nodes cannot be deleted if they are followed nodes."
+            )
+
+    def before_move(
+        self,
+        node: AutomationTriggerNode,
+        reference_node: AutomationNode | None,
+        position: GraphPointPositionType,
+        output: str,
+    ):
+        raise AutomationNodeNotMovable("Trigger nodes cannot be moved.")
+
+    def _belongs_to_workflow(self, trigger, service: Service) -> bool:
+        """
+        Returns whether the trigger's service reads only through what its workflow's
+        automation may use.
+
+        :param trigger: The trigger node.
+        :param service: The trigger's service.
+        :return: True when the trigger may be started.
+        """
+
+        try:
+            self.check_service_belongs_to_workflow(trigger.workflow, service)
+        except AutomationNodeMisconfiguredService:
+            return False
+        return True
+
+    def on_event(
+        self,
+        services: Iterable[Service],
+        event_payload: Dict | None | Callable = None,
+        user: Optional[AbstractUser] = None,
+        isolate_failures: bool = False,
+    ):
+        """
+        Starts the workflow of every trigger whose service the event applies to.
+
+        :param services: The services the event applies to.
+        :param event_payload: The event payload, or a callable returning the payload
+            for a given service.
+        :param user: The user who caused the event, if any.
+        :param isolate_failures: Whether a workflow that fails to start is rolled
+            back and skipped, so that the other workflows still start. Otherwise the
+            failure is raised.
+        :return: The histories of the started workflows.
+        """
+
+        triggers = list(
+            self.model_class.objects.filter(
+                service__in=services,
+            )
+            .using(router.db_for_write(self.model_class))
+            .filter(
+                Q(
+                    Q(workflow__state=WorkflowState.LIVE)
+                    | Q(workflow__allow_test_run_until__gte=timezone.now())
+                    | Q(workflow__simulate_until_node__isnull=False)
+                ),
+            )
+            .select_related("workflow__automation__workspace")
+        )
+
+        # For perf reasons, store the trigger<->service relationship.
+        service_map = {service.id: service for service in services}
+
+        # A trigger whose service reads through what its automation may not use
+        # isn't started.
+        triggers = [
+            trigger
+            for trigger in triggers
+            if self._belongs_to_workflow(trigger, service_map[trigger.service_id])
+        ]
+
+        histories = []
+        for trigger in triggers:
+            service = service_map[trigger.service_id]
+            history = (
+                self._start_workflow_in_savepoint(trigger, service, event_payload)
+                if isolate_failures
+                else self._start_workflow(trigger, service, event_payload)
+            )
+            if history is not None:
+                histories.append(history)
+
+        return histories
+
+    def _start_workflow_in_savepoint(
+        self,
+        trigger: AutomationTriggerNode,
+        service: Service,
+        event_payload: Dict | None | Callable = None,
+    ):
+        """
+        Starts the workflow of one trigger in a savepoint. If it fails, everything
+        it did is rolled back and the failure is logged rather than raised.
+
+        :param trigger: The trigger node whose workflow is started.
+        :param service: The trigger's service.
+        :param event_payload: The event payload, or a callable returning the payload
+            for a given service.
+        :return: The history of the started workflow, if one was created.
+        """
+
+        try:
+            with transaction.atomic():
+                return self._start_workflow(trigger, service, event_payload)
+        except SoftTimeLimitExceeded:
+            # The task is out of time, so it must stop rather than carry on with
+            # the next trigger until the hard time limit kills it.
+            raise
+        except Exception as e:
+            logger.exception(
+                "Could not start workflow {} from trigger {}.",
+                trigger.workflow_id,
+                trigger.id,
+            )
+            exception_capturer(e)
+            return None
+
+    def _start_workflow(
+        self,
+        trigger: AutomationTriggerNode,
+        service: Service,
+        event_payload: Dict | None | Callable = None,
+    ):
+        """
+        Starts the workflow of one trigger that the event applies to.
+
+        :param trigger: The trigger node whose workflow is started.
+        :param service: The trigger's service.
+        :param event_payload: The event payload, or a callable returning the payload
+            for a given service.
+        :return: The history of the started workflow, if one was created.
+        """
+
+        from baserow.contrib.automation.workflows.handler import (
+            AutomationWorkflowHandler,
+        )
+
+        # If we've received a callable payload, call it with the specific service,
+        # this can give us a payload that is specific to the trigger's service.
+        service_payload = (
+            event_payload(service) if callable(event_payload) else event_payload
+        )
+
+        workflow = trigger.workflow
+        history = AutomationWorkflowHandler().async_start_workflow(
+            workflow,
+            service_payload,
+            # Read before the reset below clears it.
+            triggered_by=AutomationWorkflowHandler().get_test_run_triggered_by(
+                workflow
+            ),
+        )
+
+        # We don't want subsequent events to trigger a new test run
+        AutomationWorkflowHandler().reset_workflow_temporary_states(workflow)
+
+        return history
+
+
+class LocalBaserowRowsCreatedTriggerNodeType(AutomationTriggerNodeType):
+    display_name = _("Local Baserow rows created")
+    type = "local_baserow_rows_created"
+    compat_type = "rows_created"
+    model_class = LocalBaserowRowsCreatedTriggerNode
+    service_type = LocalBaserowRowsCreatedTriggerServiceType.type
+
+
+class LocalBaserowRowsUpdatedTriggerNodeType(AutomationTriggerNodeType):
+    display_name = _("Local Baserow rows updated")
+    type = "local_baserow_rows_updated"
+    compat_type = "rows_updated"
+    model_class = LocalBaserowRowsUpdatedTriggerNode
+    service_type = LocalBaserowRowsUpdatedTriggerServiceType.type
+
+
+class LocalBaserowRowsDeletedTriggerNodeType(AutomationTriggerNodeType):
+    display_name = _("Local Baserow rows deleted")
+    type = "local_baserow_rows_deleted"
+    compat_type = "rows_deleted"
+    model_class = LocalBaserowRowsDeletedTriggerNode
+    service_type = LocalBaserowRowsDeletedTriggerServiceType.type
+
+
+class LocalBaserowFieldsUpdatedTriggerNodeType(AutomationTriggerNodeType):
+    type = "local_baserow_fields_updated"
+    model_class = LocalBaserowFieldsUpdatedTriggerNode
+    service_type = LocalBaserowFieldsUpdatedTriggerServiceType.type
+
+
+class CorePeriodicTriggerNodeType(
+    AutomationTriggerNodeType,
+):
+    display_name = _("Periodic trigger")
+    type = "periodic"
+    model_class = CorePeriodicTriggerNode
+    service_type = CorePeriodicTriggerServiceType.type
+
+
+class CoreHTTPTriggerNodeType(AutomationTriggerNodeType):
+    display_name = _("HTTP trigger")
+    type = "http_trigger"
+    model_class = CoreHTTPTriggerNode
+    service_type = CoreHTTPTriggerServiceType.type
+
+
+class CoreInboundEmailTriggerNodeType(AutomationTriggerNodeType):
+    display_name = _("Email trigger")
+    type = "email_trigger"
+    model_class = CoreInboundEmailTriggerNode
+    service_type = CoreInboundEmailTriggerServiceType.type
+
+    def is_deactivated(self, workspace) -> bool:
+        # Instance-wide (the workspace is irrelevant): the trigger is withheld
+        # until the domain, the webhook secret and the receiver URL are all
+        # configured. See `is_inbound_email_configured` for why each matters.
+        return not is_inbound_email_configured()
+
+
+class CoreManualTriggerNodeType(AutomationTriggerNodeType):
+    type = "manual"
+    model_class = CoreManualTriggerNode
+    service_type = CoreManualTriggerServiceType.type
+
+
+class SlackWriteMessageActionNodeType(AutomationActionNodeType):
+    display_name = _("Slack write message")
+    type = "slack_write_message"
+    model_class = SlackWriteMessageActionNode
+    service_type = SlackWriteMessageServiceType.type

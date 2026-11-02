@@ -1,0 +1,1128 @@
+<template>
+  <div ref="formulaInputRoot">
+    <div class="formula-input-field__container">
+      <div
+        v-if="!isRawMode"
+        ref="formulaEditorSurface"
+        class="formula-input-field__editor"
+        @click="handleEditorClick"
+      >
+        <EditorContent
+          :id="forInput"
+          ref="editor"
+          class="form-input formula-input-field"
+          role="textbox"
+          :class="classes"
+          :editor="editor"
+          :style="{ '--formula-placeholder': `'${placeholder}'` }"
+        />
+      </div>
+      <div v-else class="formula-input-field__raw-input">
+        <slot
+          name="raw-input"
+          :value="value"
+          :disabled="disabled"
+          :read-only="readOnly"
+          :placeholder="placeholder"
+          :small="small"
+          :input="emitRawValue"
+        >
+          <FormInput
+            :value="value"
+            :disabled="disabled || readOnly"
+            :placeholder="placeholder"
+            :size="small ? 'small' : 'regular'"
+            @input="emitRawValue"
+          />
+        </slot>
+      </div>
+      <button
+        v-if="showFormatBadge"
+        type="button"
+        class="formula-input-field__format-badge"
+        :title="formatBadgeTitle"
+        :disabled="disabled"
+        @mousedown.prevent
+        @click="focusEditor"
+      >
+        {{ formatBadge }}
+      </button>
+      <ButtonIcon
+        v-if="allowRawValues && !readOnly"
+        class="formula-input-field__mode-toggle"
+        :class="{
+          'formula-input-field__mode-toggle--active': !isRawMode,
+        }"
+        icon="iconoir-sigma-function"
+        type="secondary"
+        :disabled="disabled"
+        :title="rawModeToggleTitle"
+        @click="toggleRawMode"
+      />
+    </div>
+
+    <FormulaInputErrorContext
+      v-if="!isRawMode"
+      :visible="showErrorContext"
+      :formula-error-context="formulaErrorContext"
+      :target="$refs.formulaEditorSurface"
+      @mousedown="onContextMouseDown"
+    />
+
+    <FormulaInputExplorerContext
+      v-if="!isRawMode && isFocused && !readOnly"
+      ref="formulaInputExplorerContext"
+      :node-selected="nodeSelected"
+      :reveal-node="revealNode"
+      :loading="loading"
+      :mode="activeMode"
+      :has-value="Boolean(value && value.length)"
+      :allow-node-selection="allowNodeSelection"
+      :nodes-hierarchy="nodesHierarchy"
+      :enabled-modes="enabledModes"
+      :format="format"
+      :format-options="formatOptions"
+      @node-selected="handleNodeSelected"
+      @node-unselected="unSelectNode"
+      @example-click="handleExampleSelected"
+      @mode-changed="handleModeChange"
+      @format-changed="$emit('update:format', $event)"
+      @mousedown="onContextMouseDown"
+    />
+
+    <NodeHelpTooltip
+      v-if="!readOnly"
+      ref="nodeHelpTooltip"
+      :node="hoveredFunctionNode"
+      :nodes-hierarchy="nodesHierarchy"
+      @mouseenter="onHelpTooltipEnter"
+      @mouseleave="onHelpTooltipLeave"
+    />
+
+    <FormulaInputModeChangeModal
+      v-if="allowRawValues"
+      ref="rawModeModal"
+      :title="$t('formulaInputExplorerContext.useRegularInputModalTitle')"
+      :confirm-label="$t('formulaInputField.useRawMode')"
+      @confirm="confirmRawModeChange"
+    />
+  </div>
+</template>
+
+<script>
+import { Editor, EditorContent, Node } from '@tiptap/vue-3'
+import { Document } from '@tiptap/extension-document'
+import { Text } from '@tiptap/extension-text'
+import { History } from '@tiptap/extension-history'
+import { HardBreak } from '@tiptap/extension-hard-break'
+import { ArrowKeyNavigationExtension } from '@baserow/modules/core/components/formula/extensions/ArrowKeyNavigationExtension'
+import { SmartDeletionExtension } from '@baserow/modules/core/components/formula/extensions/SmartDeletionExtension'
+import { ZWSManagementExtension } from '@baserow/modules/core/components/formula/extensions/ZWSManagementExtension'
+import { FunctionHelpTooltipExtension } from '@baserow/modules/core/components/formula/extensions/FunctionHelpTooltipExtension'
+import {
+  ParenMatchHighlightExtension,
+  findFunctionOpener,
+} from '@baserow/modules/core/components/formula/extensions/ParenMatchHighlightExtension'
+import {
+  FormulaInsertionExtension,
+  FunctionFormulaComponentNode,
+  FunctionArgumentCommaNode,
+  FunctionClosingParenNode,
+  GroupOpeningParenNode,
+  GroupClosingParenNode,
+  OperatorFormulaComponentNode,
+} from '@baserow/modules/core/components/formula/extensions/FormulaNodes'
+import { NodeSelectionExtension } from '@baserow/modules/core/components/formula/extensions/NodeSelectionExtension'
+import { ContextManagementExtension } from '@baserow/modules/core/components/formula/extensions/ContextManagementExtension'
+import { InputDetectionExtension } from '@baserow/modules/core/components/formula/extensions/InputDetectionExtension'
+import { FunctionDowngradeExtension } from '@baserow/modules/core/components/formula/extensions/FunctionDowngradeExtension'
+import {
+  createClipboardTextSerializer,
+  createPasteHandler,
+} from '@baserow/modules/core/components/formula/extensions/FormulaClipboardHandler'
+import _ from 'lodash'
+import parseBaserowFormula from '@baserow/modules/core/formula/parser/parser'
+import { ToTipTapVisitor } from '@baserow/modules/core/formula/tiptap/toTipTapVisitor'
+import { RuntimeFunctionCollection } from '@baserow/modules/core/functionCollection'
+import { FromTipTapVisitor } from '@baserow/modules/core/formula/tiptap/fromTipTapVisitor'
+import { mergeAttributes } from '@tiptap/core'
+import FormulaInputErrorContext from '~/modules/core/components/formula/FormulaInputErrorContext'
+import FormulaInputExplorerContext from '@baserow/modules/core/components/formula/FormulaInputExplorerContext'
+import {
+  isFormulaValid,
+  toFormulaStringLiteral,
+} from '@baserow/modules/core/formula'
+import NodeHelpTooltip from '@baserow/modules/core/components/nodeExplorer/NodeHelpTooltip'
+import {
+  BASEROW_FORMULA_FORMAT_MARKDOWN,
+  BASEROW_FORMULA_FORMAT_PLAIN,
+  BASEROW_FORMULA_FORMATS,
+  BASEROW_FORMULA_MODES,
+} from '@baserow/modules/core/formula/constants'
+import FormInput from '@baserow/modules/core/components/FormInput'
+import ButtonIcon from '@baserow/modules/core/components/ButtonIcon'
+import { ensureString } from '@baserow/modules/core/utils/validator'
+import FormulaInputModeChangeModal from '@baserow/modules/core/components/formula/FormulaInputModeChangeModal'
+
+/**
+ * The ANTLR lexer's INTEGER_LITERAL / NUMERIC_LITERAL rules include an
+ * optional leading '-', so the lexer greedily tokenizes e.g. ")-200" as
+ * CLOSE_PAREN INTEGER_LITERAL(-200) instead of CLOSE_PAREN MINUS
+ * INTEGER_LITERAL(200). This inserts a space before '-' when it acts as a
+ * binary operator (preceded by a character that ends an expression) so the
+ * lexer produces a separate MINUS token.
+ */
+export function disambiguateMinusOperator(formula) {
+  let result = ''
+  let inString = false
+  let quoteChar = null
+
+  for (let i = 0; i < formula.length; i++) {
+    const ch = formula[i]
+
+    if (inString) {
+      result += ch
+      if (ch === '\\' && i + 1 < formula.length) {
+        result += formula[++i]
+      } else if (ch === quoteChar) {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === "'" || ch === '"') {
+      inString = true
+      quoteChar = ch
+      result += ch
+      continue
+    }
+
+    if (
+      ch === '-' &&
+      i + 1 < formula.length &&
+      /\d/.test(formula[i + 1]) &&
+      i > 0 &&
+      /[)\d\w]/.test(formula[i - 1])
+    ) {
+      result += ' - '
+      continue
+    }
+
+    result += ch
+  }
+
+  return result
+}
+
+const FORMAT_LABEL_KEYS = {
+  [BASEROW_FORMULA_FORMAT_PLAIN]: 'formulaInputField.formatPlain',
+  [BASEROW_FORMULA_FORMAT_MARKDOWN]: 'formulaInputField.formatMarkdown',
+}
+
+// The letter shown on the input while a non-plain format is selected. The
+// picker itself lives in the explorer context, which only exists while the
+// field is focused, so the badge is what keeps the format visible.
+const FORMAT_BADGES = {
+  [BASEROW_FORMULA_FORMAT_MARKDOWN]: 'M',
+}
+
+// How long the function help tooltip stays open after the mouse leaves the
+// function or the tooltip. Matches the tooltip in the explorer.
+const HELP_TOOLTIP_HIDE_DELAY = 250
+
+export default {
+  name: 'FormulaInputField',
+  components: {
+    FormulaInputErrorContext,
+    FormulaInputExplorerContext,
+    EditorContent,
+    NodeHelpTooltip,
+    FormInput,
+    ButtonIcon,
+    FormulaInputModeChangeModal,
+  },
+
+  provide() {
+    return { nodesHierarchy: computed(() => this.nodesHierarchy) }
+  },
+  inject: {
+    forInput: { from: 'forInput', default: null },
+  },
+  props: {
+    value: {
+      type: String,
+      default: '',
+    },
+    disabled: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    readOnly: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    placeholder: {
+      type: String,
+      default: null,
+    },
+    loading: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    small: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    nodesHierarchy: {
+      type: Array,
+      required: false,
+      default: () => [],
+    },
+    allowNodeSelection: {
+      type: String,
+      required: false,
+      default: 'none',
+      validator: (value) => ['none', 'all', 'array', 'object'].includes(value),
+    },
+    mode: {
+      type: String,
+      required: false,
+      default: 'simple',
+      validator: (value) => {
+        return BASEROW_FORMULA_MODES.includes(value)
+      },
+    },
+    contextPosition: {
+      type: String,
+      required: false,
+      default: 'bottom',
+      validator: (value) => {
+        return ['bottom', 'left', 'right'].includes(value)
+      },
+    },
+    /**
+     * An array of Baserow formula modes which the parent formula input
+     * component allows to be used. By default, we will allow all modes.
+     */
+    enabledModes: {
+      type: Array,
+      required: false,
+      default: () => BASEROW_FORMULA_MODES,
+    },
+    allowRawValues: {
+      type: Boolean,
+      required: false,
+      default: false,
+    },
+    /**
+     * How the surface showing the resolved formula renders it (plain text or
+     * markdown). It doesn't affect the formula itself, which is why it also
+     * applies in raw mode.
+     */
+    format: {
+      type: String,
+      required: false,
+      default: BASEROW_FORMULA_FORMAT_PLAIN,
+      validator: (value) => BASEROW_FORMULA_FORMATS.includes(value),
+    },
+    /**
+     * The formats the surface using this input can render. The format picker
+     * is only shown when there is more than one to choose from.
+     */
+    allowedFormats: {
+      type: Array,
+      required: false,
+      default: () => [BASEROW_FORMULA_FORMAT_PLAIN],
+    },
+    validationContext: {
+      type: Object,
+      required: false,
+      default: () => ({}),
+    },
+  },
+  emits: ['input', 'update:mode', 'update:format', 'update:invalid', 'blur'],
+  data() {
+    return {
+      editor: null,
+      content: null,
+      isFormulaInvalid: false,
+      formulaErrorContext: { scope: null, title: '', message: '' },
+      errorExpanded: false,
+      isFocused: false,
+      hoveredFunctionNode: null,
+      // Whether the mouse is over the function help tooltip, which then stays
+      // open so its examples can be read and scrolled.
+      isHelpTooltipHovered: false,
+      helpTooltipHideTimer: null,
+      // The formula node the user last clicked, which the explorer context
+      // reveals by opening its tab and scrolling to it. A new object is set on
+      // every click so clicking the same node twice reveals it again. Cleared
+      // on blur, see the `isFocused` watcher.
+      revealNode: null,
+      isHandlingModeChange: false,
+      intersectionObserver: null,
+      isEditorInitialized: false,
+    }
+  },
+  computed: {
+    showErrorContext() {
+      return this.isFocused && !this.readOnly && this.isFormulaInvalid
+    },
+    /**
+     * The mode the editor runs in. A `mode` the parent does not enable falls
+     * back to advanced mode when that one is enabled: advanced mode renders any
+     * formula string as is, so the fallback never changes a value. Simple and
+     * raw mode would turn the formula into a literal, which is why the explorer
+     * asks before switching to them and why they are never fallen back to.
+     */
+    activeMode() {
+      if (
+        !this.enabledModes.includes(this.mode) &&
+        this.enabledModes.includes('advanced')
+      ) {
+        return 'advanced'
+      }
+      return this.mode
+    },
+    isRawMode() {
+      return this.activeMode === 'raw'
+    },
+    rawModeToggleTitle() {
+      return this.isRawMode
+        ? this.$t('formulaInputField.useFormulaMode')
+        : this.$t('formulaInputField.useRawMode')
+    },
+    showFormatBadge() {
+      return (
+        this.allowedFormats.length > 1 &&
+        !this.readOnly &&
+        this.format !== BASEROW_FORMULA_FORMAT_PLAIN
+      )
+    },
+    formatBadge() {
+      return FORMAT_BADGES[this.format] || this.format.charAt(0).toUpperCase()
+    },
+    formatBadgeTitle() {
+      return this.$t('formulaInputField.formatBadgeTitle', {
+        format: this.$t(FORMAT_LABEL_KEYS[this.format] || this.format),
+      })
+    },
+    /**
+     * The options of the format picker, which the explorer context renders in
+     * its footer when there is more than one.
+     */
+    formatOptions() {
+      return this.allowedFormats.map((format) => ({
+        value: format,
+        name: this.$t(FORMAT_LABEL_KEYS[format] || format),
+      }))
+    },
+    isFormulaEmpty() {
+      if (!this.editor) return true
+      const formula = this.toFormula(this.wrapperContent)
+      return !formula || formula.length === 0
+    },
+    classes() {
+      return {
+        'form-input--disabled': this.disabled,
+        'formula-input-field--small': this.small,
+        'formula-input-field--focused':
+          !this.disabled && !this.readOnly && this.isFocused,
+        'formula-input-field--disabled': this.disabled,
+        'formula-input-field--error': this.isFormulaInvalid,
+        'formula-input-field--formula-empty': this.isFormulaEmpty,
+      }
+    },
+    formulaComponents() {
+      return Object.values(this.$registry.getAll('runtimeFormulaFunction'))
+        .map((type) => type.formulaComponent)
+        .filter((component) => component !== null)
+    },
+    wrapperNode() {
+      return Node.create({
+        name: 'wrapper',
+        group: 'block',
+        content: 'inline*',
+        parseHTML() {
+          return [{ tag: 'div' }]
+        },
+        renderHTML({ HTMLAttributes }) {
+          return ['div', mergeAttributes(HTMLAttributes), 0]
+        },
+      })
+    },
+    formulaRegistry() {
+      const names = []
+      const definitions = {}
+      const operators = []
+
+      const extract = (nodes) => {
+        if (!nodes) return
+        for (const node of nodes) {
+          if (node.type === 'function' && node.signature) {
+            names.push(node.name)
+            definitions[node.name.toLowerCase()] = node
+          }
+          if (node.type === 'operator' && node.signature?.operator) {
+            operators.push(node.signature.operator)
+          }
+          if (node.nodes) extract(node.nodes)
+        }
+      }
+
+      extract(this.nodesHierarchy)
+      return { names, definitions, operators }
+    },
+    extensions() {
+      const DocumentNode = Document.extend()
+      const TextNode = Text.extend({ inline: true })
+
+      const extensions = [
+        DocumentNode,
+        this.wrapperNode,
+        TextNode,
+        ArrowKeyNavigationExtension,
+        SmartDeletionExtension,
+        ZWSManagementExtension,
+        History.configure({
+          depth: 100,
+        }),
+        FormulaInsertionExtension,
+        NodeSelectionExtension,
+        ContextManagementExtension.configure({
+          getState: () => ({
+            isFocused: this.isFocused,
+            disabled: this.disabled,
+            readOnly: this.readOnly,
+          }),
+          setFocused: (val) => {
+            this.isFocused = val
+          },
+          getRootEl: () => this.$el,
+          getContextEl: () =>
+            this.$refs.formulaInputExplorerContext?.getTeleportedElement(),
+          showExplorerContextMenu: () => {
+            this.$nextTick(() => {
+              if (!this.isFocused) return
+              this.positionAndShowExplorerContext()
+            })
+          },
+          hideContextMenu: () => {
+            this.$refs.formulaInputExplorerContext?.hide()
+          },
+        }),
+        // Read-only fields are display-only snippets (e.g. the examples
+        // rendered inside `NodeHelpTooltip` itself), so they must not spawn
+        // their own hover help tooltip.
+        ...(this.readOnly
+          ? []
+          : [
+              FunctionHelpTooltipExtension.configure({
+                functionDefinitions: this.formulaRegistry.definitions,
+                // Long enough for the mouse to travel from the function into
+                // the tooltip, which then keeps it open.
+                hideDelay: HELP_TOOLTIP_HIDE_DELAY,
+                onShowTooltip: (el, node) => {
+                  this.cancelHelpTooltipHide()
+                  this.hoveredFunctionNode = node
+                  this.$refs.nodeHelpTooltip?.show(el, 'bottom', 'right', 6, 10)
+                },
+                onHideTooltip: () => {
+                  if (!this.isHelpTooltipHovered) {
+                    this.hideHelpTooltip()
+                  }
+                },
+              }),
+            ]),
+        ...this.formulaComponents,
+      ]
+
+      if (this.activeMode === 'advanced') {
+        extensions.push(FunctionFormulaComponentNode)
+        extensions.push(FunctionArgumentCommaNode)
+        extensions.push(FunctionClosingParenNode)
+        extensions.push(GroupOpeningParenNode)
+        extensions.push(GroupClosingParenNode)
+        extensions.push(OperatorFormulaComponentNode)
+        extensions.push(
+          HardBreak.extend({
+            addKeyboardShortcuts() {
+              return {
+                Enter: () => this.editor.commands.setHardBreak(),
+              }
+            },
+          })
+        )
+        extensions.push(
+          InputDetectionExtension.configure({
+            functionNames: this.formulaRegistry.names,
+            functionDefinitions: this.formulaRegistry.definitions,
+            operators: this.formulaRegistry.operators,
+          })
+        )
+        extensions.push(FunctionDowngradeExtension)
+        extensions.push(ParenMatchHighlightExtension)
+      }
+
+      return extensions
+    },
+    wrapperContent() {
+      return this.editor.getJSON()
+    },
+    nodeSelected() {
+      return this.editor?.commands.getSelectedNodePath() || null
+    },
+  },
+  watch: {
+    // The explorer context only exists while focused and reveals `revealNode`
+    // when it mounts, so a reveal must not outlive the focus. Otherwise every
+    // later focus would reveal the node again, even after it was deleted.
+    isFocused(newValue) {
+      if (!newValue) {
+        this.revealNode = null
+      }
+    },
+    // The `input` event only fires for valid formulas, so parents that must
+    // block submission on an invalid one need this signal too.
+    isFormulaInvalid(newValue) {
+      this.$emit('update:invalid', newValue)
+    },
+    disabled(newValue) {
+      this.editor?.setOptions({ editable: !newValue && !this.readOnly })
+    },
+    readOnly(newValue) {
+      this.editor?.setOptions({ editable: !this.disabled && !newValue })
+    },
+
+    mode: 'syncMode',
+    enabledModes: 'syncMode',
+
+    activeMode(newMode, oldMode) {
+      // In Vue 3, watchers can fire during the initial render cycle before
+      // mounted() completes. Skip if editor hasn't been initialized yet.
+      if (!this.isEditorInitialized) {
+        return
+      }
+      // Skip automatic recreation if we're handling it manually in handleModeChange
+      if (this.isHandlingModeChange) {
+        return
+      }
+      if (newMode === 'raw') {
+        this.editor?.destroy()
+        this.editor = null
+        this.isEditorInitialized = false
+        this.isFormulaInvalid = false
+        this.formulaErrorContext = { scope: null, title: '', message: '' }
+      } else {
+        this.recreateEditor()
+      }
+    },
+
+    value(value) {
+      if (this.isRawMode) {
+        return
+      }
+      // Use editor.getJSON() directly instead of this.wrapperContent to avoid stale cached data
+      const editorContent = this.editor?.getJSON()
+      const currentFormula = this.toFormula(editorContent)
+      if (!_.isEqual(value, currentFormula)) {
+        const content = this.toContent(value)
+
+        if (!this.isFormulaInvalid) {
+          this.content = content
+        }
+        // A newly displayed formula must reflect its own validity.
+        this.validateFormula(value)
+      }
+    },
+    content: {
+      handler() {
+        if (this.editor && !_.isEqual(this.content, this.editor.getJSON())) {
+          this.editor.commands.setContent(this.content, false, {
+            preserveWhitespace: 'full',
+            addToHistory: false,
+          })
+        }
+      },
+      deep: true,
+    },
+  },
+  created() {
+    this.syncMode()
+  },
+  mounted() {
+    if (!this.isRawMode) {
+      this.createEditor()
+    }
+    // Reflect the validity of the initially-displayed formula so an
+    // already-invalid stored value shows its error state without an edit.
+    this.validateFormula(this.value)
+    this.setupIntersectionObserver()
+  },
+  beforeUnmount() {
+    this.cancelHelpTooltipHide()
+    this.editor?.destroy()
+    this.cleanupIntersectionObserver()
+  },
+  methods: {
+    setupIntersectionObserver() {
+      this.intersectionObserver = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting && this.isFocused) {
+              this.isFocused = false
+              if (this.editor) {
+                this.editor.commands.blur()
+              }
+            }
+          })
+        },
+        {
+          root: null,
+          threshold: 0,
+        }
+      )
+
+      if (this.$refs.formulaInputRoot) {
+        this.intersectionObserver.observe(this.$refs.formulaInputRoot)
+      }
+    },
+    cleanupIntersectionObserver() {
+      if (this.intersectionObserver) {
+        this.intersectionObserver.disconnect()
+        this.intersectionObserver = null
+      }
+    },
+    createEditor(formula = null) {
+      // An empty string is an intentional value after switching from expert
+      // to basic mode, so only fall back when no formula was provided.
+      this.content = this.toContent(formula ?? this.value)
+      this.editor = new Editor({
+        content: this.content,
+        editable: !this.disabled && !this.readOnly,
+        onUpdate: this.onUpdate,
+        onBlur: () => this.$emit('blur'),
+        extensions: this.extensions,
+        parseOptions: {
+          preserveWhitespace: 'full',
+        },
+        editorProps: {
+          clipboardTextSerializer: createClipboardTextSerializer(
+            this.toFormula.bind(this)
+          ),
+          handlePaste: createPasteHandler({
+            toContent: this.toContent.bind(this),
+            getMode: () => this.activeMode,
+          }),
+        },
+      })
+      this.isEditorInitialized = true
+
+      this.editor.on('data-node-clicked', this.dataNodeClicked)
+      this.editor.on('formula-node-clicked', this.formulaNodeClicked)
+    },
+    recreateEditor(formula = null) {
+      const currentFormula =
+        formula ??
+        (this.editor ? this.toFormula(this.wrapperContent) : this.value)
+
+      this.editor?.destroy()
+      this.createEditor(currentFormula)
+    },
+    /**
+     * Validate a formula string, updating the error state (and the error
+     * context shown to the user). Returns whether the formula is valid.
+     *
+     * Kept separate from emitChange() so it can also run when a formula is
+     * merely *displayed* (on mount and when the value prop changes), not only
+     * when the user edits it. Otherwise an already-invalid stored formula
+     * renders without any error styling until the field is touched.
+     */
+    validateFormula(formula) {
+      // Raw mode holds plain text, not a formula. Read-only fields are
+      // display-only snippets (e.g. the examples in the help tooltip) that
+      // never show an error context, so don't paint them as errors either:
+      // an example may deliberately be incomplete, like `get()` without a path.
+      if (this.isRawMode || this.readOnly) {
+        this.isFormulaInvalid = false
+        this.formulaErrorContext = { scope: null, title: '', message: '' }
+        return true
+      }
+
+      const functions = new RuntimeFunctionCollection(this.$registry)
+      // Validate the syntax, and assuming it's valid, then validate the arguments.
+      const validationResult = isFormulaValid(
+        formula,
+        functions,
+        false,
+        this.validationContext,
+        this.$t('formulaInputField.invalidSyntax')
+      )
+      this.isFormulaInvalid = !validationResult.valid
+      this.formulaErrorContext = this.isFormulaInvalid
+        ? {
+            scope: validationResult.scope,
+            title: this.$t('formulaInputField.invalidFormulaTitle'),
+            message: validationResult.errors[0],
+          }
+        : { scope: null, title: '', message: '' }
+      return validationResult.valid
+    },
+    emitChange() {
+      this.errorExpanded = false
+
+      // this.wrapperContent can be stale content, so get the data
+      // directly from the editor.
+      const editorContent = this.editor.getJSON()
+      // `toFormula` returns null when the content cannot be serialized; never
+      // emit null upstream, parents store it and feed it back as `value`.
+      const formula = this.toFormula(editorContent) ?? ''
+
+      if (this.validateFormula(formula)) {
+        this.$emit('input', formula)
+      } else {
+        this.$nextTick(() => {
+          this.editor.commands.repositionContext()
+        })
+      }
+    },
+    onUpdate() {
+      this.emitChange()
+    },
+    emitRawValue(value) {
+      this.$emit('input', value)
+    },
+    toggleRawMode() {
+      if (this.disabled) {
+        return
+      }
+
+      if (!this.isRawMode && this.value) {
+        this.$refs.rawModeModal.show()
+        return
+      }
+
+      this.changeRawMode()
+    },
+    changeRawMode() {
+      const newMode = this.isRawMode ? 'simple' : 'raw'
+      // Raw text is not formula syntax, so it carries over as a string
+      // literal (`Price` -> `'Price'`); passed through verbatim it would be
+      // parsed as a function name and rejected. The other direction clears
+      // the formula, after confirmation when it isn't empty.
+      const rawText = this.isRawMode ? ensureString(this.value) : ''
+      const newFormula = rawText ? toFormulaStringLiteral(rawText) : ''
+
+      this.isHandlingModeChange = true
+      this.$emit('update:mode', newMode)
+      this.$emit('input', newFormula)
+
+      if (!this.isRawMode) {
+        this.editor?.destroy()
+        this.editor = null
+        this.isEditorInitialized = false
+      }
+
+      this.isFormulaInvalid = false
+      this.formulaErrorContext = { scope: null, title: '', message: '' }
+      this.$nextTick(() => {
+        if (newMode !== 'raw' && !this.editor) {
+          this.createEditor(newFormula)
+        }
+        this.isHandlingModeChange = false
+      })
+    },
+    confirmRawModeChange() {
+      this.changeRawMode()
+    },
+    handleNodeSelected(data) {
+      const { path, node } = data
+      switch (node.type) {
+        case 'function':
+          this.editor.commands.insertFunction(node)
+          break
+        case 'operator':
+          this.editor.commands.insertOperator(node)
+          break
+        default:
+          this.editor.commands.insertDataComponent(path)
+          break
+      }
+    },
+    /**
+     * Inserts a clicked help-tooltip example at the cursor. Only advanced
+     * mode can host the function nodes examples parse into; the explorer's
+     * function tab (and thus a clickable tooltip) only exists in that mode.
+     */
+    handleExampleSelected(example) {
+      if (this.activeMode !== 'advanced') {
+        return
+      }
+      const content = this.toContent(example.formula)
+      const fragment = content?.content?.[0]?.content
+      if (!fragment) {
+        return
+      }
+      this.editor.commands.insertFormulaFragment(fragment)
+    },
+    onContextMouseDown() {
+      this.editor?.commands.handleContextMouseDown()
+    },
+    positionAndShowExplorerContext() {
+      let config
+      switch (this.contextPosition) {
+        case 'left':
+          config = {
+            vertical: 'bottom',
+            horizontal: 'left',
+            needsDynamicOffset: true,
+          }
+          break
+        case 'right':
+          config = {
+            vertical: 'bottom',
+            horizontal: 'left',
+            needsDynamicOffset: true,
+          }
+          break
+        case 'bottom':
+        default:
+          config = {
+            vertical: 'bottom',
+            horizontal: 'left',
+            verticalOffset: 10,
+            horizontalOffset: 0,
+          }
+          break
+      }
+
+      const { vertical, horizontal } = config
+      let { verticalOffset = 0, horizontalOffset = 0 } = config
+
+      if (config.needsDynamicOffset) {
+        const inputRect = this.$el?.getBoundingClientRect()
+        const contextRect = this.$refs.formulaInputExplorerContext
+          ?.getTeleportedElement()
+          ?.getBoundingClientRect()
+
+        switch (this.contextPosition) {
+          case 'left':
+            verticalOffset = -inputRect?.height || 0
+            horizontalOffset = -(contextRect?.width || 0) - 10
+            break
+          case 'right':
+            verticalOffset = -inputRect?.height || 0
+            horizontalOffset = (inputRect?.width || 0) + 10
+            break
+        }
+      }
+
+      this.$refs.formulaInputExplorerContext?.show(
+        this.$refs.editor.$el,
+        vertical,
+        horizontal,
+        verticalOffset,
+        horizontalOffset
+      )
+    },
+    toContent(formula) {
+      if (!formula) {
+        return {
+          type: 'doc',
+          content: [
+            {
+              type: 'wrapper',
+              content: [{ type: 'text', text: '\u200B' }],
+            },
+          ],
+        }
+      }
+
+      try {
+        const tree = parseBaserowFormula(
+          disambiguateMinusOperator(formula),
+          false
+        )
+        const functionCollection = new RuntimeFunctionCollection(this.$registry)
+        const result = new ToTipTapVisitor(
+          functionCollection,
+          this.activeMode
+        ).visit(tree)
+
+        // Ensure wrapper always starts with a ZWS
+        if (result && result.content && result.content[0]) {
+          const wrapper = result.content[0]
+          if (wrapper.type === 'wrapper') {
+            if (!wrapper.content || wrapper.content.length === 0) {
+              wrapper.content = [{ type: 'text', text: '\u200B' }]
+            } else {
+              const firstNode = wrapper.content[0]
+              // Add ZWS at the beginning if it's not already there
+              if (
+                !firstNode ||
+                firstNode.type !== 'text' ||
+                firstNode.text !== '\u200B'
+              ) {
+                wrapper.content.unshift({ type: 'text', text: '\u200B' })
+              }
+            }
+          }
+        }
+
+        return result
+      } catch (error) {
+        return null
+      }
+    },
+    toFormula(content, mode = null) {
+      const functionCollection = new RuntimeFunctionCollection(this.$registry)
+      try {
+        const formula = new FromTipTapVisitor(
+          functionCollection,
+          mode || this.activeMode
+        ).visit(content)
+
+        return formula
+      } catch (error) {
+        return null
+      }
+    },
+    dataNodeClicked(node) {
+      this.editor.commands.selectNode(node)
+      this.revealNode = { type: 'data', path: node.attrs.path }
+    },
+    /**
+     * Called when a function or operator node is clicked in the editor.
+     * @param {Object} target the `{ type, name }` of the clicked node, where
+     *   `name` is the function name or the operator symbol.
+     */
+    formulaNodeClicked(target) {
+      this.revealNode = { ...target }
+    },
+    onHelpTooltipEnter() {
+      this.isHelpTooltipHovered = true
+      this.cancelHelpTooltipHide()
+    },
+    onHelpTooltipLeave() {
+      this.isHelpTooltipHovered = false
+      this.cancelHelpTooltipHide()
+      this.helpTooltipHideTimer = setTimeout(() => {
+        this.helpTooltipHideTimer = null
+        this.hideHelpTooltip()
+      }, HELP_TOOLTIP_HIDE_DELAY)
+    },
+    cancelHelpTooltipHide() {
+      clearTimeout(this.helpTooltipHideTimer)
+      this.helpTooltipHideTimer = null
+    },
+    hideHelpTooltip() {
+      this.$refs.nodeHelpTooltip?.hide()
+      this.hoveredFunctionNode = null
+    },
+    handleEditorClick(event) {
+      if (this.editor && !this.disabled && !this.readOnly) {
+        this.editor.commands.showContext()
+        this.revealClickedFunctionPunctuation(event.target)
+      }
+    },
+    /**
+     * Closing parentheses and argument commas are plain nodes without a
+     * component to emit `formula-node-clicked`, so a click on one reveals the
+     * function it belongs to from here.
+     * @param {HTMLElement} target the clicked element.
+     */
+    revealClickedFunctionPunctuation(target) {
+      const punctuation = target?.closest?.(
+        '[data-formula-closing-paren], [data-formula-comma]'
+      )
+      if (!punctuation) {
+        return
+      }
+      const opener = findFunctionOpener(this.editor.view.dom, punctuation)
+      const name = opener?.textContent.trim().match(/^[A-Za-z_]\w*/)?.[0]
+      if (name) {
+        this.formulaNodeClicked({ type: 'function', name })
+      }
+    },
+    /**
+     * The format badge is a shortcut to the picker: focusing the editor opens
+     * the explorer context that hosts it. The badge prevents the default of
+     * its mousedown, so an already focused editor keeps the focus and the
+     * context doesn't close and reopen.
+     */
+    focusEditor() {
+      if (this.isRawMode || this.disabled || this.readOnly) return
+      this.editor?.commands.focus()
+    },
+    /**
+     * Tells the parent when the given mode was replaced by the fallback (see
+     * `activeMode`), so the mode it saves with the next edit is the one the
+     * formula was edited in.
+     */
+    syncMode() {
+      if (this.activeMode !== this.mode) {
+        this.$emit('update:mode', this.activeMode)
+      }
+    },
+    handleModeChange(newMode) {
+      // If switching from advanced to simple, clear the content
+      if (this.activeMode === 'advanced' && newMode === 'simple') {
+        this.isHandlingModeChange = true
+        this.editor.commands.clearContent()
+        this.$emit('update:mode', newMode)
+        this.$emit('input', '')
+        this.isFormulaInvalid = false
+        this.formulaErrorContext = { scope: null, title: '', message: '' }
+        this.$nextTick(() => {
+          this.recreateEditor('')
+          this.isHandlingModeChange = false
+        })
+      } else {
+        // Otherwise (simple to advanced), keep the current formula
+        // Get the formula BEFORE changing the mode, using the CURRENT mode
+        const currentFormula = this.toFormula(
+          this.wrapperContent,
+          this.activeMode
+        )
+
+        // Set flag to prevent automatic recreation from watcher
+        this.isHandlingModeChange = true
+
+        // Update the mode
+        this.$emit('update:mode', newMode)
+
+        // Wait for Vue to update the mode prop
+        this.$nextTick(() => {
+          // Recreate the editor with the new mode and preserved formula
+          this.recreateEditor(currentFormula)
+
+          // Emit the formula value
+          if (currentFormula) {
+            this.$emit('input', currentFormula)
+          }
+
+          // Reset the flag
+          this.isHandlingModeChange = false
+        })
+      }
+    },
+    undo() {
+      if (this.editor) {
+        this.editor.commands.undo()
+      }
+    },
+    redo() {
+      if (this.editor) {
+        this.editor.commands.redo()
+      }
+    },
+    unSelectNode() {
+      this.editor?.commands.unselectNode()
+    },
+  },
+}
+</script>

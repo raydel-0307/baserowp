@@ -1,0 +1,210 @@
+import { markRaw } from 'vue'
+import { Registerable } from '@baserow/modules/core/registry'
+import { integrationsErrorMessage } from '@baserow/modules/core/utils/integration'
+import GeneralSettingsComponent from '@baserow/modules/builder/components/settings/GeneralSettings'
+import IntegrationSettingsComponent from '@baserow/modules/builder/components/settings/IntegrationSettings'
+import ThemeSettingsComponent from '@baserow/modules/builder/components/settings/ThemeSettings'
+import DomainsSettingsComponent from '@baserow/modules/builder/components/settings/DomainsSettings'
+import UserSourcesSettingsComponent from '@baserow/modules/builder/components/settings/UserSourcesSettings'
+import BreakpointsSettingsComponent from '@baserow/modules/builder/components/settings/BreakpointsSettings'
+
+const GeneralSettings = markRaw(GeneralSettingsComponent)
+const IntegrationSettings = markRaw(IntegrationSettingsComponent)
+const ThemeSettings = markRaw(ThemeSettingsComponent)
+const DomainsSettings = markRaw(DomainsSettingsComponent)
+const UserSourcesSettings = markRaw(UserSourcesSettingsComponent)
+const BreakpointsSettings = markRaw(BreakpointsSettingsComponent)
+
+export class BuilderSettingType extends Registerable {
+  static getType() {
+    return null
+  }
+
+  get name() {
+    return null
+  }
+
+  get icon() {
+    return null
+  }
+
+  get component() {
+    return null
+  }
+
+  get componentPadding() {
+    return true
+  }
+
+  /**
+   * Returns why this setting contains something that needs the user's
+   * attention, or null when nothing does. Used to flag the setting, and the
+   * "Settings" entry leading to it, so the user can follow the trail to the
+   * issue.
+   *
+   * @param {object} application The application the setting belongs to.
+   * @returns {string|null} The error message, if any.
+   */
+  getErrorMessage(application) {
+    return null
+  }
+
+  /**
+   * Override `getErrorMessage` instead of this method so a setting in error
+   * also provides a user-facing explanation.
+   *
+   * @param {object} application The application the setting belongs to.
+   * @returns {boolean} If the setting is in error.
+   */
+  isInError(application) {
+    return Boolean(this.getErrorMessage(application))
+  }
+
+  isDeactivated({ workspace }) {
+    return !!this.isDeactivatedReason({ workspace })
+  }
+
+  isDeactivatedReason({ workspace }) {
+    return null
+  }
+
+  getDeactivatedModal({ workspace }) {
+    return null
+  }
+}
+
+export class GeneralBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'general'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.generalName')
+  }
+
+  get icon() {
+    return 'iconoir-settings'
+  }
+
+  getOrder() {
+    return 1
+  }
+
+  get component() {
+    return GeneralSettings
+  }
+}
+
+export class BreakpointsBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'breakpoints'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.breakpointsName')
+  }
+
+  get icon() {
+    return 'iconoir-move-ruler'
+  }
+
+  getOrder() {
+    return 30
+  }
+
+  get component() {
+    return BreakpointsSettings
+  }
+}
+
+export class IntegrationsBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'integrations'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.integrationsName')
+  }
+
+  get icon() {
+    return 'iconoir-ev-plug'
+  }
+
+  getOrder() {
+    return 10
+  }
+
+  get component() {
+    return IntegrationSettings
+  }
+
+  getErrorMessage(application) {
+    return integrationsErrorMessage(this.app, application.integrations)
+  }
+}
+
+export class ThemeBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'theme'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.themeName')
+  }
+
+  get icon() {
+    return 'iconoir-fill-color'
+  }
+
+  getOrder() {
+    return 20
+  }
+
+  get component() {
+    return ThemeSettings
+  }
+}
+
+export class DomainsBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'domains'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.domainsName')
+  }
+
+  get icon() {
+    return 'iconoir-globe'
+  }
+
+  getOrder() {
+    return 5
+  }
+
+  get component() {
+    return DomainsSettings
+  }
+}
+
+export class UserSourcesBuilderSettingsType extends BuilderSettingType {
+  static getType() {
+    return 'user_sources'
+  }
+
+  get name() {
+    return this.app.$i18n.t('builderSettingTypes.userSourcesName')
+  }
+
+  get icon() {
+    return 'baserow-icon-team'
+  }
+
+  getOrder() {
+    return 15
+  }
+
+  get component() {
+    return UserSourcesSettings
+  }
+}
