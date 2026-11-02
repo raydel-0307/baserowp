@@ -17,8 +17,6 @@ COPY --chown=9999:9999 ./premium/web-frontend/modules/baserow_premium/ /baserow/
 RUN cd /baserow/web-frontend && \
     (NODE_OPTIONS="--max-old-space-size=4096" yarn run build || echo "Build completado")
 
-USER 9999:9999
-
 # Desactivar la verificación obligatoria de volumen al iniciar el contenedor
 ENV DISABLE_VOLUME_CHECK=yes
 
