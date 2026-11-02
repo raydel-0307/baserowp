@@ -19,6 +19,9 @@ RUN cd /baserow/web-frontend && \
 
 USER 9999:9999
 
+# Desactivar la verificación obligatoria de volumen al iniciar el contenedor
+ENV DISABLE_VOLUME_CHECK=yes
+
 # Exponer el puerto HTTP estándar
 EXPOSE 80
 
