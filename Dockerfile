@@ -19,12 +19,16 @@ RUN cd /baserow/web-frontend && \
     (NODE_OPTIONS="--max-old-space-size=4096" yarn run build || echo "Build completado")
 
 # Variables de entorno para Easypanel / Docker
-# - Desactivar comprobación de volumen al inicio
-# - Forzar que el frontend interno (Nitro) use el puerto 3000 y no colisione con Caddy (puerto 80)
 ENV DISABLE_VOLUME_CHECK=yes
-ENV NITRO_PORT=3000
 
-# Exponer el puerto HTTP estándar
+# Cambiar el puerto interno del Web Frontend para que no choque con Caddy
+# En la imagen oficial, el componente Nuxt/Nitro responde a BASEROW_FRONTEND_PORT (por defecto suele ser 3000, pero forzarlo evita el conflicto)
+ENV BASEROW_FRONTEND_PORT=3000
+
+# Asegurar que Caddy sea el único que escuche en el puerto 80 del contenedor
+ENV WEB_FRONTEND_PORT=80
+
+# Exponer el puerto HTTP estándar hacia el exterior (Easypanel apuntará aquí)
 EXPOSE 80
 
 # El comando de inicio usa el orquestador supervisor interno
