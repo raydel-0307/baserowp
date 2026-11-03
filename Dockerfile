@@ -12,13 +12,17 @@ COPY --chown=9999:9999 ./enterprise/backend/src/baserow_enterprise/ /baserow/ent
 # 2. Copiar frontend modificado (desbloqueo de interfaz, permisos e indicadores)
 COPY --chown=9999:9999 ./web-frontend/modules/core/plugins/hasFeature.js /baserow/web-frontend/modules/core/plugins/hasFeature.js
 COPY --chown=9999:9999 ./premium/web-frontend/modules/baserow_premium/ /baserow/web-frontend/modules/baserow_premium/
+COPY --chown=9999:9999 ./web-frontend/env-remap.mjs /baserow/web-frontend/env-remap.mjs
 
 # 3. Compilar los assets del frontend desbloqueado
 RUN cd /baserow/web-frontend && \
     (NODE_OPTIONS="--max-old-space-size=4096" yarn run build || echo "Build completado")
 
-# Desactivar la verificación obligatoria de volumen al iniciar el contenedor
+# Variables de entorno para Easypanel / Docker
+# - Desactivar comprobación de volumen al inicio
+# - Forzar que el frontend interno (Nitro) use el puerto 3000 y no colisione con Caddy (puerto 80)
 ENV DISABLE_VOLUME_CHECK=yes
+ENV NITRO_PORT=3000
 
 # Exponer el puerto HTTP estándar
 EXPOSE 80

@@ -178,3 +178,12 @@ if (
     .filter((d) => d !== '')
   process.env.NUXT_PUBLIC_BASEROW_BUILDER_DOMAINS = JSON.stringify(domains)
 }
+
+// Ensure Nitro webfrontend strictly binds to port 3000 inside the container.
+// PaaS environments (Easypanel, Railway, Heroku) often inject PORT=80 into container env,
+// which causes Nitro to attempt to bind to port 80 and conflict with Caddy (EADDRINUSE).
+process.env.NITRO_PORT = process.env.BASEROW_WEBFRONTEND_PORT || '3000'
+if (process.env.PORT === '80') {
+  delete process.env.PORT
+}
+
