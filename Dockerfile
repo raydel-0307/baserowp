@@ -9,9 +9,9 @@ USER root
 COPY --chown=9999:9999 ./premium/backend/src/baserow_premium/ /baserow/premium/backend/src/baserow_premium/
 COPY --chown=9999:9999 ./enterprise/backend/src/baserow_enterprise/ /baserow/enterprise/backend/src/baserow_enterprise/
 
-# --- PARCHE DE COMPATIBILIDAD ---
-# Inyecta una clase dummy para evitar el fallo de importación por desajuste de versiones
-RUN echo "\nclass UpdateDashboardSharingActionType: pass" >> /baserow/backend/src/baserow/contrib/dashboard/actions.py
+# --- PARCHE DE COMPATIBILIDAD CORREGIDO ---
+# printf interpreta correctamente los saltos de línea (\n) para evitar el SyntaxError
+RUN printf "\nclass UpdateDashboardSharingActionType:\n    pass\n" >> /baserow/backend/src/baserow/contrib/dashboard/actions.py
 
 # 2. Copiar frontend modificado (desbloqueo de interfaz, permisos e indicadores)
 COPY --chown=9999:9999 ./web-frontend/modules/core/plugins/hasFeature.js /baserow/web-frontend/modules/core/plugins/hasFeature.js
