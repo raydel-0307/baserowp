@@ -9,14 +9,27 @@ USER root
 COPY --chown=9999:9999 ./premium/backend/src/baserow_premium/ /baserow/premium/backend/src/baserow_premium/
 COPY --chown=9999:9999 ./enterprise/backend/src/baserow_enterprise/ /baserow/enterprise/backend/src/baserow_enterprise/
 
-# --- SOLUCIÓN DE RAÍZ PARA ERRORES DE IMPORTACIÓN ---
-# Elimina la importación rota en las vistas del backend premium (UpdateDashboardSharingActionType)
+# --- PARCHES DE LIMPIEZA Y SINTAXIS SEGUROS ---
+
+# Parche 1: Elimina la importación rota en las vistas del backend premium
 RUN sed -i '/UpdateDashboardSharingActionType/d' /baserow/premium/backend/src/baserow_premium/api/dashboard/views.py || true
 
-# Elimina el archivo de permisos de campos enterprise que busca 'subject_options' (módulo inexistente en el core)
+# Parche 2: Desactiva por completo el submódulo de permisos de campos enterprise que genera el bucle
+# Borramos la carpeta problemática para evitar fallos de módulos inexistentes
 RUN rm -rf /baserow/enterprise/backend/src/baserow_enterprise/field_permissions/ || true
-# Limpia la inicialización del módulo eliminado para que Django no lo busque al arrancar
-RUN sed -i '/field_permissions/d' /baserow/enterprise/backend/src/baserow_enterprise/apps.py || true
+
+# Parche 3: Reescribimos el inicializador del plugin de permisos de campo usando Python puro
+# Esto evita que 'sed' rompa la indentación y los bloques de código
+RUN python3 -c '\
+path = "/baserow/enterprise/backend/src/baserow_enterprise/apps.py";\
+code = open(path).read();\
+# Buscamos la función problematica y anulamos su contenido con un pass seguro\
+if "from .field_permissions.actions" in code:\
+    start = code.find("        from .field_permissions.actions")\
+    end = code.find("        )", start) + 9\
+    code = code[:start] + "        pass" + code[end:];\
+open(path, "w").write(code);\
+' || true
 
 # 2. Copiar frontend modificado (desbloqueo de interfaz, permisos e indicadores)
 COPY --chown=9999:9999 ./web-frontend/modules/core/plugins/hasFeature.js /baserow/web-frontend/modules/core/plugins/hasFeature.js
