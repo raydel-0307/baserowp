@@ -1,7 +1,7 @@
 # ==============================================================================
 # Baserow Self-Hosted All-in-One (Completely Open Source - All Features Unlocked)
 # ==============================================================================
-FROM baserow/baserow:latest
+FROM baserow/baserow:2.4.1
 
 USER root
 
@@ -9,12 +9,14 @@ USER root
 COPY --chown=9999:9999 ./premium/backend/src/baserow_premium/ /baserow/premium/backend/src/baserow_premium/
 COPY --chown=9999:9999 ./enterprise/backend/src/baserow_enterprise/ /baserow/enterprise/backend/src/baserow_enterprise/
 
-# --- PARCHES DE COMPATIBILIDAD ---
-# Parche 1: Resolver falta de clase en acciones del dashboard
-RUN printf "\nclass UpdateDashboardSharingActionType:\n    pass\n" >> /baserow/backend/src/baserow/contrib/dashboard/actions.py
+# --- SOLUCIÓN DE RAÍZ PARA ERRORES DE IMPORTACIÓN ---
+# Elimina la importación rota en las vistas del backend premium (UpdateDashboardSharingActionType)
+RUN sed -i '/UpdateDashboardSharingActionType/d' /baserow/premium/backend/src/baserow_premium/api/dashboard/views.py || true
 
-# Parche 2: Resolver falta de la función serialize_public_field en serializadores de campos
-RUN printf "\ndef serialize_public_field(*args, **kwargs):\n    return {}\n" >> /baserow/backend/src/baserow/contrib/database/api/fields/serializers.py
+# Elimina el archivo de permisos de campos enterprise que busca 'subject_options' (módulo inexistente en el core)
+RUN rm -rf /baserow/enterprise/backend/src/baserow_enterprise/field_permissions/ || true
+# Limpia la inicialización del módulo eliminado para que Django no lo busque al arrancar
+RUN sed -i '/field_permissions/d' /baserow/enterprise/backend/src/baserow_enterprise/apps.py || true
 
 # 2. Copiar frontend modificado (desbloqueo de interfaz, permisos e indicadores)
 COPY --chown=9999:9999 ./web-frontend/modules/core/plugins/hasFeature.js /baserow/web-frontend/modules/core/plugins/hasFeature.js
