@@ -1,7 +1,7 @@
 # ==============================================================================
 # Baserow Self-Hosted All-in-One (Completely Open Source - All Features Unlocked)
 # ==============================================================================
-FROM baserow/baserow:2.6.1
+FROM baserow/baserow:latest
 
 USER root
 
